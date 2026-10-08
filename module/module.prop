@@ -1,0 +1,6 @@
+id=gkui-pack
+name=GKUI-Pack
+version=__VERSION__
+versionCode=__VERSION_CODE__
+author=GKUI-Pack contributors
+description=以 coexist 模式把 GKUI 本土化应用(日历/图库/计算器/时钟)挂载到 system/app 下;不替换、不修改、不禁用任何 ROM 自带应用。安装前须先卸载 /data 中已安装的同包名应用(见 README 与 customize.sh 的冲突检查)。

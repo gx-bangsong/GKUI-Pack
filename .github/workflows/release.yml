@@ -1,0 +1,244 @@
+---
+# =============================================================================
+# Release —— tag v* 触发
+#
+# 流程:下载 APK → 校验 sha256 / 签名证书(preflight 七项门禁)→ build.sh
+#       → 上传模块 zip + 门禁报告。
+#
+# 重要行为:
+#   * 构建**一定会**校验资产 sha256 与 APK 签名证书(C5/C6);任何不一致都会
+#     让本工作流失败,并提示"需卸载重装,应用内数据会丢失"。
+#   * apps.yaml 里仍是 TODO 时,构建必然失败(C7):此时 --collect-only 步骤
+#     采集到的真实值会作为 artifact 上传,供你回填 apps.yaml(本工作流**不会**
+#     自动改仓库里的 apps.yaml)。
+#   * 未在 KernelSU / APatch 真机验证,详见 README 的"诚实边界"。
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要构建并发布的 tag(需已存在)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 下载 APK → 门禁 → 构建 coexist 模块 → 发布
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: 安装 aapt / apksigner / JDK
+        run: |
+          set -uo pipefail
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq --no-install-recommends \
+            aapt apksigner zipalign default-jre-headless unzip zip curl || true
+          if ! command -v aapt >/dev/null 2>&1 || ! command -v apksigner >/dev/null 2>&1; then
+            echo "apt 未提供 aapt/apksigner,回退到 Android cmdline-tools"
+            curl -fsSL -o "$RUNNER_TEMP/cmdline-tools.zip" \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$HOME/android-sdk"
+            rm -rf "$RUNNER_TEMP/cmdline-tools"
+            unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$RUNNER_TEMP/cmdline-tools"
+            mkdir -p "$HOME/android-sdk/cmdline-tools"
+            mv "$RUNNER_TEMP/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+            yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" \
+              --sdk_root="$HOME/android-sdk" --licenses >/dev/null 2>&1 || true
+            yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" \
+              --sdk_root="$HOME/android-sdk" "build-tools;34.0.0" >/dev/null
+            echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+            echo "PATH=$HOME/android-sdk/build-tools/34.0.0:$PATH" >> "$GITHUB_ENV"
+          fi
+          echo "aapt     = $(command -v aapt || echo 缺失)"
+          echo "apksigner= $(command -v apksigner || echo 缺失)"
+          java -version 2>&1 | head -1 || true
+
+      - name: 下载各应用的 Release 资产
+        run: |
+          set -euo pipefail
+          mkdir -p dist/apks
+          bash build.sh --emit-tsv > "$RUNNER_TEMP/apps.tsv"
+          count=0
+          while IFS=$'\t' read -r APP_ID _APP_NAME APP_PKG _STOCK APP_REPO _UP _LIC _SRC \
+                  APP_TAG APP_ASSET _SHA _SIGNER _IVC _AS _MODE _CONF _ENABLED; do
+            [ -n "$APP_ID" ] || continue
+            echo "→ $APP_ID : $APP_REPO @ $APP_TAG / $APP_ASSET"
+            curl -fL --retry 3 --retry-delay 2 -o "dist/apks/$APP_ASSET" \
+              "https://github.com/$APP_REPO/releases/download/$APP_TAG/$APP_ASSET"
+            count=$((count + 1))
+          done < "$RUNNER_TEMP/apps.tsv"
+          echo "已下载 $count 个资产(sha256 校验在下一步 build.sh 内完成)"
+          ls -l dist/apks
+
+      - name: 采集真实值(--collect-only;失败不影响后续,报告将作为 artifact 上传)
+        continue-on-error: true
+        run: bash build.sh --collect-only --no-color
+
+      - name: 构建(含 C5 sha256 / C6 签名 / C2 coexist / G7 versionCode 等门禁)
+        env:
+          VERSION: ${{ env.TAG }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: bash build.sh --no-color
+
+      - name: 生成 Release notes
+        if: success()
+        run: |
+          python3 - "$TAG" > notes.md <<'PY'
+          """根据构建清单与 apps.yaml 生成 Release notes(含 GPL 源码链接与 debug 警告)"""
+          import glob
+          import hashlib
+          import json
+          import subprocess
+          import sys
+
+          tag = sys.argv[1]
+
+          fields = ["id", "name", "application_id", "stock_package", "repo", "upstream",
+                    "license", "source_url", "release_tag", "asset_name", "sha256",
+                    "signer_sha256", "installed_version_code", "install_as", "mode",
+                    "confidence", "enabled"]
+          tsv = subprocess.run(["bash", "build.sh", "--emit-tsv"],
+                               capture_output=True, text=True, check=True).stdout
+          meta = {}
+          for line in tsv.strip().split("\n"):
+              if not line.strip():
+                  continue
+              vals = line.split("\t")
+              meta[vals[0]] = dict(zip(fields, vals))
+
+          rows = []
+          with open("dist/build-manifest.txt", encoding="utf-8") as fh:
+              for line in fh:
+                  if line.startswith("#") or not line.strip():
+                      continue
+                  rows.append(line.rstrip("\n").split("\t"))
+          header = rows[0]
+          records = [dict(zip(header, r)) for r in rows[1:]]
+          included = [r for r in records if r.get("state") == "included"]
+          excluded = [r for r in records if r.get("state") != "included"]
+
+          zips = sorted(glob.glob("dist/GKUI-Pack-*.zip"))
+          zip_name = zips[-1].split("/")[-1] if zips else "(未生成)"
+          zip_sha = hashlib.sha256(open(zips[-1], "rb").read()).hexdigest() if zips else "-"
+
+          out = []
+          out.append("## GKUI-Pack %s(coexist 模式 systemless 模块)" % tag)
+          out.append("")
+          out.append("> ⚠️ **所有 APK 均为 debug 构建**(包名带 `.debug` / `.dev` 后缀,")
+          out.append("> 由 debug keystore 签名)。调试签名可能随构建环境变化:")
+          out.append("> 覆盖安装可能失败(`INSTALL_FAILED_UPDATE_INCOMPATIBLE`),此时只能卸载重装,")
+          out.append("> **应用内数据会丢失**(日历/图库数据存放在系统 Provider,不受影响;")
+          out.append("> 时钟闹钟、计算器历史、录音机设置会丢失)。请勿用于正式分发场景。")
+          out.append("")
+          out.append("### 刷入前置条件(必须)")
+          out.append("")
+          out.append("本模块与设备 `/data` 中已安装的同包名应用**必然冲突**。刷入前请先卸载:")
+          out.append("")
+          out.append("```bash")
+          for r in included:
+              out.append("pm uninstall %s" % r.get("application_id", ""))
+          out.append("```")
+          out.append("")
+          out.append("卸载会丢失:时钟闹钟、计算器历史、录音机设置;日历/图库数据在系统 Provider 中不受影响。")
+          out.append("")
+          out.append("### 模块内容(coexist:不替换、不修改、不禁用任何自带应用)")
+          out.append("")
+          out.append("| 应用 | application_id | 与之共存的 ROM 自带包 | versionCode | 资产 sha256(前 16 位) |")
+          out.append("|---|---|---|---|---|")
+          for r in included:
+              app = meta.get(r.get("app_id", ""), {})
+              out.append("| %s | `%s` | `%s` | %s | `%s…` |" % (
+                  r.get("name", ""), r.get("application_id", ""),
+                  app.get("stock_package", ""), r.get("version_code", ""),
+                  str(r.get("asset_sha256", ""))[:16]))
+          out.append("")
+          if excluded:
+              out.append("### 未纳入模块的条目")
+              out.append("")
+              out.append("| 应用 | application_id | 原因 |")
+              out.append("|---|---|---|")
+              for r in excluded:
+                  out.append("| %s | `%s` | 检出 signature/privileged 权限,不适合模块化,仅走 adb install |" % (
+                      r.get("name", ""), r.get("application_id", "")))
+              out.append("")
+          out.append("### 签名证书(debug 构建的锚点,C6)")
+          out.append("")
+          out.append("| 应用 | 签名证书 SHA-256 |")
+          out.append("|---|---|")
+          for r in included:
+              out.append("| %s | `%s` |" % (r.get("name", ""), r.get("signer_sha256", "")))
+          out.append("")
+          out.append("### 来源与许可")
+          out.append("")
+          out.append("| 应用 | 来源仓库 | tag | 许可 | 对应源码 |")
+          out.append("|---|---|---|---|---|")
+          for r in included:
+              app = meta.get(r.get("app_id", ""), {})
+              out.append("| %s | `%s` | `%s` | %s | [源码](%s) |" % (
+                  r.get("name", ""), app.get("repo", ""), app.get("release_tag", ""),
+                  app.get("license", ""), app.get("source_url", "")))
+          out.append("")
+          out.append("本仓库不含任何上游源码,仅做打包与安装工程;各应用按其各自许可分发。")
+          out.append("")
+          out.append("### 校验")
+          out.append("")
+          out.append("- 模块包: `%s`" % zip_name)
+          out.append("- sha256: `%s`" % zip_sha)
+          out.append("- 门禁报告:见 Release 附件 `PREFLIGHT-REPORT.md` 与 `build-manifest.txt`")
+          out.append("")
+          out.append("### 诚实边界(未验证项)")
+          out.append("")
+          out.append("- 未在 **KernelSU / APatch 真机**上验证;仅 Magisk 走标准 `install_module` 流程。")
+          out.append("- 不在 KernelSU/APatch 上按各自管理器自带安装器安装时,请自行确认行为。")
+          out.append("- 未包含拨号 / 短信 / 联系人类应用(它们依赖 platform 签名与系统共享 UID,")
+          out.append("  第三方签名无法替换,详见 README 的 C4 说明)。")
+          out.append("- 本模块 **不替换、不修改、不禁用** 任何 ROM 自带应用;")
+          out.append("  如需隐藏自带应用,请自行 `pm disable-user --user 0 <stock_package>`。")
+          print("\n".join(out))
+          PY
+          echo "--- notes.md 预览 ---"
+          head -40 notes.md
+
+      - name: 上传门禁报告与构建清单(失败时也上传,便于回填 TODO)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: preflight-report
+          path: |
+            dist/PREFLIGHT-REPORT.md
+            dist/build-manifest.txt
+            dist/collected-values.txt
+          if-no-files-found: warn
+
+      - name: 发布 Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(dist/GKUI-Pack-*.zip)
+          if [ -f dist/PREFLIGHT-REPORT.md ]; then assets+=("dist/PREFLIGHT-REPORT.md"); fi
+          if [ -f dist/build-manifest.txt ]; then assets+=("dist/build-manifest.txt"); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --title "GKUI-Pack $TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "GKUI-Pack $TAG" --notes-file notes.md
+          fi
+          gh release view "$TAG" --json url --jq .url
