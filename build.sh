@@ -10,6 +10,14 @@
 #   bash build.sh --list             打印条目摘要(不校验,不会失败)
 #   bash build.sh --no-zip           渲染模块但不打包(调试用)
 #
+# 供其它脚本复用的机器可读输出(本仓库其它脚本一律通过这两个模式读取 apps.yaml,
+# 不允许各自解析 YAML):
+#   bash build.sh --emit-tsv         制表符分隔,仅 enabled 条目
+#   bash build.sh --emit-tsv-all     制表符分隔,含 disabled 条目
+#   字段顺序:id name application_id stock_package repo upstream license source_url
+#            release_tag asset_name sha256 signer_sha256 installed_version_code
+#            install_as mode confidence enabled
+#
 # 选项:
 #   --strict       disabled 条目里的 TODO/unverified 也视为失败(字面版 C7)
 #   --no-color     关闭彩色输出
@@ -43,7 +51,6 @@ PREFLIGHT="$ROOT/scripts/preflight-apk.sh"
 
 MODE="build"
 STRICT=0
-COLOR=1
 NO_ZIP=0
 
 # ---------------------------------------------------------------------------
@@ -499,11 +506,16 @@ def main():
     if mode == "--list":
         sys.stdout.write(emit_report(schema_version, entries, [], warnings, skipped) + "\n")
         return 0
-    if mode == "--emit-tsv":
+    if mode in ("--emit-tsv", "--emit-tsv-all"):
         for entry in entries:
-            if not entry["_enabled"]:
+            if not entry["_enabled"] and mode == "--emit-tsv":
                 continue
-            row = ["%s" % (entry.get(k) if entry.get(k) is not None else "") for k in FIELDS]
+            row = []
+            for k in FIELDS:
+                val = entry.get(k)
+                if isinstance(val, bool):
+                    val = "true" if val else "false"
+                row.append("" if val is None else "%s" % val)
             if any("\t" in cell or "\n" in cell for cell in row):
                 sys.stderr.write("[失败] %s 的字段含制表符/换行,无法传递\n" % entry.get("id"))
                 return 1
@@ -598,6 +610,8 @@ while [ $# -gt 0 ]; do
   case "${1:-}" in
     --check)          MODE=check ;;
     --dump-apps-json) MODE=dump ;;
+    --emit-tsv)       MODE=tsv ;;
+    --emit-tsv-all)   MODE=tsv-all ;;
     --list)           MODE=list ;;
     --no-zip)         NO_ZIP=1 ;;
     --strict)         STRICT=1 ;;
@@ -610,6 +624,8 @@ done
 
 case "$MODE" in
   dump) apps_python --dump-apps-json; exit $? ;;
+  tsv) apps_python --emit-tsv; exit $? ;;
+  tsv-all) apps_python --emit-tsv-all; exit $? ;;
   list) apps_python --list; exit $? ;;
   check) STRICT_FLAG=(); [ "$STRICT" = 1 ] && STRICT_FLAG=(--strict); apps_python --validate "${STRICT_FLAG[@]}"; exit $? ;;
 esac
@@ -733,8 +749,11 @@ $(printf '%s\n' "$found")"
     *) die "APK 门禁失败: $APP_ID(详见 $REPORT)" ;;
   esac
 
+  [ -f "$pf_json" ] || die "APK 门禁未产出结果文件: $pf_json(门禁脚本异常)"
   vc="$(json_get "$pf_json" version_code)"
   signer="$(json_get "$pf_json" signer_sha256)"
+  [ -n "$vc" ] || die "APK 门禁结果缺少 versionCode: $pf_json"
+  [ -n "$signer" ] || die "APK 门禁结果缺少签名摘要: $pf_json"
   printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$vc" "$signer" "$staged_sha" "$APP_ASSET" \
     >> "$WORK/included.txt"
@@ -746,7 +765,7 @@ excluded_count="$(grep -c . "$WORK/excluded.txt" || true)"
 
 # 4) 渲染模块
 STAGE="$WORK/stage"
-mkdir -p "$STAGE"
+mkdir -p "$STAGE/apks"
 cp -a "$ROOT/module/." "$STAGE/"
 
 ENTRY_LINES=""

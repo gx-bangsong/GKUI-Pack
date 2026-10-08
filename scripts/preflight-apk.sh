@@ -139,6 +139,7 @@ AAPT="${AAPT:-$(command -v aapt 2>/dev/null || true)}"
 if [ -z "$AAPT" ]; then
   sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
   if [ -n "$sdk" ] && [ -d "$sdk/build-tools" ]; then
+    # shellcheck disable=SC2012
     bt="$(ls -1 "$sdk/build-tools" 2>/dev/null | sort -V | tail -1)"
     if [ -n "$bt" ] && [ -x "$sdk/build-tools/$bt/aapt" ]; then
       AAPT="$sdk/build-tools/$bt/aapt"
@@ -148,10 +149,18 @@ fi
 [ -n "$AAPT" ] || env_fail "找不到 aapt。请安装 Android SDK build-tools,或用 AAPT=/path/to/aapt 指定(本工程不接受用解包 manifest 的 package 属性替代)"
 "$AAPT" version >/dev/null 2>&1 || env_fail "aapt 不可用: $AAPT"
 
+# 注意:APKSIGNER 若由环境变量显式提供(测试桩 / 自定义包装脚本),则不做
+# java 依赖检查;只有从 PATH / ANDROID_HOME 自动发现时(即 SDK 自带脚本,
+# 它本身是 Java 程序)才要求 java 存在。
+APKSIGNER_EXPLICIT=0
+if [ -n "${APKSIGNER:-}" ]; then
+  APKSIGNER_EXPLICIT=1
+fi
 APKSIGNER="${APKSIGNER:-$(command -v apksigner 2>/dev/null || true)}"
 if [ -z "$APKSIGNER" ]; then
   sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
   if [ -n "$sdk" ] && [ -d "$sdk/build-tools" ]; then
+    # shellcheck disable=SC2012
     bt="$(ls -1 "$sdk/build-tools" 2>/dev/null | sort -V | tail -1)"
     if [ -n "$bt" ] && [ -x "$sdk/build-tools/$bt/apksigner" ]; then
       APKSIGNER="$sdk/build-tools/$bt/apksigner"
@@ -159,7 +168,9 @@ if [ -z "$APKSIGNER" ]; then
   fi
 fi
 [ -n "$APKSIGNER" ] || env_fail "找不到 apksigner(签名证书门禁 G4 必需),用 APKSIGNER=/path/to/apksigner 指定"
-command -v java >/dev/null 2>&1 || env_fail "找不到 java:apksigner 是 Java 程序,必须安装 JRE"
+if [ "$APKSIGNER_EXPLICIT" = 0 ]; then
+  command -v java >/dev/null 2>&1 || env_fail "找不到 java:SDK 自带的 apksigner 是 Java 程序,必须安装 JRE(或用 APKSIGNER= 指定替代实现)"
+fi
 
 APK_BYTES="$(wc -c < "$APK" | tr -d ' ')"
 
@@ -462,14 +473,14 @@ data = {
     "signer_sha256": "$SIGNER_SHA",
     "signer_sha256_expected": "$E_SIGNER",
     "signer_count": "$SIGNER_COUNT",
-    "shared_user_id_detected": $(printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && echo true || echo false),
-    "privileged_declaration_detected": $([ -n "$PRIV_EVIDENCE" ] && echo true || echo false),
+    "shared_user_id_detected": $(printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && echo True || echo False),
+    "privileged_declaration_detected": $([ -n "$PRIV_EVIDENCE" ] && echo True || echo False),
     "requested_permission_count": $REQ_COUNT,
     "authorities": [$(printf '%s\n' "$AUTHORITIES" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
     "gate1_application_id": "$GATE1",
     "gate2_shared_user_id": "$GATE2",
     "gate3_permissions": "$GATE3",
-    "module_suitable": $([ "$RESULT" = "not_module_suitable" ] && echo false || echo true),
+    "module_suitable": $([ "$RESULT" = "not_module_suitable" ] && echo False || echo True),
     "result": "$RESULT",
     "exit_code": $RC
 }
