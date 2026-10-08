@@ -1,0 +1,175 @@
+---
+# =============================================================================
+# CI —— push / pull_request 触发
+#
+# 设计原则:
+#   * **全程不下载任何 APK**(APK 只在 release.yml 的 tag 构建里下载);
+#   * 不依赖 Android SDK、不依赖真实设备:APK 侧流程由 tests/test_build.sh
+#     用"假 APK + 桩 aapt/apksigner/pm/adb"覆盖;
+#   * 只做静态检查 + 离线全流程测试 + 硬约束验收项。
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: 静态检查(shellcheck / yamllint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: 安装检查工具
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends shellcheck
+          fi
+          python3 -m pip install --quiet --disable-pip-version-check yamllint
+          shellcheck --version | head -2
+          yamllint --version
+
+      - name: shellcheck(所有脚本,必须无 error 级告警)
+        run: |
+          set -euo pipefail
+          files=()
+          while IFS= read -r f; do files+=("$f"); done < <(git ls-files '*.sh')
+          # 模块安装入口没有 .sh 后缀,单独补上
+          files+=("module/META-INF/com/google/android/update-binary")
+          printf '检查 %d 个脚本:\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          shellcheck -S error "${files[@]}"
+          echo "shellcheck:无 error 级告警"
+
+      - name: yamllint(apps.yaml 与工作流)
+        run: |
+          set -euo pipefail
+          # 说明:GitHub Actions 的 `on:` 会被 YAML 1.1 解析成布尔键,因此关闭
+          #       truthy 的 key 检查(check-keys: false);行宽放宽到 200。
+          cfg='{extends: default,
+            rules: {
+              line-length: {max: 200, allow-non-breakable-words: true},
+              comments-indentation: disable,
+              comments: {min-spaces-from-content: 1},
+              truthy: {allowed-values: ["true", "false"], check-keys: false}
+            }}'
+          yamllint -d "$cfg" \
+            apps.yaml .github/workflows/ci.yml .github/workflows/release.yml
+          echo "yamllint:通过"
+
+  offline-tests:
+    name: 离线全流程测试(假 APK + 桩工具)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: 环境自检(本作业刻意不装 Android SDK、不连设备、不下载 APK)
+        run: |
+          set -euo pipefail
+          echo "aapt     = $(command -v aapt || echo "未安装-预期")"
+          echo "apksigner= $(command -v apksigner || echo "未安装-预期")"
+          echo "adb      = $(command -v adb || echo "未安装-预期")"
+          echo "python3  = $(python3 --version)"
+
+      - name: 运行 tests/test_build.sh
+        run: bash tests/test_build.sh
+
+  acceptance:
+    name: 硬约束验收项
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: C5 仓库不得跟踪任何 .apk
+        run: |
+          set -euo pipefail
+          n="$(git ls-files | grep -c '\.apk$' || true)"
+          echo "git ls-files | grep -c '.apk\$' = $n"
+          test "$n" -eq 0
+
+      - name: C2 apps.yaml 不得出现 replace 模式
+        run: |
+          if grep -rn "mode: replace" apps.yaml; then
+            echo "::error::apps.yaml 出现 mode: replace(违反 C2:mode 恒为 coexist)"
+            exit 1
+          fi
+          echo "未出现 mode: replace"
+
+      - name: C3 module/ 不得使用特权应用目录
+        run: |
+          if grep -rn "priv-app" module/; then
+            echo "::error::module/ 出现 priv-app(违反 C3:一律装到 system/app)"
+            exit 1
+          fi
+          echo "module/ 未出现 priv-app"
+
+      - name: C4 apps.yaml 不得含拨号/短信/联系人类应用
+        run: |
+          if grep -rniE "dialer|telephony|messaging|contacts" apps.yaml; then
+            echo "::error::命中 C4 禁用类别"
+            exit 1
+          fi
+          echo "未命中 C4 禁用类别"
+
+      - name: 录音机条目必须 unverified + enabled false + application_id TODO
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          out = subprocess.run(["bash", "build.sh", "--dump-apps-json"],
+                               capture_output=True, text=True, check=True).stdout
+          apps = json.loads(out)["apps"]
+          rec = [a for a in apps if a["id"] == "recorder"]
+          if not rec:
+              raise SystemExit("apps.yaml 缺少 recorder 条目")
+          app = rec[0]
+          assert app["confidence"] == "unverified", app["confidence"]
+          assert app["_enabled"] is False, app["_enabled"]
+          assert str(app["application_id"]).upper().startswith("TODO"), app["application_id"]
+          print("recorder 条目符合要求: application_id=%s confidence=%s enabled=%s"
+                % (app["application_id"], app["confidence"], app["_enabled"]))
+          PY
+
+      - name: C7 清单含 TODO 时 build.sh 必须非零(无 TODO 时必须通过)
+        run: |
+          set -uo pipefail
+          pending="$(python3 - <<'PY'
+          import json
+          import subprocess
+
+          out = subprocess.run(["bash", "build.sh", "--dump-apps-json"],
+                               capture_output=True, text=True).stdout
+          apps = json.loads(out)["apps"]
+          print(sum(1 for a in apps if a.get("_enabled") and a.get("_todo_fields")))
+          PY
+          )"
+          echo "仍有 TODO 的启用条目数: $pending"
+          if [ "$pending" -gt 0 ]; then
+            if bash build.sh --check >/dev/null 2>&1; then
+              echo "::error::apps.yaml 存在 TODO,但 build.sh --check 竟然通过(违反 C7)"
+              exit 1
+            fi
+            echo "符合预期:存在 TODO → build.sh 拒绝构建"
+          else
+            if ! bash build.sh --check >/dev/null 2>&1; then
+              echo "::error::apps.yaml 已无 TODO,但 build.sh --check 失败"
+              exit 1
+            fi
+            echo "符合预期:无 TODO → build.sh 校验通过"
+          fi
