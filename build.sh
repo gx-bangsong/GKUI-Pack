@@ -9,6 +9,10 @@
 #   bash build.sh --dump-apps-json   输出 apps.yaml 规范化 JSON(其他脚本复用)
 #   bash build.sh --list             打印条目摘要(不校验,不会失败)
 #   bash build.sh --no-zip           渲染模块但不打包(调试用)
+#   bash build.sh --collect-only     只采集真实值(不产出模块,永远返回非零)
+#                                    用途:apps.yaml 里 signer_sha256 / sha256 还是 TODO 时,
+#                                    先用它在 CI/本地把"该填什么值"打印出来。
+#                                    它**不会**改写 apps.yaml,也不产出任何 zip。
 #
 # 供其它脚本复用的机器可读输出(本仓库其它脚本一律通过这两个模式读取 apps.yaml,
 # 不允许各自解析 YAML):
@@ -52,6 +56,7 @@ PREFLIGHT="$ROOT/scripts/preflight-apk.sh"
 MODE="build"
 STRICT=0
 NO_ZIP=0
+COLLECT=0
 
 # ---------------------------------------------------------------------------
 # 输出helpers
@@ -334,8 +339,12 @@ def load(path):
     return doc.get("schema_version"), entries
 
 
-def validate(schema_version, entries, strict=False):
-    """返回 (errors, warnings, skipped)"""
+def validate(schema_version, entries, strict=False, allow_todo=False):
+    """返回 (errors, warnings, skipped)
+
+    allow_todo=True(仅 --collect-only 采集模式使用)时,把 TODO / confidence 类问题
+    从"错误"降级为"警告"。**任何硬规则(C2/C3/C4/格式/重复)依然必须失败**。
+    """
     errors, warnings, skipped = [], [], []
     for entry in entries:
         eid = entry.get("id") if isinstance(entry.get("id"), str) else "#%d" % (entry["_index"] + 1)
@@ -420,7 +429,9 @@ def validate(schema_version, entries, strict=False):
                 problems.append("license=%s 必须提供 source_url(GPL 的对应源码链接)" % lic)
 
         if problems:
-            if enabled:
+            if enabled and allow_todo:
+                warnings.extend("%s: %s(采集模式:仅提示,不阻断)" % (eid, p) for p in problems)
+            elif enabled:
                 errors.extend("%s: %s" % (eid, p) for p in problems)
             else:
                 reason = "条目已禁用(enabled: false),未参与构建"
@@ -486,6 +497,7 @@ def main():
     flags = sys.argv[2:]
     mode = flags[0] if flags else "--validate"
     strict = "--strict" in flags
+    allow_todo = "--allow-todo" in flags
     try:
         schema_version, entries = load(path)
     except YamlError as exc:
@@ -502,7 +514,7 @@ def main():
         json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
         return 0
-    errors, warnings, skipped = validate(schema_version, entries, strict=strict)
+    errors, warnings, skipped = validate(schema_version, entries, strict=strict, allow_todo=allow_todo)
     if mode == "--list":
         sys.stdout.write(emit_report(schema_version, entries, [], warnings, skipped) + "\n")
         return 0
@@ -575,6 +587,41 @@ sys.stdout.write("" if val is None else str(val))
 ' "$1" "$2"
 }
 
+collect_values() { # $1=门禁json $2=app-id $3=包名 $4=解包后 APK sha256 $5=资产 sha256 $6=资产名
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PYEOF'
+# -*- coding: utf-8 -*-
+"""输出一个便于人工回填的采集块(只打印,不写 apps.yaml)"""
+import json
+import sys
+
+path, app_id, pkg, apk_sha, asset_sha, asset_name = sys.argv[1:7]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    data = {}
+
+
+def val(key):
+    v = data.get(key)
+    return "<未取到>" if v in (None, "") else str(v)
+
+
+print("=== %s ===" % app_id)
+print("  apps.yaml 当前 application_id : %s" % pkg)
+print("  APK 内真实 application_id     : %s" % val("application_id"))
+print("  version_code                  : %s" % val("version_code"))
+print("  version_name                  : %s" % val("version_name"))
+print("  signer_sha256                 : %s" % val("signer_sha256"))
+print("  asset_name                    : %s" % asset_name)
+print("  asset_sha256                  : %s" % asset_sha)
+print("  apk_sha256(解包后待安装物)    : %s" % apk_sha)
+print("  module_suitable               : %s" % ("true" if data.get("module_suitable") else "false"))
+print("  preflight_result              : %s" % (data.get("result") or "unknown"))
+print("")
+PYEOF
+}
+
 render_placeholder() { # $1=文件 $2=占位符 $3=替换文本
   python3 - "$1" "$2" "$3" <<'PYEOF'
 # -*- coding: utf-8 -*-
@@ -614,6 +661,7 @@ while [ $# -gt 0 ]; do
     --emit-tsv-all)   MODE=tsv-all ;;
     --list)           MODE=list ;;
     --no-zip)         NO_ZIP=1 ;;
+    --collect-only)   MODE=collect ;;
     --strict)         STRICT=1 ;;
     --no-color)       C_RED=''; C_GRN=''; C_YEL=''; C_BLD=''; C_RST='' ;;
     -h|--help)        usage; exit 0 ;;
@@ -642,6 +690,12 @@ printf '%s=== GKUI-Pack 构建 ===%s\n' "$C_BLD" "$C_RST"
 
 STRICT_FLAG=()
 [ "$STRICT" = 1 ] && STRICT_FLAG=(--strict)
+if [ "$MODE" = collect ]; then
+  COLLECT=1
+  STRICT_FLAG+=(--allow-todo)
+  printf '%s%s%s\n' "$C_YEL" \
+    "注意:当前是 --collect-only 只采集模式:只打印真实值,不产出模块 zip,最终一定返回非零。" "$C_RST"
+fi
 # 1) 清单校验(任何 TODO/规则违例都会在这里失败 C1/C2/C3/C7)
 apps_python --validate "${STRICT_FLAG[@]}"
 
@@ -667,6 +721,23 @@ mkdir -p "$DIST_DIR" "$APK_DIR"
   printf -- '- 模块版本: %s (versionCode %s)\n' "$VERSION" "$VERSION_CODE"
   printf -- '- APK 来源目录: %s\n\n' "$APK_DIR"
 } > "$REPORT"
+
+COLLECT_VALUES="$DIST_DIR/collected-values.txt"
+COLLECT_TSV="$WORK/collected.tsv"
+: > "$COLLECT_TSV"
+if [ "$COLLECT" = 1 ]; then
+  {
+    printf '# GKUI-Pack 值采集报告(--collect-only)
+'
+    printf '# 生成时间(UTC): %s
+' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '# 用途:apps.yaml 中 signer_sha256 / sha256 等 TODO 字段的真实取值。
+'
+    printf '# 注意:本文件只是"值",不会自动写入 apps.yaml —— 请人工核对后填写。
+
+'
+  } > "$COLLECT_VALUES"
+fi
 
 apps_python --emit-tsv > "$WORK/enabled.tsv"
 : > "$WORK/included.txt"
@@ -695,13 +766,16 @@ while IFS=$'\t' read -r APP_ID APP_NAME APP_PKG STOCK_PKG APP_REPO APP_UP APP_LI
 
   # 3.1 资产 sha256 校验(C5:APK 由 CI 下载并校验 sha256)
   actual_asset_sha="$(sha256_of "$asset_path")"
-  if [ "$actual_asset_sha" != "$(norm_hex "$APP_SHA")" ]; then
+  if [ "$COLLECT" = 1 ]; then
+    info "采集模式:实际资产 sha256 = $actual_asset_sha(apps.yaml 记录: $APP_SHA)"
+  elif [ "$actual_asset_sha" != "$(norm_hex "$APP_SHA")" ]; then
     die "资产 sha256 不匹配: $asset_path
       期望(apps.yaml): $(norm_hex "$APP_SHA")
       实际(本地文件): $actual_asset_sha
       拒绝继续:可能是资产被替换、下载不完整,或 apps.yaml 尚未更新到该版本。"
+  else
+    info "资产 sha256 校验通过: ${actual_asset_sha:0:16}…"
   fi
-  info "资产 sha256 校验通过: ${actual_asset_sha:0:16}…"
 
   # 3.2 必要时解包(zip 包装的资产),取其中唯一的 APK
   mkdir -p "$WORK/apks"
@@ -736,6 +810,35 @@ $(printf '%s\n' "$found")"
   pf_json="$WORK/preflight-$APP_ID.json"
   rc=0
   bash "$PREFLIGHT" "$staged" "$APP_ID" --report "$REPORT" --json "$pf_json" || rc=$?
+
+  if [ "$COLLECT" = 1 ]; then
+    [ "$rc" = 3 ] && die "APK 门禁环境不完整(aapt/apksigner 缺失),无法采集 $APP_ID 的值" 2
+    # 采集模式:门禁失败也要把"该填什么值"记录下来,便于回填 apps.yaml
+    collect_values "$pf_json" "$APP_ID" "$APP_PKG" "$staged_sha" "$actual_asset_sha" "$APP_ASSET" >> "$COLLECT_VALUES"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$APP_ID" "$actual_asset_sha" "$staged_sha" \
+      "$(json_get "$pf_json" signer_sha256)" "$(json_get "$pf_json" version_code)" >> "$COLLECT_TSV"
+    printf '%s[采集] %s:%s\n' "$C_YEL" "$APP_ID" "$C_RST"
+    while IFS=$'\t' read -r k v; do
+      [ -n "$k" ] && printf '        %-24s %s\n' "$k" "$v"
+    done < <(python3 - "$pf_json" <<'PYC'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+for k in ("application_id", "version_code", "version_name", "signer_sha256", "module_suitable", "result"):
+    v = d.get(k, "")
+    if isinstance(v, bool):
+        v = "true" if v else "false"
+    if v != "":
+        print("%s\t%s" % (k, v))
+PYC
+)
+    rm -f "$staged"
+    continue
+  fi
+
   case "$rc" in
     0) : ;;
     2)
@@ -758,6 +861,36 @@ $(printf '%s\n' "$found")"
     "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$vc" "$signer" "$staged_sha" "$APP_ASSET" \
     >> "$WORK/included.txt"
 done < "$WORK/enabled.tsv"
+
+if [ "$COLLECT" = 1 ]; then
+  printf '\n%s=== 只采集模式结果(未产出模块 zip)===%s\n' "$C_BLD" "$C_RST"
+  printf '真实值报告: %s\n' "$COLLECT_VALUES"
+  printf '门禁报告  : %s\n' "$REPORT"
+  printf '\n%s可回填到 apps.yaml 的片段(请人工核对;installed_version_code 是设备事实,\n用 bash scripts/probe-device.sh 采集):%s\n' "$C_BLD" "$C_RST"
+  python3 - "$COLLECT_TSV" <<'PYEOF'
+# -*- coding: utf-8 -*-
+"""把采集到的值排版成 apps.yaml 片段(仅打印)"""
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    rows = [ln.rstrip("\n").split("\t") for ln in fh if ln.strip()]
+for row in rows:
+    while len(row) < 5:
+        row.append("")
+    app_id, asset_sha, apk_sha, signer, vc = row[:5]
+    print("  # %s" % app_id)
+    print("      sha256: %s          # 资产 %s 的 sha256" % (asset_sha, app_id))
+    if asset_sha != apk_sha:
+        print("      # 注意:该资产是 zip 包装,解包后 APK 的 sha256 = %s" % apk_sha)
+    print("      signer_sha256: %s" % (signer or "<未取到>"))
+    print("      # version_code(该 APK)= %s;installed_version_code 请在设备上实测" % (vc or "<未取到>"))
+    print("")
+PYEOF
+  printf '%s重要:%s本模式**不产出任何模块 zip**,且退出码为 1(C7:apps.yaml 仍有 TODO 时不许假装构建成功)。\n' "$C_YEL" "$C_RST"
+  printf '请把上面的值填入 apps.yaml(并删除对应的 TODO 注释),然后执行:\n'
+  printf '    bash build.sh --check\n'
+  exit 1
+fi
 
 included_count="$(grep -c . "$WORK/included.txt" || true)"
 excluded_count="$(grep -c . "$WORK/excluded.txt" || true)"

@@ -46,6 +46,10 @@
 | C7 | 不确定的值写 `TODO` 并让构建失败 | `build.sh` |
 | C8 | 同包名已存在于 `/data` 时必须**中止安装**(提示用户自行 `pm uninstall`),模块**不得**代为卸载 | `module/customize.sh` |
 
+唯一一处对 C7 的宽松处理:**`enabled: false` 的条目**里残留的 `TODO` 不阻断构建
+(它不参与构建)。这样录音机在"包名待确认"的长期状态下不会卡死整个项目。
+需要字面语义时用 `--strict`。
+
 ## 3. 目录地图
 
 ```
@@ -67,11 +71,17 @@ tests/test_build.sh           离线全流程测试:桩 aapt/apksigner + 假 APK
 ```bash
 bash tests/test_build.sh              # 离线自测(不需要网络、设备、Android SDK)
 bash build.sh --check                 # 只做字段与门禁校验,不出包
+bash build.sh --check --strict        # 连 disabled 条目的 TODO 也算失败(字面版 C7)
 bash build.sh --dump-apps-json        # 查看 apps.yaml 规范化后的 JSON
-bash scripts/preflight-apk.sh <apk> <id>   # 单文件门禁
-bash scripts/install_all.sh --dry-run      # 主方案演练(只打印,不装)
+bash build.sh --collect-only          # 只采集真实值(不产出模块,永远非零)
+bash scripts/preflight-apk.sh <apk> <id>   # 单文件门禁(七项)
+bash scripts/install_all.sh --dry-run      # 【主方案】演练(只打印,不装)
 bash scripts/uninstall_all.sh --dry-run
+bash scripts/probe-device.sh          # 只读采集设备事实
 ```
+
+注意:**其它脚本一律通过 `bash build.sh --emit-tsv` / `--dump-apps-json` 读取
+apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实来源)。
 
 ## 5. 添加一个新应用的标准流程
 
@@ -95,13 +105,26 @@ bash scripts/uninstall_all.sh --dry-run
   `Signature|privileged permissions not in privapp-permissions whitelist` → bootloop。
   检出此情况**不要生成白名单 XML**,而是**不入模块**并提示仅走 adb 安装。
 
-## 7. 提交前自检
+## 7. 值的来源纪律
+
+`apps.yaml` 中已经填好的值**只能**来自可复核的来源,并且必须在 PR / 提交信息里说明出处:
+
+* 包名 / `stock_package`:设备实测(事实基线)或 `probe-device.sh` 的输出;
+* `release_tag` / `asset_name` / `sha256`:对应仓库的 Release 元数据
+  (`gh api repos/<owner>/<repo>/releases`;`sha256` 取自 asset 的 `digest` 字段);
+* `source_url`(GPL 必需):Release tag 经 API 解析出的 commit 链接;
+* `signer_sha256` / `installed_version_code`:**TODO**,必须由真实 APK 与真实设备采集
+  (`--collect-only` / `probe-device.sh`),**任何人都不许手写**。
+
+## 8. 提交前自检
 
 ```bash
 git ls-files | grep -c '\.apk$'                      # 必须为 0
 grep -rn "mode: replace" apps.yaml                   # 必须无结果
 grep -rn "priv-app" module/                          # 必须无结果
 grep -rniE "dialer|telephony|messaging|contacts" apps.yaml   # 必须无结果
-bash tests/test_build.sh                             # 必须通过
+bash tests/test_build.sh                             # 必须通过(含上述全部验收项的自动检查)
+find . -name '*.apk' -not -path './.git/*' | wc -l   # 必须为 0(含未跟踪文件)
 shellcheck -S error $(git ls-files '*.sh')           # 必须无 error
+shellcheck -S error module/META-INF/com/google/android/update-binary
 ```
