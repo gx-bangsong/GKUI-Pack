@@ -136,6 +136,26 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 - **判断"设备上是否安装"要用 `pm list packages`,不要用 dumpsys 是否取到 versionCode**:
   adb 偶发返回空,会被误读成"未安装"(clock 上真实踩过,一度把 IVC 记成 none)。
 
+- **门禁断言不要绑死在某个具体字段上**。曾有验收写成"recorder 的 `application_id`
+  必须以 `TODO` 开头",结果每回填一个实测值都要求同步改 CI 工作流 —— 而工作流只有
+  用户能推(路径 B),耦合纯属自找。正确写法是断言**不变量**:未证实 → 必须
+  `confidence: unverified`、必须禁用、`application_id != stock_package`、且
+  `_todo_fields` 非空(`build.sh --dump-apps-json` 已提供该字段)。这样回填实测值
+  不再需要碰工作流。
+- **versionName ≠ versionCode**。用户说"版本号是 1.1"时,1.1 只可能是 versionName;
+  versionCode 是整数(该例实测为 1)。`apps.yaml` 的 `installed_version_code`
+  只登记整数,永远不要把小数值当 versionCode 写进去。
+- **`pm list packages <关键词>` 是子串过滤,不是精确匹配**:用 `Contains()` 判定
+  "是否存在"时,理论上可能被相似包名误命中(录音机这次同时拿到了 `versionCode=1`,
+  误命中概率极低)。要更严格可再用 `pm path <完整包名>` 复核一次。
+
+- **`set -o pipefail` + `grep -q` = 假失败**:`grep -q` 一命中就退出并关闭管道,
+  上游还在写(如 `git log`)就会吃到 SIGPIPE,管道整体返回 **141** —— 于是"找到了"
+  被当成"没找到"。本工程的脚本里已经踩过一次(重建脚本的幂等守卫失效)。
+  写法:先把输出重定向到变量或文件,再 `grep -q`;或在该管道后加 `|| true`。
+  (仓库现有的 `printf '%s' "$out" | grep -q ...` 属于小输出、进 64KB 管道缓冲区即写完,
+  暂时安全;但输出一旦变大就会变成随机失败。)
+
 ## 7. 值的来源纪律
 
 `apps.yaml` 中已经填好的值**只能**来自可复核的来源,并且必须在 PR / 提交信息里说明出处:

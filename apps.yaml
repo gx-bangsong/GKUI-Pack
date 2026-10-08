@@ -171,18 +171,30 @@ apps:
   #       并声明 SPDX-License-Identifier = "Apache-2.0"
   #       (LICENSES/Apache-2.0.txt 存在)。GitHub API 的 license 字段为
   #       "无法识别",故以仓库内 REUSE 元数据为准。
-  #   application_id 仍为 TODO:事实基线中该值 UNVERIFIED。源码 app/build.gradle.kts
-  #   写着 applicationId = org.lineageos.recorder 且 debug 构建带
-  #   applicationIdSuffix = ".dev" —— 但这只是**源码意图,不是已构建 APK 的事实**,
-  #   按 C1 严禁据此回填(反例:GKUICalendar 的包名连基名都不同)。
-  #   name 亦保持 TODO:name 与仓库名/上游名并不同形
+  #   application_id 已回填为 org.lineageos.recorder.dev —— 依据是**设备实测**
+  #   (2026-10-08,用户真机):采集走 README「🪟 Windows」那段 PowerShell ——
+  #   先用 pm list packages -3 判该包名是否存在,存在才继续 dumpsys package 取
+  #   versionCode,输出行为
+  #       org.lineageos.recorder.dev   installed_version_code = 1
+  #   即"设备上确实存在该包名,且 versionCode=1"。
+  #     * 源码 app/build.gradle.kts 里 applicationId = org.lineageos.recorder
+  #       且 debug 构建带 applicationIdSuffix = ".dev",与实测恰好一致 —— 但填写
+  #       依据是上面的实测输出,**不是**源码意图(C1;反例:GKUICalendar 的包名
+  #       连基名都不同)。规律只是巧合,不是证据。
+  #     * 下游防护:APK 下载后 preflight 会把 badging 里的真实包名与本字段逐字符
+  #       比对,不一致即 CI 失败 —— 错值不可能带着出包。
+  #   installed_version_code 同为实测:1。用户补充的人工可读版本 1.1 是 versionName
+  #   (versionCode 只能是整数),本清单只登记 versionCode。
+  #   name 仍保持 TODO:name 与仓库名/上游名并不同形
   #   (反例:android_packages_apps_DeskClock → GKUIClock),不构成可验证事实。
-  #   该仓库当前**没有任何 Release、也没有任何 Tag**,因此不存在可供下载与校验的
-  #   资产。confidence: unverified + enabled: false → build.sh 跳过它并拒绝入包。
+  #   该仓库当前**没有任何 Release、也没有任何 Tag**:拿不到可下载、可校验 sha256
+  #   的资产,所以 source_url(commit 级)/ release_tag / asset_name / sha256 /
+  #   signer_sha256 仍为 TODO。
+  #   confidence: unverified + enabled: false → build.sh 跳过它并拒绝入包。
   # ---------------------------------------------------------------------------
   - id: recorder
     name: TODO
-    application_id: TODO
+    application_id: org.lineageos.recorder.dev
     stock_package: org.lineageos.recorder
     repo: gx-bangsong/GKUIRecorder
     upstream: LineageOS/android_packages_apps_Recorder
@@ -192,7 +204,7 @@ apps:
     asset_name: TODO
     sha256: TODO
     signer_sha256: TODO
-    installed_version_code: TODO
+    installed_version_code: 1
     install_as: system_app
     mode: coexist
     confidence: unverified

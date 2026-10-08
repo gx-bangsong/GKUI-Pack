@@ -113,10 +113,10 @@ $adb = Join-Path $PWD 'adb.exe'          # 用绝对路径,切目录也不会失
 #    (unauthorized = 手机还没点"允许 USB 调试";空列表 = 线/口/驱动问题)
 & $adb devices
 
-# 2) 四个应用的已安装 versionCode(等价于 probe 里 dumpsys 那一步)
+# 2) 五个应用的已安装 versionCode(等价于 probe 里 dumpsys 那一步;含录音机)
 #    先判"是否安装"(用 pm list packages,可靠),再取 versionCode;
 #    这样"adb 偶发取不到"不会被误读成"设备上没装"。
-$pkgs = 'ws.xsoh.etar.debug','org.lineageos.glimpse.dev','com.android.calculator2.dev','com.android.deskclock.dev'
+$pkgs = 'ws.xsoh.etar.debug','org.lineageos.glimpse.dev','com.android.calculator2.dev','com.android.deskclock.dev','org.lineageos.recorder.dev'
 foreach ($p in $pkgs) {
   $listed = (& $adb shell pm list packages $p) -join "`n"
   if (-not $listed.Contains($p)) { "{0,-30} 未安装" -f $p; continue }
@@ -128,11 +128,12 @@ foreach ($p in $pkgs) {
 # 3) 若上面有"未取到",先看清楚设备上到底装了什么:
 & $adb shell pm list packages | Select-String -Pattern 'etar|glimpse|calculator2|deskclock|recorder'
 
-# 4) 录音机的真实包名(严禁按 .dev 规律推断;包名只能实测)
+# 4) 录音机包名已实测为 org.lineageos.recorder.dev(2026-10-08)。注意:严禁按 .dev
+#    规律推断 —— 当初能填进 apps.yaml 是因为有下面的实测输出,规律本身不是证据。
 & $adb shell pm list packages -3 | Select-String recorder    # -3 = 仅用户空间安装的
 ```
 
-拿到那四个数字后,在 **GitHub 网页编辑器**里填进 `apps.yaml` 对应的
+拿到这些数字后,在 **GitHub 网页编辑器**里填进 `apps.yaml` 对应的
 `installed_version_code:` 行即可(Windows 上无需任何命令行)。
 
 > 想看更细的设备信息(签名、路径等)?那就是 `probe-device.sh` 的活;它需要 bash,
@@ -296,7 +297,7 @@ adb shell pm disable-user --user 0 <stock_package>
 |---|---|---|
 | `sha256` | Release 资产的 sha256 | 已按 GitHub Releases API 的 asset digest 填好(核查时间 2026-10-08);CI 每次构建都会重新下载并逐字节复算 |
 | `signer_sha256` | APK 签名证书 SHA-256 | ✅ **已填**(2026-10-08 CI Release 运行在真实 APK 上由 `apksigner` 实测,见 `PREFLIGHT-REPORT.md` G4);CI 每次构建都会重新比对,不一致即 fail(C6) |
-| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none` |
+| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none`。录音机条目另实测到 `org.lineageos.recorder.dev=1`(条目仍禁用,原因见下节) |
 
 ### 设备侧:`scripts/probe-device.sh`(只读)
 
@@ -323,18 +324,27 @@ bash build.sh --collect-only     # 打印每个 APK 的真实 applicationId / ve
 * CI 的 tag 构建(`release.yml`)会自动跑一遍这个步骤,并把报告作为 artifact
   上传 —— 于是你可以:打 tag → 下载 artifact → 回填 `apps.yaml` → 重新打 tag。
 
-### 录音机(GKUIRecorder)为什么是 `enabled: false`
+### 录音机(GKUIRecorder)为什么仍然是 `enabled: false`
 
-* `application_id` 处于 `UNVERIFIED` 状态,**严禁**按 `.dev` 规律填写(C1);
-* 仓库 `gx-bangsong/GKUIRecorder` 确实存在(描述:"基于LineageOS录音机,添加打点功能"),
-  但**没有任何 Release、也没有任何 Tag**,因此没有可下载、可校验的资产;
+* **包名与已装版本都已实测**(2026-10-08):真机采集得到 `org.lineageos.recorder.dev`,
+  `installed_version_code = 1` —— 用的就是上一节「Windows 用户」那段 PowerShell
+  (先 `pm list packages -3` 判存在、再 `dumpsys package` 取 versionCode)。
+  源码里 `applicationIdSuffix = ".dev"` 恰与实测一致,但那只是巧合:
+  填写依据是实测输出,不是规律。
+* **真正的拦路石是资产**:仓库 `gx-bangsong/GKUIRecorder` 目前**没有任何 Release、
+  也没有任何 Tag**,拿不到可下载、可校验 sha256 的 APK,于是 `source_url`(commit 级)、
+  `release_tag`、`asset_name`、`sha256`、`signer_sha256` 只能继续留 `TODO`,
+  条目保持 `enabled: false`。
 * 上游与许可**已核实**:上游为 `LineageOS/android_packages_apps_Recorder`
   (GitHub API 的 `parent` / `source` 字段),许可为 **Apache-2.0**
   (仓库内 `REUSE.toml` + `LICENSES/Apache-2.0.txt`;API 的 license 字段"无法识别")。
-  仍缺的是**包名**与**可下载资产**。
-* 待确认方式:`bash scripts/probe-device.sh --filter recorder` 可列出设备上
-  用户空间安装的包名 —— 那里的结果才是**证据**,规律不是。
-
+* **想让它进包?** 给 GKUIRecorder 打一个 Release(附 debug APK),然后:
+  打 tag 触发 CI → 下载 `PREFLIGHT-REPORT.md`(真实 APK 的包名 / versionCode /
+  签名证书 / 资产 sha256 都在里面)→ 回填 `apps.yaml` → 再打 tag。
+  回填前条目保持禁用;万一 `application_id` 填错,preflight 会拿 APK 的真实包名
+  逐字符比对并让 CI 失败,错值带不出包。
+* 复核命令:`bash scripts/probe-device.sh --filter recorder`(列出设备上用户空间的包名
+  —— 那里的结果才是证据,规律不是)。
 ---
 
 ## 🧰 命令速查
@@ -454,10 +464,10 @@ NOTICE.md                 上游 → fork → 本仓库 的归属与许可链条
   Magisk 模块约定(读取 `module.prop`、执行 `customize.sh`)"这一公开约定;
   Magisk 侧走标准 `install_module` 流程。`update-binary` 里为非 Magisk 环境提供了
   保守兜底流程(不确定就失败,绝不半成品安装),但同样未在真机验证。
-* **recorder(GKUIRecorder)的 `application_id` 仍未确认**(上游与许可已核实为
-  `LineageOS/android_packages_apps_Recorder` / Apache-2.0):条目保持
-  `confidence: unverified` + `enabled: false`,该仓库没有任何 Release/Tag。
-* **`clock` 的 APK 未声明 versionCode**(设备上那一份实测为 0,与平台语义一致):
+* **recorder(GKUIRecorder)拦在门外的不是包名,而是资产**:包名与 versionCode 已实测
+  (`org.lineageos.recorder.dev` / 1),但该仓库**没有任何 Release / Tag**,拿不到可下载、
+  可校验 sha256 的 APK;因此条目保持 `confidence: unverified` + `enabled: false`
+  (上游与许可已核实为 `LineageOS/android_packages_apps_Recorder` / Apache-2.0)。
   G7 按"未声明=0"参与比较。但"versionCode=0 的 APK 装入 `/system/app` 后的真机行为"**未实测**。
 * **采集过程留痕**:第一次采集 clock 时 adb 偶发返回空,一度被误读成"未安装";
   已在 apps.yaml 的注释里如实记录,采集命令也改为先用 `pm list packages` 判是否安装。

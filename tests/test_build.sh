@@ -228,7 +228,7 @@ run_build() { # $1=工作区repo $2=APK_DIR $3=dist $4...=额外参数与环境(
 }
 
 # -----------------------------------------------------------------------------
-head1 "1) 真实仓库状态:四个应用字段已齐全,仅 disabled 的 recorder 留 TODO"
+head1 "1) 真实仓库状态:四个应用字段已齐全;recorder 已实测回填但仍留 TODO(禁用)"
 # -----------------------------------------------------------------------------
 out="$(cd "$REPO_ROOT" && bash build.sh --check 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then ok "bash build.sh --check 通过(rc=0):启用条目已无 TODO"; else bad "字段已齐全却未通过校验(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
@@ -774,12 +774,18 @@ out = subprocess.run(["bash", "build.sh", "--dump-apps-json"], cwd=sys.argv[1],
 data = json.loads(out)
 for app in data["apps"]:
     if app["id"] == "recorder":
+        # 设计要点:断言写成**不变量**(未证实 → 必须 unverified/禁用/不得指向官方包名/
+        # 仍留 TODO),而不是"application_id 必须以 TODO 开头"。后者每回填一个实测字段
+        # 就要连 CI 工作流一起改,而工作流只能由用户经网页编辑器落地 —— 徒增耦合。
         ok = (app["confidence"] == "unverified" and app["_enabled"] is False
-              and str(app["application_id"]).upper().startswith("TODO"))
+              and app["application_id"] == "org.lineageos.recorder.dev"
+              and app["application_id"] != app["stock_package"]
+              and str(app["installed_version_code"]) == "1"
+              and bool(app["_todo_fields"]))
         sys.exit(0 if ok else 1)
 sys.exit(1)
 PYEOF
-then ok "recorder 条目 confidence=unverified 且 enabled=false 且 application_id=TODO"; else bad "recorder 条目不符合要求"; fi
+then ok "recorder:实测包名与 versionCode 已回填,且仍 unverified + disabled + 留有 TODO"; else bad "recorder 条目不符合要求"; fi
 if grep -q '^\*.apk$' "$REPO_ROOT/.gitignore" && grep -q '^dist/$' "$REPO_ROOT/.gitignore" \
    && grep -q '^build/$' "$REPO_ROOT/.gitignore" && grep -q '^\*.keystore$' "$REPO_ROOT/.gitignore"; then
   ok ".gitignore 含 *.apk / dist/ / build/ / *.keystore"
