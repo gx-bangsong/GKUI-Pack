@@ -143,7 +143,7 @@ jobs:
           fi
           echo "未命中 C4 禁用类别"
 
-      - name: 录音机条目必须 unverified + enabled false 且不得指向官方包名
+      - name: 录音机条目必须保持安全不变量(不得指向官方包名;禁用时必须 unverified)
         run: |
           python3 - <<'PY'
           import json
@@ -156,12 +156,14 @@ jobs:
           if not rec:
               raise SystemExit("apps.yaml 缺少 recorder 条目")
           app = rec[0]
-          assert app["confidence"] == "unverified", app["confidence"]
-          assert app["_enabled"] is False, app["_enabled"]
-          # C2:绝不指向官方包名。这里刻意断言**不变量**而不是
-          # "application_id 必须以 TODO 开头" —— 后者每回填一个实测值都要改工作流,
-          # 而工作流只能由用户经网页编辑器落地,耦合没有意义。
+          # C2:绝不指向官方包名(无论启用与否都要成立)。
           assert app["application_id"] != app["stock_package"], app["application_id"]
+          # 状态无关的不变量:禁用 ⇒ 必须是未证实(unverified)。
+          # 启用后的完整性由 build.sh 与上一处 C7 步骤保证:
+          # enabled + TODO/unverified ⇒ 构建必然失败,不可能带着未证实的值出包。
+          # 这样录音机"启用/禁用"都不需要再改工作流。
+          if not app["_enabled"]:
+              assert app["confidence"] == "unverified", app["confidence"]
           print("recorder 条目符合要求: application_id=%s confidence=%s enabled=%s"
                 % (app["application_id"], app["confidence"], app["_enabled"]))
           PY
