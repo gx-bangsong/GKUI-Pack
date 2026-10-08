@@ -24,6 +24,14 @@
 #                          实测"设备上没有该包名"时写 none(测量结果,不是未知)
 #   install_as             仅允许 system_app
 #                          (见 C3:模块一律装到 system/app,禁止使用特权应用目录)
+#   privileged_ack         【可选,C3 显式确认制】缺省/false:门禁检出该 APK **申请**了
+#                          signature|privileged 权限(preflight 的 ADVISORY_LIST)即排除出
+#                          模块(fail-safe)。写 true = 明知这些权限在 /system/app 下
+#                          **不会被授予**、依赖它们的功能不会生效,仍以普通系统应用纳入;
+#                          报告 / 清单 / 构建摘要会逐条标注。它不是豁免:绝不进
+#                          priv-app、绝不生成白名单 XML 的物理底线不变。
+#   privileged_note        【可选,仅与 privileged_ack: true 搭配】用人话写明后果
+#                          (如"通话录音不会生效,需 priv 变体"),原样进入三处标注。
 #   mode                   仅允许 coexist(见 C2:绝不 replace,绝不碰 stock 应用)
 #   confidence             confirmed / unverified(unverified 一律不得入包)
 #   enabled                是否纳入构建

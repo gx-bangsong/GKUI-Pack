@@ -439,6 +439,97 @@ if printf '%s' "$out" | grep -q '未检出 signature|privileged 权限声明'; t
 auth_n="$(printf '%s' "$out" | grep -c 'com.example.stub.fileprovider' || true)"
 if [ "$auth_n" -eq 1 ]; then ok "authorities 已去重(只出现 1 次)"; else bad "authority 重复出现 ${auth_n} 次"; fi
 
+# 7b) C3 显式确认制:**同一特权夹具**,给 clock 写上 privileged_ack: true →
+#     以普通系统应用纳入 system/app,且报告 / 清单 / 构建摘要逐条标注;
+#     calendar 同样写 ack 但它并未申请特权权限 → 不产生任何标注(ack 不是"豁免",只是确认)。
+set_ack() { # $1=workspace repo $2=app id $3=privileged_ack 值 $4=privileged_note(可空)
+  python3 - "$1/apps.yaml" "$2" "$3" "${4:-}" <<'PYEOF2'
+import sys
+path, app_id, ack, note = sys.argv[1:5]
+text = open(path, encoding="utf-8").read()
+blocks = text.split("  - id: ")
+out = [blocks[0]]
+for blk in blocks[1:]:
+    lines = blk.split("\n")
+    if lines[0].strip() == app_id:
+        new = []
+        for ln in lines:
+            new.append(ln)
+            if ln.startswith("    install_as: "):
+                new.append("    privileged_ack: " + ack)
+                if note:
+                    new.append('    privileged_note: "' + note + '"')
+        lines = new
+    out.append("  - id: " + "\n".join(lines))
+open(path, "w", encoding="utf-8").write("".join(out))
+PYEOF2
+}
+ACK_NOTE='通话录音不会生效,需 priv 变体(分支 recorder-priv)'
+cp "$WORK/repo/apps.yaml" "$WORK/apps.yaml.noack"
+set_ack "$WORK/repo" clock true "$ACK_NOTE"
+set_ack "$WORK/repo" calendar true
+out="$(cd "$WORK/repo" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q 'id=clock.*privileged_ack=true'; then
+  ok "privileged_ack: true 能通过清单校验,且在 --check 输出里显式标出"
+else
+  bad "privileged_ack: true 的清单校验异常(rc=$rc)"; printf '%s\n' "$out" | tail -8
+fi
+out="$(run_build "$WORK/repo" "$WORK/apks-priv" "$WORK/dist-ack" 2>&1)"; rc=$?
+ZIP_ACK="$WORK/dist-ack/GKUI-Pack-test-1.zip"
+MAN_ACK="$WORK/dist-ack/build-manifest.txt"
+REP_ACK="$WORK/dist-ack/PREFLIGHT-REPORT.md"
+if [ $rc -eq 0 ] && [ -f "$ZIP_ACK" ]; then ok "privileged_ack: true 时构建成功"; else bad "privileged_ack 构建失败(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
+if [ -f "$ZIP_ACK" ]; then
+  if unzip -l "$ZIP_ACK" | grep -q 'apks/GKUIClock.apk'; then ok "已显式确认的特权申请者以 system_app 纳入模块"; else bad "已确认的条目仍被排除"; fi
+  if unzip -l "$ZIP_ACK" | grep -q 'priv-app'; then bad "ack 后 zip 内出现特权应用目录字样"; else ok "ack 后 zip 内仍无特权应用目录字样(物理底线不变)"; fi
+  if unzip -l "$ZIP_ACK" | grep -qiE 'permissions/.*\.xml'; then bad "ack 后 zip 内出现权限白名单 XML"; else ok "ack 后 zip 内没有任何白名单 XML"; fi
+  if unzip -p "$ZIP_ACK" customize.sh | grep -q 'com.android.deskclock.dev|GKUIClock|'; then ok "渲染清单含已确认条目(落点仍是 system/app)"; else bad "渲染清单缺少已确认条目"; fi
+fi
+if grep -q '^excluded' "$MAN_ACK" 2>/dev/null; then bad "ack 后清单仍有 excluded 行"; else ok "ack 后清单没有 excluded 行"; fi
+clock_row="$(grep '^included	clock	' "$MAN_ACK" 2>/dev/null || true)"
+case "$clock_row" in
+  *WRITE_SECURE_SETTINGS*"不会被授予"*"$ACK_NOTE"*) ok "build-manifest.txt 逐条标注:权限名 + 不会被授予 + privileged_note" ;;
+  *) bad "build-manifest.txt 缺少 ack 标注:$clock_row" ;;
+esac
+cal_row="$(grep '^included	calendar	' "$MAN_ACK" 2>/dev/null || true)"
+case "$cal_row" in
+  *"	-") ok "未申请特权权限的条目即使写了 ack 也不产生标注(note 列为 -)" ;;
+  *) bad "calendar 行的 note 列异常:$cal_row" ;;
+esac
+if printf '%s' "$out" | grep -q '\[privileged_ack\].*WRITE_SECURE_SETTINGS.*'"$ACK_NOTE"; then ok "构建摘要逐条标注(权限名 + note)"; else bad "构建摘要缺少 ack 标注"; fi
+if printf '%s' "$out" | grep -q '并不会授予 signature|privileged 权限'; then ok "构建摘要说明 /system/app 不会授予特权权限"; else bad "构建摘要缺少『不会授予』说明"; fi
+if printf '%s' "$out" | grep -q '已排除出本模块'; then bad "ack 后仍打印了排除提示"; else ok "ack 后不再打印排除提示"; fi
+if grep -q '结论: privileged_acknowledged' "$REP_ACK" 2>/dev/null && grep -q '标注: 该 APK 申请特权权限 android.permission.WRITE_SECURE_SETTINGS' "$REP_ACK" 2>/dev/null; then
+  ok "PREFLIGHT-REPORT.md 标注结论 privileged_acknowledged + 权限名"
+else
+  bad "PREFLIGHT-REPORT.md 缺少 ack 标注"
+fi
+if grep -q "privileged_note):$ACK_NOTE" "$REP_ACK" 2>/dev/null; then ok "PREFLIGHT-REPORT.md 带上了 privileged_note"; else bad "PREFLIGHT-REPORT.md 缺少 privileged_note"; fi
+if grep -q '不进 priv-app、不生成任何 privapp 白名单 XML' "$REP_ACK" 2>/dev/null; then ok "PREFLIGHT-REPORT.md 重申物理底线"; else bad "PREFLIGHT-REPORT.md 缺少物理底线说明"; fi
+
+# 7c) privileged_ack: false 必须与缺省完全一致(排除)—— fail-safe
+cp "$WORK/apps.yaml.noack" "$WORK/repo/apps.yaml"
+set_ack "$WORK/repo" clock false
+out="$(run_build "$WORK/repo" "$WORK/apks-priv" "$WORK/dist-ackfalse" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && ! unzip -l "$WORK/dist-ackfalse/GKUI-Pack-test-1.zip" 2>/dev/null | grep -q 'apks/GKUIClock.apk'; then
+  ok "privileged_ack: false 与缺省一致:仍被排除"
+else
+  bad "privileged_ack: false 的行为异常(rc=$rc)"
+fi
+if grep -q '^excluded	clock	.*WRITE_SECURE_SETTINGS' "$WORK/dist-ackfalse/build-manifest.txt" 2>/dev/null; then ok "excluded 行写明了触发的特权权限"; else bad "excluded 行缺少权限名"; fi
+if printf '%s' "$out" | grep -q 'privileged_ack: true'; then ok "排除提示告诉用户显式确认的写法"; else bad "排除提示未说明 privileged_ack"; fi
+
+# 7d) 非法取值:privileged_ack 只能是 true/false;privileged_note 不能脱离 ack: true 单独出现
+cp "$WORK/apps.yaml.noack" "$WORK/repo/apps.yaml"
+set_ack "$WORK/repo" clock yes
+out="$(cd "$WORK/repo" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'privileged_ack=.* 非法'; then ok "privileged_ack: yes(非布尔)被拒绝"; else bad "非法 privileged_ack 未被拒绝(rc=$rc)"; fi
+cp "$WORK/apps.yaml.noack" "$WORK/repo/apps.yaml"
+set_ack "$WORK/repo" clock false "$ACK_NOTE"
+out="$(cd "$WORK/repo" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'privileged_note 只能与 privileged_ack: true'; then ok "privileged_note 脱离 ack: true 时被拒绝"; else bad "孤立的 privileged_note 未被拒绝(rc=$rc)"; fi
+cp "$WORK/apps.yaml.noack" "$WORK/repo/apps.yaml"
+
 # -----------------------------------------------------------------------------
 head1 "8) C8:/data 冲突检查(渲染后的 customize.sh + 桩 pm)"
 # -----------------------------------------------------------------------------
@@ -523,6 +614,25 @@ if [ -f "$ZIP" ]; then
   else
     bad "APK 被篡改却未中止(rc=$rc)"
   fi
+
+  # 8.6 C3 兜底:模块目录里若有特权变体(recorder-priv,同一模块 id)的残留落点
+  #     (特权应用目录 / privapp 白名单 XML),普通版安装时必须清掉,只留 system/app
+  MODRES="$WORK/modres"
+  stage_module "$MODRES"
+  mkdir -p "$MODRES/system/priv-app/GKUIRecorder" "$MODRES/system/etc/permissions"
+  printf 'stale\n' > "$MODRES/system/priv-app/GKUIRecorder/GKUIRecorder.apk"
+  printf '<permissions/>\n' > "$MODRES/system/etc/permissions/privapp-permissions-gkui-recorder.xml"
+  out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODRES" FAKE_PM_PKG="__none__" \
+          FAKE_PM_MODE="absent" sh "$MODRES/customize.sh" 2>&1 )"; rc=$?
+  if [ $rc -eq 0 ]; then ok "存在特权残留时安装仍成功"; else bad "存在残留时安装失败(rc=$rc)"; printf '%s\n' "$out" | tail -12; fi
+  if [ ! -e "$MODRES/system/priv-app" ] && [ ! -e "$MODRES/system/etc" ]; then
+    ok "清除了特权应用目录与白名单 XML 残留"
+  else
+    bad "特权残留未被清除"
+  fi
+  if [ "$(ls -A "$MODRES/system" 2>/dev/null | tr '\n' ' ')" = "app " ]; then ok "清理后 system/ 下只剩 app/"; else bad "system/ 下仍有其它落点: $(ls -A "$MODRES/system" | tr '\n' ' ')"; fi
+  if printf '%s' "$out" | grep -q '\[清理\] 移除非 system/app 的残留落点'; then ok "清理动作有明确提示"; else bad "缺少清理提示"; fi
+  if [ -f "$MODRES/system/app/GKUICalendar/GKUICalendar.apk" ]; then ok "清理不影响正常挂载"; else bad "清理后应用未挂载"; fi
 
   # 8.5 未渲染的 customize.sh(仓库原始版)必须拒绝安装
   out="$( env PATH="$WORK/bin:$PATH" MODPATH="$WORK/emptymod" sh "$REPO_ROOT/module/customize.sh" 2>&1 )"; rc=$?

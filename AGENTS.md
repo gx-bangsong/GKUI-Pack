@@ -39,7 +39,7 @@
 |---|---|---|
 | C1 | 禁止推断 applicationId;未知值 `TODO` + 构建失败 | `build.sh` 字段校验 |
 | C2 | `mode` 恒为 `coexist`,**严禁** `replace`;禁止任何写 stock 目录的路径;禁止 Magisk `REPLACE` / `.replace` | `build.sh`、`module/customize.sh` |
-| C3 | 一律装到 `/system/app/<Name>/`,**严禁 `priv-app`**;检出 privileged 权限则**不入模块**,README 标注"仅走 adb install" | `preflight-apk.sh`、`build.sh` |
+| C3 | 一律装到 `/system/app/<Name>/`,**严禁 `priv-app`**、严禁生成任何白名单 XML(物理底线);检出 privileged 权限申请时按**显式确认制**处理:条目未写 `privileged_ack` → **不入模块**(fail-safe,README 标注"仅走 adb install");条目写明 `privileged_ack: true` → 以 `system_app` 纳入,但报告 / 清单 / 构建摘要必须**逐条标注**申请了哪些特权权限、这些权限不会被授予、后果(`privileged_note`)。`customize.sh` 还会清掉模块目录 `system/` 下除 `app/` 以外的任何落点(从 `recorder-priv` 变体刷回时不留残留) | `preflight-apk.sh`、`build.sh`、`module/customize.sh` |
 | C4 | 严禁纳入拨号 / 短信 / 联系人(`sharedUserId="android.uid.shared"` + platform 签名,第三方签名无法替换) | `apps.yaml` 字段校验 + CI 检查 |
 | C5 | 仓库不得提交任何 `.apk` | `.gitignore`、`tests/test_build.sh` |
 | C6 | 记录 APK 签名证书 SHA-256;证书与 `apps.yaml` 不一致时 CI fail 并提示卸载重装会丢数据 | `preflight-apk.sh`、`release.yml` |
@@ -103,7 +103,11 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
   它不在 ROM 自带的 `privapp-permissions` 白名单里,
   一旦申请 `signature|privileged` 权限就会让 zygote 抛
   `Signature|privileged permissions not in privapp-permissions whitelist` → bootloop。
-  检出此情况**不要生成白名单 XML**,而是**不入模块**并提示仅走 adb 安装。
+  检出此情况**不要生成白名单 XML**:缺省**不入模块**并提示仅走 adb 安装;只有条目显式写
+  `privileged_ack: true` 才以**普通系统应用**纳入,且必须逐条标注"这些权限不会被授予"
+  (`/system/app` 只是"系统应用"标记,**不会授予** `CAPTURE_AUDIO_OUTPUT` 之类的特权权限)。
+  不要为了让某个应用"功能完整"而放宽这条 —— 需要特权的功能属于 priv 变体(`recorder-priv`
+  分支)/ ROM 侧集成,超出本模块范围。
 - **解析 `aapt dump badging` 必须按字段名整体匹配,绝不能做子串匹配**。
   真实输出形如:
 

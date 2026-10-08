@@ -272,7 +272,7 @@ adb shell pm disable-user --user 0 <stock_package>
 |---|---|---|
 | C1 | **不推断包名** | known 反例:`GKUICalendar` fork 自 Etar,但它的 applicationId 是 `ws.xsoh.etar.debug`,不是 `org.lineageos.etar.debug`。凡不在事实基线中的值一律写 `TODO`,构建失败。 |
 | C2 | **只做 coexist** | `mode` 只允许 `coexist`;不生成任何写入 stock 应用目录的代码;不使用 Magisk 的 `REPLACE` 变量或 `.replace` 文件。 |
-| C3 | **只装 `system/app`** | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。门禁若检出某 APK **申请**此类权限,**不生成白名单 XML**,而是**把它排除出模块**,并在此标注「该应用仅走 adb install」。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
+| C3 | **只装 `system/app`**(显式确认制) | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。**物理底线**:本模块绝不进 `priv-app`、绝不生成任何白名单 XML(代码里根本没有这条路径;`customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当作残留清掉)。门禁若检出某 APK **申请**此类权限:① 条目**未写** `privileged_ack` → **排除出模块**,仅走 adb install(fail-safe,缺省行为);② 条目**显式写明** `privileged_ack: true` → 允许以 `install_as: system_app` 纳入 `/system/app`,但报告 / 清单 / 构建摘要会**逐条标注**「该 APK 申请特权权限 X/Y/Z;以普通系统应用纳入,这些权限不会被授予;<`privileged_note`>」—— `/system/app` 只是"系统应用"标记,**并不会授予**这些权限。目前唯一的 ack 条目是录音机(申请 `CAPTURE_AUDIO_OUTPUT`,通话录音不会生效,需 `recorder-priv` 分支的特权变体)。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
 | C4 | **不含拨号 / 短信 / 联系人** | 它们使用 `sharedUserId="android.uid.shared"` 并依赖 platform 签名,第三方签名无法替换,任何打包尝试都必然失败。因此本仓库**不接受**这类应用,即使被要求也不做。 |
 | C5 | **仓库不含 APK** | `.gitignore` 含 `*.apk`、`dist/`、`build/`、`*.keystore`;验收 `git ls-files \| grep -c '\.apk$'` 必须为 `0`;APK 由 CI 下载并校验 sha256。 |
 | C6 | **签名必须匹配** | 每个 APK 的证书 SHA-256 与 `apps.yaml` 记录不一致 → 构建失败,并提示「需卸载重装,应用内数据会丢失」。 |
@@ -370,7 +370,7 @@ bash scripts/probe-device.sh          # 只读采集设备事实
 |---|---|---|
 | G1 | `aapt dump badging` 取 `package: name=`(**不读解包 manifest 的 package 属性** —— Etar 系那里是 AOSP 残留 `com.android.calendar`,会误导);取值按**整字段**匹配 —— 真实 badging 行里有 `compileSdkVersionCodename='16'`,它含小写 `name='`,子串匹配会把平台代号当成包名(本工程实际踩过,已加回归测试) | 失败 |
 | G2 | 断言无 `sharedUserId` | 失败 |
-| G3 | 列出 `uses-permission`;申请**平台签名/特权权限清单**(`ADVISORY_LIST`)则判为不适合模块化;另把本 APK **自己声明**的 `<permission>` 的 `protectionLevel` 解码后一并报告(如 `0x12` → `signature\|system`) | 申请命中 → 该应用**不适合模块化**,仅走 adb install(排除出模块,绝不生成白名单 XML);自声明权限**不影响**判定(androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 就是 signature 级,属正常做法) |
+| G3 | 列出 `uses-permission`;申请**平台签名/特权权限清单**(`ADVISORY_LIST`)则记为"申请了特权权限"(退出码 2,命中的权限写入 JSON 的 `privileged_permissions`);另把本 APK **自己声明**的 `<permission>` 的 `protectionLevel` 解码后一并报告(如 `0x12` → `signature\|system`) | 申请命中 → 条目未写 `privileged_ack: true` 时该应用**不适合模块化**,仅走 adb install(排除出模块);写了 `privileged_ack: true` 时结论为 `privileged_acknowledged`:以 `system_app` 纳入并逐条标注"这些权限不会被授予"。两种情况都**绝不生成白名单 XML**;自声明权限**不影响**判定(androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 就是 signature 级,属正常做法) |
 | G4 | `apksigner verify --print-certs` 的证书 SHA-256 与 `apps.yaml` 比对 | 失败(提示数据丢失) |
 | G5 | 断言 `applicationId != stock_package`(C2) | 失败 |
 | G6 | 提取 `<provider>` authorities 与 `<permission>`,authority 不以 applicationId 为前缀则标红 | **仅报告,不影响退出码** |
