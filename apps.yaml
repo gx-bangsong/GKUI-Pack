@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# GKUI-Pack 应用清单 —— 全仓库唯一事实来源(Single Source of Truth)
+#
+# 本文件只保存**事实**。任何无法验证的值一律写 TODO,构建会因此失败(C7)。
+# 严禁按仓库名 / 上游项目 / 命名后缀规律推断 applicationId(C1)。
+#   已知反例:GKUICalendar fork 自 LineageOS 的 Etar,但其 applicationId 是
+#   ws.xsoh.etar.debug,而不是 org.lineageos.etar.debug —— 规律不成立。
+#
+# 字段说明:
+#   id                     本工程内部标识(小写字母/数字/下划线)
+#   name                   模块内目录名,产物路径 system/app/<name>/<name>.apk
+#   application_id         【设备实测】GKUI 应用真实包名(带 .debug/.dev 后缀)
+#   stock_package          【设备实测】ROM 自带应用包名(coexist 的参照物,不替换)
+#   repo                   APK 来源仓库,格式 owner/name(GitHub Releases)
+#   upstream               repo 的上游项目
+#   license                repo 的许可(以本工程事实基线为准)
+#   source_url             GPL 强制:对应版本的源码链接(commit 级)
+#   release_tag            目标 Release tag(精确匹配,不做"最接近"猜测)
+#   asset_name             目标 Release 资产名(必须逐字符一致)
+#   sha256                 Release **资产文件**的 sha256(小写 hex,见下方语义说明)
+#   signer_sha256          APK 签名证书 SHA-256(去冒号小写 hex,来自 apksigner)
+#   installed_version_code 【设备实测】设备当前已安装同包名应用的 versionCode
+#   install_as             仅允许 system_app
+#                          (见 C3:模块一律装到 system/app,禁止使用特权应用目录)
+#   mode                   仅允许 coexist(见 C2:绝不 replace,绝不碰 stock 应用)
+#   confidence             confirmed / unverified(unverified 一律不得入包)
+#   enabled                是否纳入构建
+#
+# sha256 语义说明:
+#   本字段是「CI 从 GitHub Releases 下载的那个资产文件」的 sha256,**不是**解压后
+#   APK 的 sha256(个别仓库的资产是 zip 包装,见 calculator)。
+#   本文件已填写的 sha256 取自 GitHub Releases API 的 asset digest 字段
+#   (由 GitHub 服务端计算),核查时间 2026-10-08;CI 每次构建都会重新下载同一
+#   资产并逐字节复算比对,不一致即 fail。解压后 APK 的实际 sha256 由
+#   dist/build-manifest.txt 记录;APK 的身份由 preflight 的
+#   包名 + versionCode + 签名证书三重门禁约束。
+#
+# 本清单严禁加入 拨号 / 短信 / 联系人 类应用(C4:它们使用系统共享 UID 并依赖
+#   platform 签名,第三方签名无法替换,任何打包尝试都必然失败)。
+# =============================================================================
+schema_version: 1
+
+apps:
+  # ---------------------------------------------------------------------------
+  # 日历(GKUICalendar,上游 Etar,继承 GPL-3.0)
+  # ---------------------------------------------------------------------------
+  - id: calendar
+    name: GKUICalendar
+    application_id: ws.xsoh.etar.debug
+    stock_package: org.lineageos.etar
+    repo: gx-bangsong/GKUICalendar
+    upstream: LineageOS/android_packages_apps_Etar
+    license: GPL-3.0
+    # GPL 强制:对应源码链接(该 Release tag 经 GitHub API 解析出的提交)
+    source_url: https://github.com/gx-bangsong/GKUICalendar/commit/edf951d41909d274474bfde6700bae591608f924
+    release_tag: "1.0"
+    asset_name: GKUICalendar-1.0.apk
+    sha256: 13be77cad54742054bc5acb0d489efb4d98e047f414e277568a87dfbdfe8046f
+    # TODO(需真机/真 APK):apksigner verify --print-certs 的输出
+    signer_sha256: TODO
+    # TODO(需真机):dumpsys package ws.xsoh.etar.debug | grep versionCode
+    installed_version_code: TODO
+    install_as: system_app
+    mode: coexist
+    confidence: confirmed
+    enabled: true
+
+  # ---------------------------------------------------------------------------
+  # 图库(GKUIPhotos,上游 Glimpse,Apache-2.0)
+  # 注意:该仓库当前**只有 prerelease**(beta1 / beta2),没有正式版。
+  #       此处按"最新 Release"取 beta2,并优先选用原始 APK 资产(而非 zip 包装)。
+  # ---------------------------------------------------------------------------
+  - id: gallery
+    name: GKUIPhotos
+    application_id: org.lineageos.glimpse.dev
+    stock_package: org.lineageos.glimpse
+    repo: gx-bangsong/GKUIPhotos
+    upstream: LineageOS/android_packages_apps_Glimpse
+    license: Apache-2.0
+    source_url: https://github.com/gx-bangsong/GKUIPhotos/commit/5158d5813c4b152ac70ee92fc823736e65da9e30
+    release_tag: "beta2"
+    asset_name: app-debug.apk
+    sha256: b5e039fb867c76d1ca17935b51186564ebcb409c50a90c2ee20a231c08e172f7
+    signer_sha256: TODO
+    installed_version_code: TODO
+    install_as: system_app
+    mode: coexist
+    confidence: confirmed
+    enabled: true
+
+  # ---------------------------------------------------------------------------
+  # 计算器(GKUICalculator,上游 ExactCalculator,Apache-2.0)
+  # 注意:该仓库的 Release 资产是 **zip 包装**(ExactCalculator-debug.apk.zip),
+  #       构建时会先解压再取其中唯一的 APK;若压缩包内 APK 不唯一则直接 fail。
+  # ---------------------------------------------------------------------------
+  - id: calculator
+    name: GKUICalculator
+    application_id: com.android.calculator2.dev
+    stock_package: com.android.calculator2
+    repo: gx-bangsong/GKUICalculator
+    upstream: LineageOS/android_packages_apps_ExactCalculator
+    license: Apache-2.0
+    source_url: https://github.com/gx-bangsong/GKUICalculator/commit/3819af269e0a866fc61046787a0f09f44753cfb0
+    release_tag: "v1.0.1"
+    asset_name: ExactCalculator-debug.apk.zip
+    sha256: dfae8f8731797a7ffe09377a8c0141579077fb389d37f730d052cc4b2e400fc0
+    signer_sha256: TODO
+    installed_version_code: TODO
+    install_as: system_app
+    mode: coexist
+    confidence: confirmed
+    enabled: true
+
+  # ---------------------------------------------------------------------------
+  # 时钟(GKUIClock,上游 DeskClock,Apache-2.0)
+  # 注意:来源仓库名沿用事实基线(gx-bangsong/android_packages_apps_DeskClock),
+  #       不因"看起来更像 ROM 源码仓库"而替换成同账号下的其它仓库。
+  # ---------------------------------------------------------------------------
+  - id: clock
+    name: GKUIClock
+    application_id: com.android.deskclock.dev
+    stock_package: com.android.deskclock
+    repo: gx-bangsong/android_packages_apps_DeskClock
+    upstream: LineageOS/android_packages_apps_DeskClock
+    license: Apache-2.0
+    source_url: https://github.com/gx-bangsong/android_packages_apps_DeskClock/commit/e7fd65ec8f5fb1496ee7ac85e70327f97689380c
+    release_tag: "v1.0.1"
+    asset_name: DeskClock-debug.apk
+    sha256: 206d5e9cc348622036ed6cdbfe78d8db3bae9080bfa5836de2d2af8cca34f0fa
+    signer_sha256: TODO
+    installed_version_code: TODO
+    install_as: system_app
+    mode: coexist
+    confidence: confirmed
+    enabled: true
+
+  # ---------------------------------------------------------------------------
+  # 录音机(GKUIRecorder)—— **未纳入构建**
+  #   application_id 为 TODO:事实基线中该值 UNVERIFIED,且严禁按 .dev 规律填写
+  #   (C1)。仓库 gx-bangsong/GKUIRecorder 确实存在(描述:"基于LineageOS录音机,
+  #   添加打点功能"),但该仓库当前**没有任何 Release、也没有任何 Tag**,
+  #   因此不存在可供下载与校验的资产;上游与许可同样尚未确认。
+  #   confidence: unverified + enabled: false → build.sh 会跳过它并拒绝入包。
+  # ---------------------------------------------------------------------------
+  - id: recorder
+    name: TODO
+    application_id: TODO
+    stock_package: org.lineageos.recorder
+    repo: gx-bangsong/GKUIRecorder
+    upstream: TODO
+    license: TODO
+    source_url: TODO
+    release_tag: TODO
+    asset_name: TODO
+    sha256: TODO
+    signer_sha256: TODO
+    installed_version_code: TODO
+    install_as: system_app
+    mode: coexist
+    confidence: unverified
+    enabled: false
