@@ -158,3 +158,35 @@ jobs:
           app = rec[0]
           assert app["confidence"] == "unverified", app["confidence"]
           assert app["_enabled"] is False, app["_enabled"]
+          assert str(app["application_id"]).upper().startswith("TODO"), app["application_id"]
+          print("recorder 条目符合要求: application_id=%s confidence=%s enabled=%s"
+                % (app["application_id"], app["confidence"], app["_enabled"]))
+          PY
+
+      - name: C7 清单含 TODO 时 build.sh 必须非零(无 TODO 时必须通过)
+        run: |
+          set -uo pipefail
+          pending="$(python3 - <<'PY'
+          import json
+          import subprocess
+
+          out = subprocess.run(["bash", "build.sh", "--dump-apps-json"],
+                               capture_output=True, text=True).stdout
+          apps = json.loads(out)["apps"]
+          print(sum(1 for a in apps if a.get("_enabled") and a.get("_todo_fields")))
+          PY
+          )"
+          echo "仍有 TODO 的启用条目数: $pending"
+          if [ "$pending" -gt 0 ]; then
+            if bash build.sh --check >/dev/null 2>&1; then
+              echo "::error::apps.yaml 存在 TODO,但 build.sh --check 竟然通过(违反 C7)"
+              exit 1
+            fi
+            echo "符合预期:存在 TODO → build.sh 拒绝构建"
+          else
+            if ! bash build.sh --check >/dev/null 2>&1; then
+              echo "::error::apps.yaml 已无 TODO,但 build.sh --check 失败"
+              exit 1
+            fi
+            echo "符合预期:无 TODO → build.sh 校验通过"
+          fi
