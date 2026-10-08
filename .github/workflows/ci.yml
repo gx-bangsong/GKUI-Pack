@@ -143,7 +143,7 @@ jobs:
           fi
           echo "未命中 C4 禁用类别"
 
-      - name: 录音机条目必须 unverified + enabled false + application_id TODO
+      - name: 录音机条目必须 unverified + enabled false 且不得指向官方包名
         run: |
           python3 - <<'PY'
           import json
@@ -158,7 +158,10 @@ jobs:
           app = rec[0]
           assert app["confidence"] == "unverified", app["confidence"]
           assert app["_enabled"] is False, app["_enabled"]
-          assert str(app["application_id"]).upper().startswith("TODO"), app["application_id"]
+          # C2:绝不指向官方包名。这里刻意断言**不变量**而不是
+          # "application_id 必须以 TODO 开头" —— 后者每回填一个实测值都要改工作流,
+          # 而工作流只能由用户经网页编辑器落地,耦合没有意义。
+          assert app["application_id"] != app["stock_package"], app["application_id"]
           print("recorder 条目符合要求: application_id=%s confidence=%s enabled=%s"
                 % (app["application_id"], app["confidence"], app["_enabled"]))
           PY
