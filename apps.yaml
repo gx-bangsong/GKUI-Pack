@@ -69,8 +69,7 @@
 #   结论:四个应用都装在设备上(与工程最初的事实基线一致)。
 #
 # 仍为 TODO 的字段(必须实测,严禁推断):
-#   录音机条目的全部身份字段(application_id / release_tag / asset_name / sha256 …)
-#   —— 该仓库无 Release/Tag,且包名只能由真机 pm list packages 证实(C1)。
+#   录音机条目的 signer_sha256 —— 待真实 APK 的 apksigner 采集(其余值已按 API / 实测回填)。
 #
 # 本清单严禁加入 拨号 / 短信 / 联系人 类应用(C4:它们使用系统共享 UID 并依赖
 #   platform 签名,第三方签名无法替换,任何打包尝试都必然失败)。
@@ -172,48 +171,65 @@ apps:
     enabled: true
 
   # ---------------------------------------------------------------------------
-  # 录音机(GKUIRecorder)—— **未纳入构建**
+  # 录音机(GKUIRecorder,上游 Recorder,Apache-2.0)—— 以**普通系统应用**纳入(C3 显式确认制)
   #   upstream / license 已核实(2026-10-08,GitHub API + 仓库内元数据):
   #     * API 的 parent 与 source 字段均为 LineageOS/android_packages_apps_Recorder;
   #     * fork 仓库内 REUSE.toml 自述 SPDX-PackageDownloadLocation 指向同一上游,
   #       并声明 SPDX-License-Identifier = "Apache-2.0"
   #       (LICENSES/Apache-2.0.txt 存在)。GitHub API 的 license 字段为
   #       "无法识别",故以仓库内 REUSE 元数据为准。
-  #   application_id 已回填为 org.lineageos.recorder.dev —— 依据是**设备实测**
-  #   (2026-10-08,用户真机):采集走 README「🪟 Windows」那段 PowerShell ——
-  #   先用 pm list packages -3 判该包名是否存在,存在才继续 dumpsys package 取
-  #   versionCode,输出行为
-  #       org.lineageos.recorder.dev   installed_version_code = 1
-  #   即"设备上确实存在该包名,且 versionCode=1"。
-  #     * 源码 app/build.gradle.kts 里 applicationId = org.lineageos.recorder
-  #       且 debug 构建带 applicationIdSuffix = ".dev",与实测恰好一致 —— 但填写
-  #       依据是上面的实测输出,**不是**源码意图(C1;反例:GKUICalendar 的包名
-  #       连基名都不同)。规律只是巧合,不是证据。
-  #     * 下游防护:APK 下载后 preflight 会把 badging 里的真实包名与本字段逐字符
-  #       比对,不一致即 CI 失败 —— 错值不可能带着出包。
-  #   installed_version_code 同为实测:1。用户补充的人工可读版本 1.1 是 versionName
-  #   (versionCode 只能是整数),本清单只登记 versionCode。
-  #   name 仍保持 TODO:name 与仓库名/上游名并不同形
-  #   (反例:android_packages_apps_DeskClock → GKUIClock),不构成可验证事实。
-  #   该仓库当前**没有任何 Release、也没有任何 Tag**:拿不到可下载、可校验 sha256
-  #   的资产,所以 source_url(commit 级)/ release_tag / asset_name / sha256 /
-  #   signer_sha256 仍为 TODO。
-  #   confidence: unverified + enabled: false → build.sh 跳过它并拒绝入包。
+  #   application_id / installed_version_code 为**设备实测**(2026-10-08,用户真机):
+  #     采集走 README「🪟 Windows」那段 PowerShell —— 先用 pm list packages -3 判该包名
+  #     是否存在,存在才继续 dumpsys package 取 versionCode,输出行为
+  #         org.lineageos.recorder.dev   installed_version_code = 1
+  #     即"设备上确实存在该包名,且 versionCode=1"。
+  #     * 源码 app/build.gradle.kts 里 applicationId = org.lineageos.recorder 且 debug
+  #       构建带 applicationIdSuffix = ".dev",与实测恰好一致 —— 但填写依据是上面的实测
+  #       输出,**不是**源码意图(C1;反例:GKUICalendar 的包名连基名都不同)。
+  #       规律只是巧合,不是证据。
+  #     * 下游防护:APK 下载后 preflight 会把 badging 里的真实包名与本字段逐字符比对,
+  #       不一致即 CI 失败 —— 错值不可能带着出包。
+  #     * 用户补充的人工可读版本 1.1 是 versionName(versionCode 只能是整数),
+  #       本清单只登记 versionCode。
+  #   Release 已存在(2026-10-08):以下四个值全部取自 GitHub Releases API
+  #   (gh api repos/gx-bangsong/GKUIRecorder/releases,逐字符原样,不做任何"最接近"猜测):
+  #     * release_tag  = .[0].tag_name            → beta2(prerelease,published_at 2026-10-08T13:21:53Z)
+  #     * asset_name   = .[0].assets[0].name      → GKUIRecorder-beta2.apk(该 Release 唯一资产,
+  #                                                  用户已改名,不再与 gallery 的 app-debug.apk 冲突)
+  #     * sha256       = .[0].assets[0].digest    → 去掉 sha256: 前缀;资产文件本身的 sha256(与其余四条同口径)
+  #     * source_url   = tag → commit(gh api repos/…/commits/beta2 的 .sha)
+  #       注意:beta1 与 beta2 两个 tag 都指向同一个 commit 4650818f(即 fork 默认分支
+  #       lineage-23.2 的顶端,与上游一致);这里按规则如实登记 tag 解析出的 commit,不替换成
+  #       其它分支上"看起来更像"的提交。
+  #   name = GKUIRecorder:用户确认的模块内目录名(name 与仓库名/上游名并不同形,不构成可
+  #   验证事实,因此必须由用户给出)。
+  #   signer_sha256:TODO —— 唯一无法从 API 得到的值,必须由真实 APK 的
+  #   apksigner verify --print-certs 采集(--collect-only),采集完成后回填并改 confidence。
+  #   C3 显式确认制(2026-10-08 用户决策):该 APK 申请 android.permission.CAPTURE_AUDIO_OUTPUT
+  #   (通话录音所需,在 preflight 的 ADVISORY_LIST 内)。privileged_ack: true 表示明知
+  #   /system/app 只是"系统应用"标记、**不会授予**该权限、通话录音不会生效,仍以普通系统
+  #   应用纳入;通话录音需要 priv 变体(分支 recorder-priv:ROM 侧 priv-app + privapp 白名单),
+  #   超出本模块范围。报告 / 清单 / 构建摘要会逐条标注。
+  #   C8:设备上已有该包名的 /data 副本(实测 versionCode=1)→ 刷模块前同样要先 pm uninstall;
+  #   G7:模块内 versionCode 与设备已装版本相等时放行并打印 C8 提示(预期行为)。
   # ---------------------------------------------------------------------------
   - id: recorder
-    name: TODO
+    name: GKUIRecorder
     application_id: org.lineageos.recorder.dev
     stock_package: org.lineageos.recorder
     repo: gx-bangsong/GKUIRecorder
     upstream: LineageOS/android_packages_apps_Recorder
     license: Apache-2.0
-    source_url: TODO
-    release_tag: TODO
-    asset_name: TODO
-    sha256: TODO
+    source_url: https://github.com/gx-bangsong/GKUIRecorder/commit/4650818fbc158d996263b4a21b378af4deb9970a
+    release_tag: "beta2"
+    asset_name: GKUIRecorder-beta2.apk
+    sha256: f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
+    # TODO(待采集):真实 APK 的 apksigner verify --print-certs(见 --collect-only)
     signer_sha256: TODO
     installed_version_code: 1
     install_as: system_app
+    privileged_ack: true
+    privileged_note: "通话录音不会生效,需 priv 变体(分支 recorder-priv)"
     mode: coexist
     confidence: unverified
-    enabled: false
+    enabled: true
