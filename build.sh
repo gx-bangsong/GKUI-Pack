@@ -39,8 +39,12 @@
 # 设计要点(勿改,改了会破坏硬约束):
 #   C1/C7  未知值必须是 TODO,并且在构建时**失败**,绝不降级为 warning。
 #   C2     mode 只允许 coexist;绝不生成任何写入 stock 应用目录的代码路径。
-#   C3     只装 system/app;检出 privileged 权限的条目**被排除出模块**,
-#          在摘要与 README 中标注"仅走 adb install"(绝不生成白名单 XML)。
+#   C3     只装 system/app(绝不进 priv-app、绝不生成任何白名单 XML)。
+#          检出 privileged 权限申请的条目默认**被排除出模块**(fail-safe);
+#          只有条目**显式写明** privileged_ack: true 时,才允许以 install_as: system_app
+#          纳入 /system/app —— 这些权限在 /system/app 下**不会被授予**,依赖它们的
+#          功能不会生效,因此报告 / 清单 / 构建摘要必须逐条标注申请了哪些特权权限
+#          (可选字段 privileged_note 用来写明具体后果,如"通话录音不会生效")。
 #   C5     构建产物只进 dist/(已被 .gitignore 忽略),仓库内不落任何 APK。
 #   C8     与 /data 同包名的冲突检查由 module/customize.sh 在安装期执行。
 # =============================================================================
@@ -99,6 +103,13 @@ FIELDS = [
     "source_url", "release_tag", "asset_name", "sha256", "signer_sha256",
     "installed_version_code", "install_as", "mode", "confidence", "enabled",
 ]
+# 可选字段(不进入 --emit-tsv 的 17 列契约,只出现在 --dump-apps-json 里):
+#   privileged_ack   C3 显式确认制:true 时允许"申请了特权权限"的 APK 以普通系统应用
+#                    (system/app)纳入模块;缺省 / false 一律保持原有排除行为(fail-safe)。
+#   privileged_note  仅与 privileged_ack: true 搭配:写明这些权限拿不到的具体后果
+#                    (如"通话录音不会生效,需 priv 变体"),原样进入报告 / 清单 / 摘要。
+OPTIONAL_FIELDS = ["privileged_ack", "privileged_note"]
+ALL_FIELDS = FIELDS + OPTIONAL_FIELDS
 REQUIRED = [
     "id", "name", "application_id", "stock_package", "repo", "upstream", "license",
     "release_tag", "asset_name", "sha256", "signer_sha256", "installed_version_code",
@@ -316,12 +327,12 @@ def norm_entry(raw, idx):
     entry = {"_index": idx, "_line": line_no}
     unknown = []
     for key in raw:
-        if key not in FIELDS:
+        if key not in ALL_FIELDS:
             unknown.append(key)
-    for key in FIELDS:
+    for key in ALL_FIELDS:
         entry[key] = raw.get(key)
     entry["_unknown"] = unknown
-    entry["_todo_fields"] = [k for k in FIELDS if is_todo(entry.get(k))]
+    entry["_todo_fields"] = [k for k in ALL_FIELDS if is_todo(entry.get(k))]
     if isinstance(raw.get("enabled"), bool):
         pass
     entry["_enabled"] = entry.get("enabled") is True
@@ -390,10 +401,29 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
             elif is_todo(val):
                 problems.append("%s 为 TODO(需实测/实算后填入)" % key)
 
+        for key in OPTIONAL_FIELDS:
+            if is_todo(entry.get(key)):
+                problems.append("%s 为 TODO(需实测/实算后填入)" % key)
+
         if entry.get("confidence") != "confirmed":
             problems.append("confidence=%r 不是 confirmed" % (entry.get("confidence"),))
         if entry.get("enabled") is not None and not isinstance(entry.get("enabled"), bool):
             errors.append("%s: enabled 必须是 true/false" % eid)
+
+        # --- C3 显式确认制:privileged_ack 只能是 true/false;note 只能伴随 ack: true ---
+        ack = entry.get("privileged_ack")
+        if ack is not None and not isinstance(ack, bool):
+            errors.append(
+                "%s: privileged_ack=%r 非法;只允许 true/false(缺省等同 false:检出特权权限即排除)" % (eid, ack)
+            )
+        note = entry.get("privileged_note")
+        if note is not None:
+            if not isinstance(note, str) or not note.strip():
+                errors.append("%s: privileged_note 必须是非空文本" % eid)
+            elif ack is not True:
+                errors.append(
+                    "%s: privileged_note 只能与 privileged_ack: true 搭配使用(当前 privileged_ack=%r)" % (eid, ack)
+                )
 
         # --- 字段格式 ---
         if isinstance(entry.get("id"), str) and not is_todo(entry["id"]) and not RE_ID.match(entry["id"]):
@@ -478,9 +508,10 @@ def emit_report(schema_version, entries, errors, warnings, skipped):
     lines.append("apps.yaml 校验: schema_version=%r,条目 %d 条" % (schema_version, len(entries)))
     for entry in entries:
         state = "纳入构建" if entry["_enabled"] else "跳过"
+        ack = "  privileged_ack=true" if entry.get("privileged_ack") is True else ""
         lines.append(
-            "  [%s] id=%-10s name=%-16s application_id=%-28s stock=%s"
-            % (state, entry.get("id"), entry.get("name"), entry.get("application_id"), entry.get("stock_package"))
+            "  [%s] id=%-10s name=%-16s application_id=%-28s stock=%s%s"
+            % (state, entry.get("id"), entry.get("name"), entry.get("application_id"), entry.get("stock_package"), ack)
         )
     for eid, reason, problems in skipped:
         detail = (";" + "、".join(problems)) if problems else ""
@@ -509,7 +540,7 @@ def main():
     if mode == "--dump-apps-json":
         out = {"schema_version": schema_version, "apps": []}
         for entry in entries:
-            clean = {k: entry.get(k) for k in FIELDS}
+            clean = {k: entry.get(k) for k in ALL_FIELDS}
             clean["_line"] = entry["_line"]
             clean["_todo_fields"] = entry["_todo_fields"]
             clean["_enabled"] = entry["_enabled"]
@@ -620,9 +651,37 @@ print("  asset_name                    : %s" % asset_name)
 print("  asset_sha256                  : %s" % asset_sha)
 print("  apk_sha256(解包后待安装物)    : %s" % apk_sha)
 print("  module_suitable               : %s" % ("true" if data.get("module_suitable") else "false"))
+perms = data.get("privileged_permissions") or []
+print("  privileged_permissions        : %s" % ("/".join(perms) if perms else "(无)"))
 print("  preflight_result              : %s" % (data.get("result") or "unknown"))
 print("")
 PYEOF
+}
+
+# 从 preflight 的 JSON 结果里取一个列表字段,用分隔符连接后输出
+json_join() { # $1=json文件 $2=字段名 $3=分隔符
+  python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+val = data.get(sys.argv[2]) or []
+if isinstance(val, list):
+    sys.stdout.write(sys.argv[3].join(str(v) for v in val))
+' "$1" "$2" "$3"
+}
+
+# C3 显式确认制的标注文案(报告 / 清单 / 构建摘要三处共用,保证措辞一致)
+privileged_annotation() { # $1=以 / 连接的特权权限列表 $2=privileged_note(可空)
+  local text="该 APK 申请特权权限 $1;以普通系统应用(/system/app)纳入,这些权限不会被授予"
+  if [ -n "${2:-}" ]; then
+    text="$text;$2"
+  else
+    text="$text,依赖它们的功能不会生效"
+  fi
+  printf '%s' "$text"
 }
 
 render_placeholder() { # $1=文件 $2=占位符 $3=替换文本
@@ -842,14 +901,30 @@ PYC
     continue
   fi
 
+  priv_perms="-"
+  priv_note=""
   case "$rc" in
     0) : ;;
     2)
-      # C3:检出 privileged 权限 → 不入模块,仅提示走 adb install
-      warn "$APP_ID 检出 signature|privileged 权限,不适合模块化;已排除出本模块,仅可走 adb install"
-      printf '%s|%s|%s|%s\n' "$APP_ID" "$APP_NAME" "$APP_PKG" "privileged 权限" >> "$WORK/excluded.txt"
-      rm -f "$staged"
-      continue
+      # C3:检出 privileged 权限申请。
+      #   * 缺省(未写 privileged_ack 或为 false)→ 排除出模块,仅提示走 adb install(fail-safe);
+      #   * 条目显式写明 privileged_ack: true → 以普通系统应用(system/app)纳入,
+      #     但这些权限不会被授予:报告 / 清单 / 摘要必须逐条标注申请了哪些特权权限。
+      #   两种情况都**绝不**进 priv-app、**绝不**生成白名单 XML(根本没有这条代码路径)。
+      APP_ACK="$(entry_field "$APP_ID" privileged_ack)"
+      priv_perms="$(json_join "$pf_json" privileged_permissions /)"
+      [ -n "$priv_perms" ] || priv_perms="(门禁未列出具体权限)"
+      if [ "$APP_ACK" = "True" ] || [ "$APP_ACK" = "true" ]; then
+        priv_note="$(entry_field "$APP_ID" privileged_note)"
+        warn "$APP_ID 申请特权权限($priv_perms),apps.yaml 已显式确认(privileged_ack: true)→ 仅以普通系统应用纳入 system/app"
+        warn "    $(privileged_annotation "$priv_perms" "$priv_note")"
+      else
+        warn "$APP_ID 检出 signature|privileged 权限申请($priv_perms),不适合模块化;已排除出本模块,仅可走 adb install"
+        warn "    (若明知这些权限不会生效仍要以普通系统应用纳入,请在 apps.yaml 该条目显式写 privileged_ack: true)"
+        printf '%s|%s|%s|%s\n' "$APP_ID" "$APP_NAME" "$APP_PKG" "申请特权权限 $priv_perms" >> "$WORK/excluded.txt"
+        rm -f "$staged"
+        continue
+      fi
       ;;
     3) die "APK 门禁环境不完整(aapt/apksigner 缺失),无法校验 $APP_ID" 2 ;;
     *) die "APK 门禁失败: $APP_ID(详见 $REPORT)" ;;
@@ -867,8 +942,10 @@ PYC
     warn "$APP_ID 的 APK 未声明 versionCode → 按平台语义记为 0(未声明)"
   fi
   [ -n "$signer" ] || die "APK 门禁结果缺少签名摘要: $pf_json"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  # 第 9/10 列:特权权限列表("-" = 未申请)与 privileged_note(记录分隔符 | 不允许出现在文案里)
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$vc" "$signer" "$staged_sha" "$APP_ASSET" \
+    "$(printf '%s' "$priv_perms" | tr '|' '/')" "$(printf '%s' "$priv_note" | tr '|' '/')" \
     >> "$WORK/included.txt"
 done < "$WORK/enabled.tsv"
 
@@ -913,7 +990,7 @@ cp -a "$ROOT/module/." "$STAGE/"
 
 ENTRY_LINES=""
 STOCK_LINES=""
-while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET; do
+while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET _PRIV _NOTE; do
   [ -n "$APP_ID" ] || continue
   cp "$WORK/apks/$APP_NAME.apk" "$STAGE/apks/$APP_NAME.apk"
   ENTRY_LINES="${ENTRY_LINES}${APP_PKG}|${APP_NAME}|${APK_SHA}"$'\n'
@@ -956,15 +1033,21 @@ MANIFEST="$DIST_DIR/build-manifest.txt"
   printf '# 产物: %s\n' "$ZIP_OUT"
   printf '#\n# 说明:asset_sha256 是 Release 资产文件的 sha256(即 apps.yaml 的 sha256);\n'
   printf '#       apk_sha256 是解包后实际写入 /system/app 的 APK 的 sha256。\n'
-  printf 'state\tapp_id\tapplication_id\tname\tasset_sha256\tapk_sha256\tversion_code\tsigner_sha256\n'
-  while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET; do
+  printf '#       note 列:"-" 表示未申请特权权限;否则为 C3 显式确认制(privileged_ack: true)的逐条标注 ——\n'
+  printf '#       该 APK 申请了哪些特权权限、以普通系统应用纳入后这些权限不会被授予、具体后果(privileged_note)。\n'
+  printf '#       本模块绝不进 priv-app、绝不生成白名单 XML;excluded 行的 note 列为排除原因。\n'
+  printf 'state\tapp_id\tapplication_id\tname\tasset_sha256\tapk_sha256\tversion_code\tsigner_sha256\tnote\n'
+  while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET PRIV NOTE; do
     [ -n "$APP_ID" ] || continue
-    printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$APP_ID" "$APP_PKG" "$APP_NAME" "$(entry_field "$APP_ID" sha256)" "$APK_SHA" "$VC" "$SIGNER"
+    note="-"
+    [ "$PRIV" = "-" ] || note="$(privileged_annotation "$PRIV" "$NOTE")"
+    printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$APP_ID" "$APP_PKG" "$APP_NAME" "$(entry_field "$APP_ID" sha256)" "$APK_SHA" "$VC" "$SIGNER" "$note"
   done < "$WORK/included.txt"
   while IFS='|' read -r APP_ID APP_NAME APP_PKG REASON; do
     [ -n "$APP_ID" ] || continue
-    printf 'excluded\t%s\t%s\t%s\t-\t-\t-\t-\n' "$APP_ID" "$APP_PKG" "$APP_NAME"
+    printf 'excluded\t%s\t%s\t%s\t-\t-\t-\t-\t%s\n' "$APP_ID" "$APP_PKG" "$APP_NAME" \
+      "$REASON;不适合模块化 → 仅走 adb install(未写 privileged_ack: true)"
   done < "$WORK/excluded.txt"
 } > "$MANIFEST"
 
@@ -972,13 +1055,23 @@ MANIFEST="$DIST_DIR/build-manifest.txt"
 log ""
 printf '%s=== 构建摘要 ===%s\n' "$C_BLD" "$C_RST"
 printf '纳入模块(%s 项):\n' "$included_count"
-while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET; do
+ack_count=0
+while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET PRIV NOTE; do
   [ -n "$APP_ID" ] || continue
   printf '  ✔ %-12s %-28s → system/app/%s/%s.apk  versionCode=%s  签名=%s…\n' \
     "$APP_ID" "$APP_PKG" "$APP_NAME" "$APP_NAME" "$VC" "$(printf '%s' "$SIGNER" | cut -c1-16)"
+  if [ "$PRIV" != "-" ]; then
+    ack_count=$((ack_count + 1))
+    printf '    %s⚠ [privileged_ack] %s%s\n' "$C_YEL" "$(privileged_annotation "$PRIV" "$NOTE")" "$C_RST"
+  fi
 done < "$WORK/included.txt"
+if [ "$ack_count" -gt 0 ]; then
+  printf '%s注意:上面带 [privileged_ack] 标注的 %s 项是以普通系统应用纳入的 —— /system/app 只是"系统应用"标记,%s\n' \
+    "$C_YEL" "$ack_count" "$C_RST"
+  printf '%s      并不会授予 signature|privileged 权限;本模块不进 priv-app、不生成白名单 XML(C3)。%s\n' "$C_YEL" "$C_RST"
+fi
 if [ "$excluded_count" -gt 0 ]; then
-  printf '%s因检出 privileged 权限被排除(仅走 adb install,见 README):%s\n' "$C_YEL" "$C_RST"
+  printf '%s因检出 privileged 权限申请被排除(未写 privileged_ack: true;仅走 adb install,见 README):%s\n' "$C_YEL" "$C_RST"
   while IFS='|' read -r APP_ID APP_NAME APP_PKG REASON; do
     [ -n "$APP_ID" ] || continue
     printf '  ✘ %-12s %-28s (%s)\n' "$APP_ID" "$APP_PKG" "$REASON"

@@ -1,7 +1,7 @@
 # GKUI-Pack
 
 把 [gx-bangsong](https://github.com/gx-bangsong) 的 LineageOS 本土化应用
-(GKUI 日历 / 图库 / 计算器 / 时钟)打包安装到你**已经能正常运行的设备**上。
+(GKUI 日历 / 图库 / 计算器 / 时钟 / 录音机)打包安装到你**已经能正常运行的设备**上。
 
 本仓库是**打包与安装工程**,不含任何 APK、不含任何上游源码:
 APK 由 CI 或你本机从各应用的 GitHub Releases 下载,并逐个校验 sha256 与签名证书。
@@ -149,6 +149,7 @@ $want = @{
   'app-debug.apk'                 = 'b5e039fb867c76d1ca17935b51186564ebcb409c50a90c2ee20a231c08e172f7'
   'ExactCalculator-debug.apk.zip' = 'dfae8f8731797a7ffe09377a8c0141579077fb389d37f730d052cc4b2e400fc0'
   'DeskClock-debug.apk'           = '206d5e9cc348622036ed6cdbfe78d8db3bae9080bfa5836de2d2af8cca34f0fa'
+  'GKUIRecorder-beta2.apk'        = 'f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f'
 }
 foreach ($f in $want.Keys) {
   if (-not (Test-Path $f)) { "缺少   $f"; continue }
@@ -163,6 +164,7 @@ foreach ($f in $want.Keys) {
 & $adb install -r .\GKUICalendar-1.0.apk
 & $adb install -r .\app-debug.apk
 & $adb install -r .\DeskClock-debug.apk
+& $adb install -r .\GKUIRecorder-beta2.apk
 
 # calculator 的 Release 资产是 zip 包装:先解压,再装里面的 APK
 Expand-Archive -Path .\ExactCalculator-debug.apk.zip -DestinationPath .\calc -Force
@@ -188,7 +190,9 @@ $inner = Get-ChildItem .\calc -Recurse -Filter *.apk | Select-Object -First 1
 `build-manifest.txt` 会作为 artifact 上传,可下载查看实测值。
 
 > ℹ️ `clock` 的 APK 未声明 `versionCode`(设备上那一份实测为 0)→ 按 G7 语义**放行**
-> (见下文专节);四个应用的字段已齐全,标签构建不会再被门禁挡住。
+> (见下文专节);五个应用的字段已齐全,标签构建不会再被门禁挡住。录音机以
+> `privileged_ack: true` 纳入(C3 显式确认制),报告 / 清单 / 构建摘要会标注
+> 「申请 `CAPTURE_AUDIO_OUTPUT`,`/system/app` 不会授予,通话录音不会生效」。
 
 ### 想在 Windows 上用原脚本?
 
@@ -272,16 +276,17 @@ adb shell pm disable-user --user 0 <stock_package>
 |---|---|---|
 | C1 | **不推断包名** | known 反例:`GKUICalendar` fork 自 Etar,但它的 applicationId 是 `ws.xsoh.etar.debug`,不是 `org.lineageos.etar.debug`。凡不在事实基线中的值一律写 `TODO`,构建失败。 |
 | C2 | **只做 coexist** | `mode` 只允许 `coexist`;不生成任何写入 stock 应用目录的代码;不使用 Magisk 的 `REPLACE` 变量或 `.replace` 文件。 |
-| C3 | **只装 `system/app`** | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。门禁若检出某 APK **申请**此类权限,**不生成白名单 XML**,而是**把它排除出模块**,并在此标注「该应用仅走 adb install」。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
+| C3 | **只装 `system/app`**(显式确认制) | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。**物理底线**:本模块绝不进 `priv-app`、绝不生成任何白名单 XML(代码里根本没有这条路径;`customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当作残留清掉)。门禁若检出某 APK **申请**此类权限:① 条目**未写** `privileged_ack` → **排除出模块**,仅走 adb install(fail-safe,缺省行为);② 条目**显式写明** `privileged_ack: true` → 允许以 `install_as: system_app` 纳入 `/system/app`,但报告 / 清单 / 构建摘要会**逐条标注**「该 APK 申请特权权限 X/Y/Z;以普通系统应用纳入,这些权限不会被授予;<`privileged_note`>」—— `/system/app` 只是"系统应用"标记,**并不会授予**这些权限。目前唯一的 ack 条目是录音机(申请 `CAPTURE_AUDIO_OUTPUT`,通话录音不会生效,需 `recorder-priv` 分支的特权变体)。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
 | C4 | **不含拨号 / 短信 / 联系人** | 它们使用 `sharedUserId="android.uid.shared"` 并依赖 platform 签名,第三方签名无法替换,任何打包尝试都必然失败。因此本仓库**不接受**这类应用,即使被要求也不做。 |
 | C5 | **仓库不含 APK** | `.gitignore` 含 `*.apk`、`dist/`、`build/`、`*.keystore`;验收 `git ls-files \| grep -c '\.apk$'` 必须为 `0`;APK 由 CI 下载并校验 sha256。 |
 | C6 | **签名必须匹配** | 每个 APK 的证书 SHA-256 与 `apps.yaml` 记录不一致 → 构建失败,并提示「需卸载重装,应用内数据会丢失」。 |
 | C7 | **TODO 必须失败** | 任何必填字段为 `TODO` 或 `confidence: unverified` 都让构建**失败**,绝不降级为 warning。 |
 | C8 | **`/data` 冲突必须中止** | 见上文「刷入前必须先做的一件事」。 |
 
-> 唯一的一处宽松处理:**`enabled: false` 的条目**(目前只有录音机)里残留的
-> `TODO` 不会阻断构建 —— 因为它根本不参与构建。这是为了让项目在"录音机包名
-> 待确认"的长期状态下仍能出包。想恢复字面语义请加 `--strict`:
+> 唯一的一处宽松处理:**`enabled: false` 的条目**里残留的 `TODO` 不会阻断构建
+> —— 因为它根本不参与构建。这是为了让项目在"某个应用的事实待确认"的长期状态下
+> 仍能出包(v0.0.2 之前的录音机就处于这种状态;目前五个条目全部启用,没有条目
+> 用到这条宽松)。想恢复字面语义请加 `--strict`:
 > `bash build.sh --check --strict` 或 `bash build.sh --strict`。
 
 ---
@@ -296,8 +301,8 @@ adb shell pm disable-user --user 0 <stock_package>
 | 字段 | 来源 | 采集方式 |
 |---|---|---|
 | `sha256` | Release 资产的 sha256 | 已按 GitHub Releases API 的 asset digest 填好(核查时间 2026-10-08);CI 每次构建都会重新下载并逐字节复算 |
-| `signer_sha256` | APK 签名证书 SHA-256 | ✅ **已填**(2026-10-08 CI Release 运行在真实 APK 上由 `apksigner` 实测,见 `PREFLIGHT-REPORT.md` G4);CI 每次构建都会重新比对,不一致即 fail(C6) |
-| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none`。录音机条目另实测到 `org.lineageos.recorder.dev=1`(条目仍禁用,原因见下节) |
+| `signer_sha256` | APK 签名证书 SHA-256 | ✅ **已填**(2026-10-08 CI Release 运行在真实 APK 上由 `apksigner` 实测,见 `PREFLIGHT-REPORT.md` G4;录音机的值来自临时 tag `v0.0.3-collect` 的 `--collect-only` 采集,运行 id 见 `apps.yaml` 注释);CI 每次构建都会重新比对,不一致即 fail(C6) |
+| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none`。录音机 `org.lineageos.recorder.dev=1`(同一天同一方式实测) |
 
 ### 设备侧:`scripts/probe-device.sh`(只读)
 
@@ -324,27 +329,37 @@ bash build.sh --collect-only     # 打印每个 APK 的真实 applicationId / ve
 * CI 的 tag 构建(`release.yml`)会自动跑一遍这个步骤,并把报告作为 artifact
   上传 —— 于是你可以:打 tag → 下载 artifact → 回填 `apps.yaml` → 重新打 tag。
 
-### 录音机(GKUIRecorder)为什么仍然是 `enabled: false`
+### 录音机(GKUIRecorder):已纳入,但请先读清楚它的边界
 
-* **包名与已装版本都已实测**(2026-10-08):真机采集得到 `org.lineageos.recorder.dev`,
-  `installed_version_code = 1` —— 用的就是上一节「Windows 用户」那段 PowerShell
-  (先 `pm list packages -3` 判存在、再 `dumpsys package` 取 versionCode)。
-  源码里 `applicationIdSuffix = ".dev"` 恰与实测一致,但那只是巧合:
-  填写依据是实测输出,不是规律。
-* **真正的拦路石是资产**:仓库 `gx-bangsong/GKUIRecorder` 目前**没有任何 Release、
-  也没有任何 Tag**,拿不到可下载、可校验 sha256 的 APK,于是 `source_url`(commit 级)、
-  `release_tag`、`asset_name`、`sha256`、`signer_sha256` 只能继续留 `TODO`,
-  条目保持 `enabled: false`。
-* 上游与许可**已核实**:上游为 `LineageOS/android_packages_apps_Recorder`
-  (GitHub API 的 `parent` / `source` 字段),许可为 **Apache-2.0**
-  (仓库内 `REUSE.toml` + `LICENSES/Apache-2.0.txt`;API 的 license 字段"无法识别")。
-* **想让它进包?** 给 GKUIRecorder 打一个 Release(附 debug APK),然后:
-  打 tag 触发 CI → 下载 `PREFLIGHT-REPORT.md`(真实 APK 的包名 / versionCode /
-  签名证书 / 资产 sha256 都在里面)→ 回填 `apps.yaml` → 再打 tag。
-  回填前条目保持禁用;万一 `application_id` 填错,preflight 会拿 APK 的真实包名
-  逐字符比对并让 CI 失败,错值带不出包。
+v0.0.3 起录音机作为**普通系统应用**随模块一起进 `/system/app/GKUIRecorder/`,条目
+`enabled: true`、`confidence: confirmed`。但它和另外四个应用有一个本质区别,请务必知悉:
+
+* **它申请了 `android.permission.CAPTURE_AUDIO_OUTPUT`**(通话录音所需),这是
+  `signature|privileged` 级权限,在 preflight 的 `ADVISORY_LIST` 内。C3 的缺省行为是把
+  这类申请者**排除出模块**;录音机是**唯一**在 `apps.yaml` 里写了 `privileged_ack: true`
+  的条目,表示我们明知以下事实仍选择纳入:
+  * **`/system/app` 不会授予 `CAPTURE_AUDIO_OUTPUT`。** 那只是"系统应用"标记,
+    不是特权;系统只会把它当作一个普通应用对待。
+  * 因此**通话录音不会生效**;普通的麦克风录音不受影响。
+  * 要让通话录音工作,需要 ROM 侧的 priv-app 落点 + `privapp-permissions` 白名单
+    —— 这超出了本模块的范围(见 C3 的 bootloop 原因),属于 `recorder-priv` 分支的
+    特权变体,**本仓库主线不会做**。本模块绝不进 `priv-app`、绝不生成白名单 XML,
+    `customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当残留清掉。
+* 这条边界会出现在**三个地方**,不会只藏在文档里:`PREFLIGHT-REPORT.md`(结论
+  `privileged_acknowledged` + 标注行)、`build-manifest.txt`(`note` 列)、Actions 日志里的
+  构建摘要(`⚠ [privileged_ack]` 行)。
+* **刷入前(C8)**:设备上已有该包名的 `/data` 副本(实测 `org.lineageos.recorder.dev`
+  versionCode=1),模块内 APK 的 versionCode 也是 1 → G7 判为"同一版本"放行,但刷入时
+  C8 仍会要求你先 `pm uninstall org.lineageos.recorder.dev`(录音机设置会丢失;已有录音
+  文件是否保留取决于该版本的存放位置,本仓库未实测,**请先自行备份**)。
+* **数据来源**(全部可追溯,详见 `apps.yaml` 注释):`release_tag` / `asset_name` / `sha256`
+  取自 GitHub Releases API(Release `beta2`,prerelease);`source_url` 为该 tag 解析出的
+  commit;`application_id` / `installed_version_code` 为真机实测;`signer_sha256` 为 CI
+  在真实 APK 上 `apksigner` 采集(临时 tag `v0.0.3-collect`)。注意 `beta1` / `beta2` 两个
+  tag 指向同一个 commit(fork 默认分支的顶端),`source_url` 按规则如实登记。
 * 复核命令:`bash scripts/probe-device.sh --filter recorder`(列出设备上用户空间的包名
   —— 那里的结果才是证据,规律不是)。
+
 ---
 
 ## 🧰 命令速查
@@ -370,7 +385,7 @@ bash scripts/probe-device.sh          # 只读采集设备事实
 |---|---|---|
 | G1 | `aapt dump badging` 取 `package: name=`(**不读解包 manifest 的 package 属性** —— Etar 系那里是 AOSP 残留 `com.android.calendar`,会误导);取值按**整字段**匹配 —— 真实 badging 行里有 `compileSdkVersionCodename='16'`,它含小写 `name='`,子串匹配会把平台代号当成包名(本工程实际踩过,已加回归测试) | 失败 |
 | G2 | 断言无 `sharedUserId` | 失败 |
-| G3 | 列出 `uses-permission`;申请**平台签名/特权权限清单**(`ADVISORY_LIST`)则判为不适合模块化;另把本 APK **自己声明**的 `<permission>` 的 `protectionLevel` 解码后一并报告(如 `0x12` → `signature\|system`) | 申请命中 → 该应用**不适合模块化**,仅走 adb install(排除出模块,绝不生成白名单 XML);自声明权限**不影响**判定(androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 就是 signature 级,属正常做法) |
+| G3 | 列出 `uses-permission`;申请**平台签名/特权权限清单**(`ADVISORY_LIST`)则记为"申请了特权权限"(退出码 2,命中的权限写入 JSON 的 `privileged_permissions`);另把本 APK **自己声明**的 `<permission>` 的 `protectionLevel` 解码后一并报告(如 `0x12` → `signature\|system`) | 申请命中 → 条目未写 `privileged_ack: true` 时该应用**不适合模块化**,仅走 adb install(排除出模块);写了 `privileged_ack: true` 时结论为 `privileged_acknowledged`:以 `system_app` 纳入并逐条标注"这些权限不会被授予"。两种情况都**绝不生成白名单 XML**;自声明权限**不影响**判定(androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 就是 signature 级,属正常做法) |
 | G4 | `apksigner verify --print-certs` 的证书 SHA-256 与 `apps.yaml` 比对 | 失败(提示数据丢失) |
 | G5 | 断言 `applicationId != stock_package`(C2) | 失败 |
 | G6 | 提取 `<provider>` authorities 与 `<permission>`,authority 不以 applicationId 为前缀则标红 | **仅报告,不影响退出码** |
@@ -464,11 +479,12 @@ NOTICE.md                 上游 → fork → 本仓库 的归属与许可链条
   Magisk 模块约定(读取 `module.prop`、执行 `customize.sh`)"这一公开约定;
   Magisk 侧走标准 `install_module` 流程。`update-binary` 里为非 Magisk 环境提供了
   保守兜底流程(不确定就失败,绝不半成品安装),但同样未在真机验证。
-* **recorder(GKUIRecorder)拦在门外的不是包名,而是资产**:包名与 versionCode 已实测
-  (`org.lineageos.recorder.dev` / 1),但该仓库**没有任何 Release / Tag**,拿不到可下载、
-  可校验 sha256 的 APK;因此条目保持 `confidence: unverified` + `enabled: false`
-  (上游与许可已核实为 `LineageOS/android_packages_apps_Recorder` / Apache-2.0)。
-  G7 按"未声明=0"参与比较。但"versionCode=0 的 APK 装入 `/system/app` 后的真机行为"**未实测**。
+* **recorder(GKUIRecorder)的通话录音在本模块里不会生效**:它申请的
+  `CAPTURE_AUDIO_OUTPUT` 不会被 `/system/app` 授予(C3 显式确认制,见上文专节)。
+  "以普通系统应用形式装入后,录音机其余功能的真机行为"**未实测**;本仓库只保证门禁结论
+  与标注如实。
+* **clock 的 APK 未声明 versionCode**,G7 按"未声明=0"参与比较。但"versionCode=0 的 APK
+  装入 `/system/app` 后的真机行为"**未实测**。
 * **采集过程留痕**:第一次采集 clock 时 adb 偶发返回空,一度被误读成"未安装";
   已在 apps.yaml 的注释里如实记录,采集命令也改为先用 `pm list packages` 判是否安装。
 * 各应用的**权限与 provider authorities 实际内容**由 CI 的 preflight 在真实 APK 上判定,
