@@ -1,0 +1,37 @@
+# ============================================================
+# GKUI-Pack 忽略规则
+# 硬约束 C5:本仓库不得提交任何 .apk
+# 验收:git ls-files | grep -c '\.apk$' == 0
+# APK 一律由 CI 从 GitHub Releases 下载并校验 sha256。
+# ============================================================
+
+# --- APK / 安装包(严禁提交) ---
+*.apk
+*.apks
+*.xapk
+*.apkm
+
+# --- 构建产物 ---
+dist/
+build/
+out/
+*.zip
+
+# --- 签名材料(严禁提交) ---
+*.keystore
+*.jks
+*.p12
+*.pepk
+*.pem
+*.der
+
+# --- preflight / 构建报告产物(build.sh 与 CI 生成) ---
+PREFLIGHT-REPORT.md
+apps.json
+module/.preflight.json
+
+# --- 临时文件 ---
+*.tmp
+*.swp
+*~
+.DS_Store
