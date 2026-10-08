@@ -20,7 +20,8 @@
 #   asset_name             目标 Release 资产名(必须逐字符一致)
 #   sha256                 Release **资产文件**的 sha256(小写 hex,见下方语义说明)
 #   signer_sha256          APK 签名证书 SHA-256(去冒号小写 hex,来自 apksigner)
-#   installed_version_code 【设备实测】设备当前已安装同包名应用的 versionCode
+#   installed_version_code 【设备实测】设备当前已安装同包名应用的 versionCode;
+#                          实测"设备上没有该包名"时写 none(测量结果,不是未知)
 #   install_as             仅允许 system_app
 #                          (见 C3:模块一律装到 system/app,禁止使用特权应用目录)
 #   mode                   仅允许 coexist(见 C2:绝不 replace,绝不碰 stock 应用)
@@ -35,6 +36,33 @@
 #   资产并逐字节复算比对,不一致即 fail。解压后 APK 的实际 sha256 由
 #   dist/build-manifest.txt 记录;APK 的身份由 preflight 的
 #   包名 + versionCode + 签名证书三重门禁约束。
+#
+# signer_sha256 来源(可复核):
+#   2026-10-08 的 CI Release 运行(v0.0.1 预演)在真实 APK 上跑门禁,由
+#   apksigner verify --print-certs 实测得出,见该次运行的 PREFLIGHT-REPORT.md(G4)。
+#   同一次报告还证实:3 个非 zip 资产的“解压后 APK sha256”与上面 sha256 字段
+#   完全一致(calendar/gallery/clock),calculator 的资产是 zip 包装,其内层 APK 的
+#   sha256 记录在 dist/build-manifest.txt。
+#   ⚠️ 这些证书是 debug 构建的锚点:若设备上已安装版本的签名与之不同,
+#      覆盖安装会 INSTALL_FAILED_UPDATE_INCOMPATIBLE,必须卸载重装(数据会丢)。
+#
+# installed_version_code 来源(可复核):
+#   2026-10-08 用户在真机上用 adb(PowerShell 版采集命令,等价 probe-device.sh 的
+#   dumpsys 那一步)实测:
+#     ws.xsoh.etar.debug          = 51
+#     org.lineageos.glimpse.dev   = 1
+#     com.android.calculator2.dev = 1
+#     com.android.deskclock.dev   = 0
+#   记录经过(如实留痕):
+#     * 第一次采集时 clock 报"未取到"(adb 侧偶发),一度被记为 none;
+#       复查后确认它**确实已安装**,versionCode = 0 → 以复查结果为准。
+#     * 0 这个值与"该 APK 未声明 versionCode"完全吻合:Android 平台对未声明
+#       versionCode 的包按 0 处理,安装后记录的正是 0(同一款 APK 的另一种独立印证)。
+#   结论:四个应用都装在设备上(与工程最初的事实基线一致)。
+#
+# 仍为 TODO 的字段(必须实测,严禁推断):
+#   录音机条目的全部身份字段(application_id / release_tag / asset_name / sha256 …)
+#   —— 该仓库无 Release/Tag,且包名只能由真机 pm list packages 证实(C1)。
 #
 # 本清单严禁加入 拨号 / 短信 / 联系人 类应用(C4:它们使用系统共享 UID 并依赖
 #   platform 签名,第三方签名无法替换,任何打包尝试都必然失败)。
@@ -58,9 +86,9 @@ apps:
     asset_name: GKUICalendar-1.0.apk
     sha256: 13be77cad54742054bc5acb0d489efb4d98e047f414e277568a87dfbdfe8046f
     # TODO(需真机/真 APK):apksigner verify --print-certs 的输出
-    signer_sha256: TODO
+    signer_sha256: 815d90d0fea961417a55b860047fd25f77d5a5908bd62371158ff60198414d43
     # TODO(需真机):dumpsys package ws.xsoh.etar.debug | grep versionCode
-    installed_version_code: TODO
+    installed_version_code: 51
     install_as: system_app
     mode: coexist
     confidence: confirmed
@@ -82,8 +110,8 @@ apps:
     release_tag: "beta2"
     asset_name: app-debug.apk
     sha256: b5e039fb867c76d1ca17935b51186564ebcb409c50a90c2ee20a231c08e172f7
-    signer_sha256: TODO
-    installed_version_code: TODO
+    signer_sha256: d71e84a89336ed5bce5c934665c81b9627681417e48febcc56a3171936de9cbe
+    installed_version_code: 1
     install_as: system_app
     mode: coexist
     confidence: confirmed
@@ -105,8 +133,8 @@ apps:
     release_tag: "v1.0.1"
     asset_name: ExactCalculator-debug.apk.zip
     sha256: dfae8f8731797a7ffe09377a8c0141579077fb389d37f730d052cc4b2e400fc0
-    signer_sha256: TODO
-    installed_version_code: TODO
+    signer_sha256: 2f64e05981843ccf69fe7b578db80e5098d1c9424cc66d64d1ebbdcb3da5e122
+    installed_version_code: 1
     install_as: system_app
     mode: coexist
     confidence: confirmed
@@ -128,8 +156,8 @@ apps:
     release_tag: "v1.0.1"
     asset_name: DeskClock-debug.apk
     sha256: 206d5e9cc348622036ed6cdbfe78d8db3bae9080bfa5836de2d2af8cca34f0fa
-    signer_sha256: TODO
-    installed_version_code: TODO
+    signer_sha256: 54976292ebc2e05fe703fa32910cab984a9d142e0ffcd0c553675945b9996a9d
+    installed_version_code: 0
     install_as: system_app
     mode: coexist
     confidence: confirmed
