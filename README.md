@@ -79,6 +79,126 @@ bash scripts/uninstall_all.sh --keep-data  # 保留应用数据(仅当之后重�
 
 ---
 
+## 🪟 Windows 用户:不需要 bash
+
+本工程的 `scripts/*.sh` 与 `build.sh` 都是 bash 脚本,但**在 Windows 上你不需要它们**。
+下面三条路径覆盖脚本的全部用途,只用 Windows 自带能力 + `adb` 即可。
+
+> 前提:装 **Android Platform Tools**(官方 zip,解压即用,不需要管理员权限):
+> <https://developer.android.com/tools/releases/platform-tools>
+> Windows 10/11 自带 `curl.exe` 与解压能力:下载 zip 后在资源管理器里右键"全部解压缩"即可。
+
+**⚠️ PowerShell 不会从当前目录加载命令**(会提示
+`无法将"adb"项识别为 cmdlet...` + `Suggestion [3,General]`)。在 platform-tools
+目录下先执行下面两条之一,之后 `adb` 就能直接用:
+
+```powershell
+$env:Path = "$($PWD.Path);$env:Path"      # 本会话有效
+# 或: $adb = Join-Path $PWD 'adb.exe'     # 之后一律用 & $adb ...
+```
+
+想要一劳永逸,把 platform-tools 目录加入用户 PATH(新开的窗口才生效)。
+
+> 注意:若 `adb` 没能调用,脚本里"未安装 / 未取到"只是**命令没找到**造成的空结果,
+> **不代表设备上没装这些应用**。务必先确认 `adb devices` 能列出设备。
+
+### ① 采集设备侧事实(代替 `probe-device.sh`)
+
+```powershell
+# 0) 让 adb 可用(在 platform-tools 目录下执行)
+$env:Path = "$($PWD.Path);$env:Path"
+$adb = Join-Path $PWD 'adb.exe'          # 用绝对路径,切目录也不会失效
+
+# 1) 设备是否就绪:必须出现一行以 device 结尾
+#    (unauthorized = 手机还没点"允许 USB 调试";空列表 = 线/口/驱动问题)
+& $adb devices
+
+# 2) 四个应用的已安装 versionCode(等价于 probe 里 dumpsys 那一步)
+#    先判"是否安装"(用 pm list packages,可靠),再取 versionCode;
+#    这样"adb 偶发取不到"不会被误读成"设备上没装"。
+$pkgs = 'ws.xsoh.etar.debug','org.lineageos.glimpse.dev','com.android.calculator2.dev','com.android.deskclock.dev'
+foreach ($p in $pkgs) {
+  $listed = (& $adb shell pm list packages $p) -join "`n"
+  if (-not $listed.Contains($p)) { "{0,-30} 未安装" -f $p; continue }
+  $dump = (& $adb shell dumpsys package $p 2>$null) -join "`n"
+  if ($dump -match 'versionCode=(\d+)') { "{0,-30} installed_version_code = {1}" -f $p, $Matches[1] }
+  else { "{0,-30} 已安装,但 dumpsys 未取到 versionCode → 请重跑这一项" -f $p }
+}
+
+# 3) 若上面有"未取到",先看清楚设备上到底装了什么:
+& $adb shell pm list packages | Select-String -Pattern 'etar|glimpse|calculator2|deskclock|recorder'
+
+# 4) 录音机的真实包名(严禁按 .dev 规律推断;包名只能实测)
+& $adb shell pm list packages -3 | Select-String recorder    # -3 = 仅用户空间安装的
+```
+
+拿到那四个数字后,在 **GitHub 网页编辑器**里填进 `apps.yaml` 对应的
+`installed_version_code:` 行即可(Windows 上无需任何命令行)。
+
+> 想看更细的设备信息(签名、路径等)?那就是 `probe-device.sh` 的活;它需要 bash,
+> 可用下面的"想在 Windows 上用原脚本"一节的 WSL 方案。
+
+### ② 安装应用(代替 `install_all.sh`,即主方案)
+
+**第一步:校验 sha256**(与 `apps.yaml` 里记录的值逐字节比对,别跳过):
+
+```powershell
+$want = @{
+  'GKUICalendar-1.0.apk'          = '13be77cad54742054bc5acb0d489efb4d98e047f414e277568a87dfbdfe8046f'
+  'app-debug.apk'                 = 'b5e039fb867c76d1ca17935b51186564ebcb409c50a90c2ee20a231c08e172f7'
+  'ExactCalculator-debug.apk.zip' = 'dfae8f8731797a7ffe09377a8c0141579077fb389d37f730d052cc4b2e400fc0'
+  'DeskClock-debug.apk'           = '206d5e9cc348622036ed6cdbfe78d8db3bae9080bfa5836de2d2af8cca34f0fa'
+}
+foreach ($f in $want.Keys) {
+  if (-not (Test-Path $f)) { "缺少   $f"; continue }
+  $h = (Get-FileHash -Algorithm SHA256 $f).Hash.ToLower()
+  if ($h -eq $want[$f]) { "OK     $f" } else { "不匹配 $f`n    期望 $($want[$f])`n    实际 $h" }
+}
+```
+
+**第二步:逐个安装**(只用 `adb install -r`,不卸载、不禁用、不修改任何已有应用):
+
+```powershell
+& $adb install -r .\GKUICalendar-1.0.apk
+& $adb install -r .\app-debug.apk
+& $adb install -r .\DeskClock-debug.apk
+
+# calculator 的 Release 资产是 zip 包装:先解压,再装里面的 APK
+Expand-Archive -Path .\ExactCalculator-debug.apk.zip -DestinationPath .\calc -Force
+$inner = Get-ChildItem .\calc -Recurse -Filter *.apk | Select-Object -First 1
+& $adb install -r $inner.FullName
+```
+
+失败时的错误码含义见下面「常见错误码」表;最典型的是
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`(**debug 签名不一致**)→ 必须先卸载再装,
+**应用内数据会丢失**(日历/图库数据在系统 Provider 中,不受影响;时钟闹钟、计算器历史会丢)。
+
+### ③ 出包(代替 `build.sh`)
+
+模块 zip 由 **CI 构建**,你的电脑不需要装任何构建工具:
+
+1. 按第 ① 步的数字填好 `apps.yaml`(网页编辑器即可)→ 提交到 `main`;
+2. 仓库 → **Releases** → *Draft a new release* → *Choose a tag* → 输入 `v0.0.2`
+   → *Create new tag* → *Publish release*;
+3. 等 **Actions** 跑完(约 1~2 分钟),在 Release 页面下载 `GKUI-Pack-v0.0.2.zip`;
+   刷入在手机上的 Magisk / KernelSU / APatch 管理器里完成,**与电脑无关**。
+
+构建失败时:Actions 日志会指出是哪一项门禁;`PREFLIGHT-REPORT.md`(门禁报告)与
+`build-manifest.txt` 会作为 artifact 上传,可下载查看实测值。
+
+> ℹ️ `clock` 的 APK 未声明 `versionCode`(设备上那一份实测为 0)→ 按 G7 语义**放行**
+> (见下文专节);四个应用的字段已齐全,标签构建不会再被门禁挡住。
+
+### 想在 Windows 上用原脚本?
+
+两条路,任选:
+
+* **WSL(推荐)**:管理员 PowerShell 执行 `wsl --install -d Ubuntu`,重启后
+  `sudo apt install zip unzip` 即可照常 `bash scripts/install_all.sh` / `bash build.sh`;
+* **Git Bash**(随 Git for Windows 安装):提供 `bash`;个别命令
+  (如 `build.sh` 需要的 `zip`/`unzip`)不保证自带,缺哪个补哪个。
+  ⚠️ 本工程未在 Windows 上实测过 Git Bash 的工具齐全度,以 WSL 为准。
+
 ## 🧩 次方案:systemless 模块(Magisk / KernelSU / APatch)
 
 模块为 **coexist 模式**:APK 挂载到 `/system/app/<Name>/`,与 ROM 自带应用**共存**,
@@ -151,7 +271,7 @@ adb shell pm disable-user --user 0 <stock_package>
 |---|---|---|
 | C1 | **不推断包名** | known 反例:`GKUICalendar` fork 自 Etar,但它的 applicationId 是 `ws.xsoh.etar.debug`,不是 `org.lineageos.etar.debug`。凡不在事实基线中的值一律写 `TODO`,构建失败。 |
 | C2 | **只做 coexist** | `mode` 只允许 `coexist`;不生成任何写入 stock 应用目录的代码;不使用 Magisk 的 `REPLACE` 变量或 `.replace` 文件。 |
-| C3 | **只装 `system/app`** | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。门禁若检出某 APK 申请此类权限,**不生成白名单 XML**,而是**把它排除出模块**,并在此标注「该应用仅走 adb install」。 |
+| C3 | **只装 `system/app`** | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。门禁若检出某 APK **申请**此类权限,**不生成白名单 XML**,而是**把它排除出模块**,并在此标注「该应用仅走 adb install」。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
 | C4 | **不含拨号 / 短信 / 联系人** | 它们使用 `sharedUserId="android.uid.shared"` 并依赖 platform 签名,第三方签名无法替换,任何打包尝试都必然失败。因此本仓库**不接受**这类应用,即使被要求也不做。 |
 | C5 | **仓库不含 APK** | `.gitignore` 含 `*.apk`、`dist/`、`build/`、`*.keystore`;验收 `git ls-files \| grep -c '\.apk$'` 必须为 `0`;APK 由 CI 下载并校验 sha256。 |
 | C6 | **签名必须匹配** | 每个 APK 的证书 SHA-256 与 `apps.yaml` 记录不一致 → 构建失败,并提示「需卸载重装,应用内数据会丢失」。 |
@@ -175,8 +295,8 @@ adb shell pm disable-user --user 0 <stock_package>
 | 字段 | 来源 | 采集方式 |
 |---|---|---|
 | `sha256` | Release 资产的 sha256 | 已按 GitHub Releases API 的 asset digest 填好(核查时间 2026-10-08);CI 每次构建都会重新下载并逐字节复算 |
-| `signer_sha256` | APK 签名证书 SHA-256 | **TODO** — 用 `--collect-only`(本地或 CI artifact)采集 |
-| `installed_version_code` | 设备上已安装版本的 versionCode | **TODO** — 用 `scripts/probe-device.sh` 采集 |
+| `signer_sha256` | APK 签名证书 SHA-256 | ✅ **已填**(2026-10-08 CI Release 运行在真实 APK 上由 `apksigner` 实测,见 `PREFLIGHT-REPORT.md` G4);CI 每次构建都会重新比对,不一致即 fail(C6) |
+| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none` |
 
 ### 设备侧:`scripts/probe-device.sh`(只读)
 
@@ -238,15 +358,39 @@ bash scripts/probe-device.sh          # 只读采集设备事实
 
 | 门禁 | 内容 | 不通过时 |
 |---|---|---|
-| G1 | `aapt dump badging` 取 `package: name=`(**不读解包 manifest 的 package 属性** —— Etar 系那里是 AOSP 残留 `com.android.calendar`,会误导) | 失败 |
+| G1 | `aapt dump badging` 取 `package: name=`(**不读解包 manifest 的 package 属性** —— Etar 系那里是 AOSP 残留 `com.android.calendar`,会误导);取值按**整字段**匹配 —— 真实 badging 行里有 `compileSdkVersionCodename='16'`,它含小写 `name='`,子串匹配会把平台代号当成包名(本工程实际踩过,已加回归测试) | 失败 |
 | G2 | 断言无 `sharedUserId` | 失败 |
-| G3 | 列出 `uses-permission`,标出 signature / privileged 级 | 命中「已声明的 signature\|privileged 权限」→ 该应用**不适合模块化**,仅走 adb install |
+| G3 | 列出 `uses-permission`;申请**平台签名/特权权限清单**(`ADVISORY_LIST`)则判为不适合模块化;另把本 APK **自己声明**的 `<permission>` 的 `protectionLevel` 解码后一并报告(如 `0x12` → `signature\|system`) | 申请命中 → 该应用**不适合模块化**,仅走 adb install(排除出模块,绝不生成白名单 XML);自声明权限**不影响**判定(androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 就是 signature 级,属正常做法) |
 | G4 | `apksigner verify --print-certs` 的证书 SHA-256 与 `apps.yaml` 比对 | 失败(提示数据丢失) |
 | G5 | 断言 `applicationId != stock_package`(C2) | 失败 |
 | G6 | 提取 `<provider>` authorities 与 `<permission>`,authority 不以 applicationId 为前缀则标红 | **仅报告,不影响退出码** |
-| G7 | 模块内 APK 的 versionCode 必须 **大于** `installed_version_code` | 失败("将被 /data 版本压制,刷入无效") |
+| G7 | 比对模块内 APK 的 versionCode 与设备实测的 `installed_version_code`:**小于** → 失败(回退);**相等** → 通过但提示(两侧同一版本,刷入前须按 C8 卸载 /data 副本);`none`(实测设备上无副本)→ 通过(不存在压制);设备上已有副本但 APK 未声明 versionCode → 失败 | 见左列(压制风险本身由 C8 在刷入时强制拦截) |
 
 G1/G3/G6 的结果写入 `PREFLIGHT-REPORT.md`(默认与 zip 同目录,或 `PREFLIGHT_REPORT=` 指定)。
+
+### clock 的 APK 未声明 versionCode(实测已闭环)
+
+两处实测互相印证(2026-10-08):
+
+* CI 门禁报告:`DeskClock-debug.apk` 的 badging 是 `versionCode='' versionName=''`
+  —— 该 APK **没有**声明 versionCode(LinageOS 部分应用仓库如此);
+* 真机实测:设备上已安装的 `com.android.deskclock.dev` 记录的 **versionCode = 0**
+  —— 与平台语义"未声明按 0 处理"完全吻合。
+
+因此 G7 把它当**已知的 0** 参与比较(不再当成"未知"):
+
+| 情况 | 结果 |
+|---|---|
+| 设备上副本也是 0(本例) | **放行**,并提示"两侧同一版本,刷入前须按 C8 先卸载 /data 副本" |
+| 设备上副本更高(如 5) | **失败** —— 模块内更旧,会被压制 |
+| 设备上无副本(`none`) | **放行** —— 无压制风险 |
+
+`dist/build-manifest.txt` 里该应用的 versionCode 记为 `0(未声明)`,Release notes 里同样如此。
+
+> ⚠️ 仍未验证:"未声明 versionCode 的 APK 装入 `/system/app` 后的真机行为"没有实测过
+> (安装本身不受影响;之后若用 adb 装了更新版本,按 Android 规则 /data 版本会正常覆盖它)。
+> 采集小坑:第一次采集时 adb 偶发返回空,曾被误读成"未安装";`probe-device.sh` 与 README 的
+> PowerShell 片段现在都改为**先用 `pm list packages` 判是否安装**,再取 versionCode。
 
 ---
 
@@ -310,11 +454,13 @@ NOTICE.md                 上游 → fork → 本仓库 的归属与许可链条
   Magisk 模块约定(读取 `module.prop`、执行 `customize.sh`)"这一公开约定;
   Magisk 侧走标准 `install_module` 流程。`update-binary` 里为非 Magisk 环境提供了
   保守兜底流程(不确定就失败,绝不半成品安装),但同样未在真机验证。
-* **recorder(GKUIRecorder)的 `application_id`、上游、许可均未确认**,
-  条目保持 `confidence: unverified` + `enabled: false`。
-* **`signer_sha256` 与 `installed_version_code` 目前是 `TODO`**:
-  前者需要真实 APK(CI/本地即可采集),后者需要真实设备(`probe-device.sh`)。
-  在这种状态下 `build.sh` 会按 C7 **拒绝构建**。
+* **recorder(GKUIRecorder)的 `application_id` 仍未确认**(上游与许可已核实为
+  `LineageOS/android_packages_apps_Recorder` / Apache-2.0):条目保持
+  `confidence: unverified` + `enabled: false`,该仓库没有任何 Release/Tag。
+* **`clock` 的 APK 未声明 versionCode**(设备上那一份实测为 0,与平台语义一致):
+  G7 按"未声明=0"参与比较。但"versionCode=0 的 APK 装入 `/system/app` 后的真机行为"**未实测**。
+* **采集过程留痕**:第一次采集 clock 时 adb 偶发返回空,一度被误读成"未安装";
+  已在 apps.yaml 的注释里如实记录,采集命令也改为先用 `pm list packages` 判是否安装。
 * 各应用的**权限与 provider authorities 实际内容**由 CI 的 preflight 在真实 APK 上判定,
   本仓库内无法预先断言。
 * 模块的**体积、开机耗时、实际挂载效果**等真机行为未经测量。

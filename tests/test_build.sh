@@ -74,17 +74,36 @@ case "${1:-}" in
     sub="${2:-}"; apk="${3:-}"
     [ -f "$apk" ] || exit 1
     if [ "$sub" = "badging" ]; then
-      printf "package: name='%s' versionCode='%s' versionName='1.0'\n" \
-        "$(sed -n '1p' "$apk")" "$(sed -n '2p' "$apk")"
+      # 尽量贴近真实 aapt 输出:单引号 + 平台版本字段。
+      # ⚠️ compileSdkVersionCodename='16' 里含小写 "name='",是历史 bug 的触发点
+      #    (子串匹配会把平台代号当成包名),这里刻意保留以防回归。
+      # 标记 #nover → 模拟未声明 versionCode/versionName 的 APK(真实 CI 上遇到过)。
+      vc="$(sed -n '2p' "$apk")"; vn="1.0"
+      if grep -q '^#nover$' "$apk"; then vc=""; vn=""; fi
+      printf "package: name='%s' versionCode='%s' versionName='%s' platformBuildVersionName='16' platformBuildVersionCode='36' compileSdkVersion='36' compileSdkVersionCodename='16'\n" \
+        "$(sed -n '1p' "$apk")" "$vc" "$vn"
+      # 标记 #priv → 申请平台特权权限(硬判据:该应用不适合模块化)
+      if grep -q '^#priv$' "$apk"; then
+        printf "uses-permission: name='android.permission.WRITE_SECURE_SETTINGS'\n"
+      fi
       sed -n '4,$p' "$apk" | grep -v '^#' || true
       exit 0
     fi
     if [ "$sub" = "xmltree" ]; then
       echo "E: manifest (line=1)"
       echo "  A: android:versionCode(0x0101021b)=(type 0x10)0x0"
-      if grep -q '^#priv$' "$apk"; then
+      # 标记 #decl → 自声明一项 signature 级权限(真实 aapt 是数值形式!
+      # 早期用关键字匹配的实现在这里永远命中不了,故专门覆盖)
+      if grep -q '^#decl$' "$apk"; then
         echo "  E: permission (line=1)"
-        echo "    A: android:protectionLevel(0x01010009)=\"signature|privileged\""
+        echo "    A: android:name(0x01010003)=\"com.example.stub.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\" (Raw: \"com.example.stub.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\")"
+        echo "    A: android:protectionLevel(0x01010009)=(type 0x11)0x12"
+      fi
+      # 标记 #auth → provider authorities(类型化值 + (Raw: ...) 会各出现一次,
+      # 报告必须去重,否则每条 authority 都打印两遍)
+      if grep -q '^#auth$' "$apk"; then
+        echo "  E: provider (line=1)"
+        echo "    A: android:authorities(0x01010018)=\"com.example.stub.fileprovider\" (Raw: \"com.example.stub.fileprovider\")"
       fi
       exit 0
     fi
@@ -142,18 +161,18 @@ make_fake_apk() { # $1=输出文件 $2=包名 $3=versionCode $4=签名 $5=额外
     printf '%s\n' "$2"
     printf '%s\n' "$3"
     printf '%s\n' "$4"
-    printf 'uses-permission: name="android.permission.INTERNET"\n'
-    printf 'uses-permission: name="android.permission.RECEIVE_BOOT_COMPLETED"\n'
+    printf "uses-permission: name='android.permission.INTERNET'\n"
+    printf "uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'\n"
     if [ -n "${5:-}" ]; then printf '%s\n' "$5"; fi
     if [ "${6:-0}" = "1" ]; then printf '#priv\n'; fi
   } > "$1"
 }
 
-build_assets() { # $1=APK_DIR $2=是否让 clock 带 privileged 声明
-  local d="$1" priv="${2:-0}"
+build_assets() { # $1=APK_DIR $2=是否让 clock 申请 privileged 权限 $3=calendar 的额外标记(可空)
+  local d="$1" priv="${2:-0}" calm="${3:-}"
   rm -rf "$d"
   mkdir -p "$d"
-  make_fake_apk "$d/GKUICalendar-1.0.apk" "ws.xsoh.etar.debug" "50000" "$SIGNER_CAL" "" "0"
+  make_fake_apk "$d/GKUICalendar-1.0.apk" "ws.xsoh.etar.debug" "50000" "$SIGNER_CAL" "$calm" "0"
   make_fake_apk "$d/app-debug.apk" "org.lineageos.glimpse.dev" "60000" "$SIGNER_GAL" "" "0"
   # 计算器的资产是 zip 包装:内层唯一的 APK
   local tmp="$WORK/calc-src"
@@ -209,24 +228,41 @@ run_build() { # $1=工作区repo $2=APK_DIR $3=dist $4...=额外参数与环境(
 }
 
 # -----------------------------------------------------------------------------
-head1 "1) 仓库原始状态:apps.yaml 含 TODO,必须让构建失败(C7)"
+head1 "1) 真实仓库状态:四个应用字段已齐全,仅 disabled 的 recorder 留 TODO"
 # -----------------------------------------------------------------------------
 out="$(cd "$REPO_ROOT" && bash build.sh --check 2>&1)"; rc=$?
-if [ $rc -ne 0 ]; then ok "bash build.sh --check 在存在 TODO 时返回非零(rc=$rc)"; else bad "含 TODO 却通过了校验"; fi
-case "$out" in
-  *"signer_sha256 为 TODO"*|*"TODO"*) ok "报告明确指出 TODO 缺口" ;;
-  *) bad "报告未指出 TODO 缺口" ;;
-esac
+if [ $rc -eq 0 ]; then ok "bash build.sh --check 通过(rc=0):启用条目已无 TODO"; else bad "字段已齐全却未通过校验(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
+if printf '%s' "$out" | grep -q '\[跳过\].*recorder'; then ok "报告里 recorder 仍被显式跳过并打印"; else bad "未打印 recorder 跳过信息"; fi
 if (cd "$REPO_ROOT" && bash build.sh --check --strict >/dev/null 2>&1); then
-  bad "--strict 下含 unverified/disabled TODO 仍通过"
+  bad "--strict 下 disabled 条目的 TODO 仍通过(违反字面版 C7)"
 else
-  ok "--strict 下 disabled 条目的 TODO 也会失败"
+  ok "--strict 下 disabled 条目的 TODO 仍会失败(字面版 C7)"
 fi
+# C7 的反向验证:启用条目里注入一个 TODO 后必须失败
+# (真实仓库已填齐,所以这里显式造出 C7 场景,避免该规则失去覆盖)
+cp "$REPO_ROOT/apps.yaml" "$WORK/c7-apps.yaml"
+sed -i 's/^    signer_sha256: 815d90d0.*/    signer_sha256: TODO/' "$WORK/c7-apps.yaml"
+cp "$WORK/c7-apps.yaml" "$WORK/repo/apps.yaml"
+out="$(cd "$WORK/repo" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'signer_sha256 为 TODO'; then
+  ok "启用条目出现 TODO 时仍被 C7 挡住(反向验证)"
+else
+  bad "启用条目的 TODO 未被挡住(rc=$rc)"
+fi
+cp "$REPO_ROOT/apps.yaml" "$WORK/repo/apps.yaml"
 
 # 1b) --collect-only:引导填值模式(采集真实值,不产出模块,始终返回非零)
 mkdir -p "$WORK/collect-repo"
 cp -a "$WORK/repo/." "$WORK/collect-repo/"
-cp "$REPO_ROOT/apps.yaml" "$WORK/collect-repo/apps.yaml"   # 故意用含 TODO 的原始清单
+cp "$REPO_ROOT/apps.yaml" "$WORK/collect-repo/apps.yaml"
+# 真实清单已填齐;为了覆盖"清单里还有 TODO 时 collect 仍能采集"这条路径,
+# 这里人为把 calendar 的签名证书改回 TODO(--collect-only 本就是为填值而存在)
+sed -i 's/^    signer_sha256: 815d90d0.*/    signer_sha256: TODO/' "$WORK/collect-repo/apps.yaml"
+if (cd "$WORK/collect-repo" && bash build.sh --check >/dev/null 2>&1); then
+  bad "collect 夹具:含 TODO 却通过了普通校验(C7 失效)"
+else
+  ok "collect 夹具仍含 TODO(普通校验如 C7 所述失败)"
+fi
 build_assets "$WORK/collect-apks" 0
 out="$( cd "$WORK/collect-repo" && env PATH="$WORK/bin:$PATH" APK_DIR="$WORK/collect-apks" \
         DIST_DIR="$WORK/collect-dist" AAPT="$WORK/bin/aapt" APKSIGNER="$WORK/bin/apksigner" \
@@ -247,7 +283,12 @@ if [ -z "$(find "$WORK/collect-dist" -name '*.zip' 2>/dev/null)" ]; then
 else
   bad "--collect-only 竟然产出了模块 zip"
 fi
-if diff -q "$REPO_ROOT/apps.yaml" "$WORK/collect-repo/apps.yaml" >/dev/null 2>&1; then
+# 注意:夹具是"人为留了 TODO 的副本",因此要与**采集前的快照**比较,而不是与仓库原始文件比较
+cp "$WORK/collect-repo/apps.yaml" "$WORK/collect-apps.yaml.before"
+out="$( cd "$WORK/collect-repo" && env PATH="$WORK/bin:$PATH" APK_DIR="$WORK/collect-apks" \
+        DIST_DIR="$WORK/collect-dist" AAPT="$WORK/bin/aapt" APKSIGNER="$WORK/bin/apksigner" \
+        bash build.sh --collect-only 2>&1 )"; rc=$?
+if diff -q "$WORK/collect-apps.yaml.before" "$WORK/collect-repo/apps.yaml" >/dev/null 2>&1; then
   ok "--collect-only 未改写 apps.yaml"
 else
   bad "--collect-only 改写了 apps.yaml"
@@ -353,10 +394,29 @@ else
 fi
 mv "$WORK/repo/apps.yaml.bak" "$WORK/repo/apps.yaml"
 
+# 6.2 相等:两侧是同一版本的构建(C8 会在刷入时要求先卸载 /data 副本)→ 应通过,但必须提示
+sed -i.bak 's/^    installed_version_code: 49999$/    installed_version_code: 50000/' "$WORK/repo/apps.yaml"
+out="$(run_build "$WORK/repo" "$WORK/apks" "$WORK/dist-vc-eq" 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "versionCode 与设备已装版本相同时构建通过(不再无条件阻断)"; else bad "相等却失败(rc=$rc)"; printf '%s\n' "$out" | tail -12; fi
+if printf '%s' "$out" | grep -q '同一版本'; then ok "相等时给出提示(同一版本构建)"; else bad "缺少相等说明"; fi
+if printf '%s' "$out" | grep -q 'C8'; then ok "相等时提示 C8(刷入前须卸载 /data 副本)"; else bad "缺少 C8 提示"; fi
+mv "$WORK/repo/apps.yaml.bak" "$WORK/repo/apps.yaml"
+
+# 6.3 none:实测设备上未安装该包名 → 不存在被压制的问题 → 应通过
+sed -i.bak 's/^    installed_version_code: 49999$/    installed_version_code: none/' "$WORK/repo/apps.yaml"
+out="$(run_build "$WORK/repo" "$WORK/apks" "$WORK/dist-vc-none" 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "installed_version_code=none(实测未安装)时构建通过"; else bad "none 却失败(rc=$rc)"; printf '%s\n' "$out" | tail -12; fi
+if printf '%s' "$out" | grep -q '无该包名副本'; then ok "明确说明设备上没有该包名的副本"; else bad "缺少 none 的说明文案"; fi
+mv "$WORK/repo/apps.yaml.bak" "$WORK/repo/apps.yaml"
+
 # -----------------------------------------------------------------------------
-head1 "7) privileged 权限检出:该应用被排除出模块,其余照常出包(C3)"
+head1 "7) 特权权限硬判据:申请者被排除出模块,其余照常出包(C3)"
 # -----------------------------------------------------------------------------
-build_assets "$WORK/apks-priv" 1
+# clock 申请平台特权权限(WRITE_SECURE_SETTINGS)→ 硬排除;
+# calendar 只是"自声明"一项 signature 级权限(androidx 常见做法)+ 有 authorities →
+# 必须**不**被排除,且 authoritiy 在报告里只出现一次(去重)。
+build_assets "$WORK/apks-priv" 1 '#decl
+#auth'
 patch_yaml "$WORK/repo" "$WORK/apks-priv"
 out="$(run_build "$WORK/repo" "$WORK/apks-priv" "$WORK/dist-priv" 2>&1)"; rc=$?
 ZIP_PRIV="$WORK/dist-priv/GKUI-Pack-test-1.zip"
@@ -367,6 +427,17 @@ if [ -f "$ZIP_PRIV" ]; then
   if unzip -l "$ZIP_PRIV" | grep -q 'apks/GKUICalendar.apk'; then ok "其余应用仍正常入包"; else bad "其余应用未入包"; fi
   if grep -q '^excluded.*clock' "$WORK/dist-priv/build-manifest.txt" 2>/dev/null; then ok "build-manifest.txt 标记了 excluded"; else bad "清单未标记 excluded"; fi
 fi
+# 触发原因必须可核:报告要列出具体权限
+if printf '%s' "$out" | grep -q 'WRITE_SECURE_SETTINGS'; then ok "报告列出触发的特权权限(证据可核)"; else bad "报告未列出触发原因"; fi
+# 回归:真实 aapt 行里的平台代号(compileSdkVersionCodename='16')绝不能被当成包名
+if printf '%s' "$out" | grep -q 'name=16'; then bad "G1 把平台代号当成了包名(子串匹配回归)"; else ok "G1 未把平台代号(16)误当成包名"; fi
+if printf '%s' "$out" | grep -q 'name=ws.xsoh.etar.debug'; then ok "G1 从真实形态的 badging 行取到正确包名"; else bad "G1 未取到正确包名"; fi
+# 仅报告:自声明权限用数值形式表示,需解码后打印(原始值 + 解码)
+if printf '%s' "$out" | grep -q 'signature|system'; then ok "自声明权限 protectionLevel 已解码(0x12 → signature|system)"; else bad "缺少 protectionLevel 解码"; fi
+if printf '%s' "$out" | grep -q '未检出 signature|privileged 权限声明'; then bad "仍输出误导性的『未检出 signature 声明』"; else ok "不再输出误导性的『未检出声明』结论"; fi
+# 去重:类型化值与 (Raw: ...) 各出现一次,报告里必须只留一条
+auth_n="$(printf '%s' "$out" | grep -c 'com.example.stub.fileprovider' || true)"
+if [ "$auth_n" -eq 1 ]; then ok "authorities 已去重(只出现 1 次)"; else bad "authority 重复出现 ${auth_n} 次"; fi
 
 # -----------------------------------------------------------------------------
 head1 "8) C8:/data 冲突检查(渲染后的 customize.sh + 桩 pm)"
@@ -664,6 +735,18 @@ if [ $rc2 -eq 0 ] && printf '%s' "$out2" | grep -q '<未取到>'; then
 else
   bad "apksigner 缺失时未优雅降级(rc=$rc2)"
 fi
+# 未安装的包名必须给出可回填的 none,而不是占位符(否则用户照抄会撞上校验)
+out3="$(ADB_STUB_MODE=ok pb --yaml-snippet 2>&1)"
+if printf '%s' "$out3" | grep -q 'installed_version_code: none'; then
+  ok "probe 对未安装/取不到 versionCode 的包给出 none(可直接回填)"
+else
+  bad "probe 未给出 none 形式的结果"
+fi
+if printf '%s' "$out3" | grep -q '未安装,无法取得\|<不适用'; then
+  bad "probe 仍输出不可回填的占位符"
+else
+  ok "probe 不再输出不可回填的占位符"
+fi
 if diff -q "$WORK/apps.yaml.before-probe" "$WORK/repo/apps.yaml" >/dev/null 2>&1; then
   ok "probe 未改写 apps.yaml(禁止自动填值)"
 else
@@ -706,7 +789,44 @@ fi
 if grep -q '^\*.apk$' "$REPO_ROOT/.gitignore" && [ "$count_apk" = "0" ]; then ok "仓库内不存在被跟踪的 APK"; fi
 
 # -----------------------------------------------------------------------------
-head1 "12) 测试没有写脏工作区"
+head1 "12) APK 未声明 versionCode:必须明确失败并解释(G7)"
+# -----------------------------------------------------------------------------
+# 真实 CI 上遇到过:LineageOS 的 DeskClock APK 的 badging 行为
+#   package: name='com.android.deskclock.dev' versionCode='' versionName=''
+# 平台语义:未声明 → 按 0 处理(设备上那一份的实测值也确实记录了 0,见 apps.yaml)。
+# 因此 G7 的行为是:
+#   * 设备上有副本且副本版本更高 → 失败(模块内更旧,会被压制);
+#   * 设备上副本也是 0 → 相等 → 放行(刷入前按 C8 先卸载副本);
+#   * 设备上无副本(none)→ 放行;
+#   * 报告里必须写明"未在 manifest 里声明 versionCode",而不是留空白。
+build_assets "$WORK/apks-nover" 0
+printf '#nover\n' >> "$WORK/apks-nover/DeskClock-debug.apk"
+patch_yaml "$WORK/repo" "$WORK/apks-nover"
+out="$(run_build "$WORK/repo" "$WORK/apks-nover" "$WORK/dist-nover" 2>&1)"; rc=$?
+if [ $rc -ne 0 ]; then ok "未声明 versionCode 的 APK 让构建失败(rc=$rc)"; else bad "缺少 versionCode 却构建成功"; fi
+if printf '%s' "$out" | grep -q '未在 manifest 里声明 versionCode'; then ok "失败原因解释清楚(指明 APK 未声明 versionCode)"; else bad "失败原因不明确"; fi
+if printf '%s' "$out" | grep -q 'versionCode: 未知'; then ok "报告里以『未知』表示而不是空白"; else bad "报告里未标明 versionCode 未知"; fi
+# 12.1 设备上已有副本、且副本版本更高(79999)→ 模块内(未声明→0)更旧 → 必须失败
+#      (12.1 的三条断言见上)
+
+# 12.2a 真实 clock 情形:APK 未声明 versionCode,设备上那一份实测为 0
+#       → 按平台语义"未声明=0",两侧相等 → 放行,并说明原因
+sed -i.bak 's/^    installed_version_code: 79999$/    installed_version_code: 0/' "$WORK/repo/apps.yaml"
+out="$(run_build "$WORK/repo" "$WORK/apks-nover" "$WORK/dist-nover0" 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "未声明 versionCode 且设备上为 0 → 相等放行(真实 clock 情形)"; else bad "该情形失败(rc=$rc)"; printf '%s\n' "$out" | tail -12; fi
+if printf '%s' "$out" | grep -q '平台按 0 处理'; then ok "明确说明未声明按平台语义记 0"; else bad "缺少未声明→0 的说明"; fi
+if grep -q '0(未声明)' "$WORK/dist-nover0/build-manifest.txt" 2>/dev/null; then ok "构建清单里记为该 APK 未声明"; else bad "清单未记录未声明"; fi
+mv "$WORK/repo/apps.yaml.bak" "$WORK/repo/apps.yaml"
+
+# 12.2b 但若设备上**没有**该包名的副本(实测 none)——没有压制风险 → 也应放行
+sed -i.bak 's/^    installed_version_code: 79999$/    installed_version_code: none/' "$WORK/repo/apps.yaml"
+out="$(run_build "$WORK/repo" "$WORK/apks-nover" "$WORK/dist-nover2" 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "设备上无副本 + APK 未声明 versionCode → 放行(无压制风险)"; else bad "该情形仍失败(rc=$rc)"; printf '%s\n' "$out" | tail -12; fi
+if printf '%s' "$out" | grep -q '不会被压制'; then ok "说明了为何放行(不会被压制)"; else bad "缺少放行理由"; fi
+mv "$WORK/repo/apps.yaml.bak" "$WORK/repo/apps.yaml"
+
+# -----------------------------------------------------------------------------
+head1 "13) 测试没有写脏工作区"
 # -----------------------------------------------------------------------------
 if [ -d "$REPO_ROOT/.git" ]; then
   leaked=""
