@@ -208,7 +208,10 @@ bash build.sh --collect-only     # 打印每个 APK 的真实 applicationId / ve
 * `application_id` 处于 `UNVERIFIED` 状态,**严禁**按 `.dev` 规律填写(C1);
 * 仓库 `gx-bangsong/GKUIRecorder` 确实存在(描述:"基于LineageOS录音机,添加打点功能"),
   但**没有任何 Release、也没有任何 Tag**,因此没有可下载、可校验的资产;
-* 上游与许可同样尚未确认。
+* 上游与许可**已核实**:上游为 `LineageOS/android_packages_apps_Recorder`
+  (GitHub API 的 `parent` / `source` 字段),许可为 **Apache-2.0**
+  (仓库内 `REUSE.toml` + `LICENSES/Apache-2.0.txt`;API 的 license 字段"无法识别")。
+  仍缺的是**包名**与**可下载资产**。
 * 待确认方式:`bash scripts/probe-device.sh --filter recorder` 可列出设备上
   用户空间安装的包名 —— 那里的结果才是**证据**,规律不是。
 
@@ -280,6 +283,24 @@ NOTICE.md                 上游 → fork → 本仓库 的归属与许可链条
 | 模块刷入被中止:`检测到 <pkg> 已安装于用户空间` | 见上文 C8:先 `pm uninstall <pkg>`,重启后再刷。 |
 
 ---
+
+## ⚙️ 仓库设置(首次启用 CI 时)
+
+工作流里**只使用 GitHub 官方 action**,并已固定到完整 commit SHA
+(`actions/checkout@11d5960a…`、`actions/upload-artifact@ea165f8d…`)。
+据此建议(仓库 → Settings → Actions → General):
+
+| 设置项 | 建议值 | 原因 |
+|---|---|---|
+| Actions permissions | **Allow gx-bangsong, and select non-gx-bangsong, actions and reusable workflows** → 勾选 *Allow actions created by GitHub*,并加入 `actions/*` | 本工程只用 GitHub 官方 action;若选「Allow gx-bangsong actions」,连 `actions/checkout` 都会被挡掉,CI 根本无法运行 |
+| Require actions to be pinned to a full-length commit SHA | **勾选** | 工作流中的 action 已固定到完整 SHA,打开后照常运行,同时可挡住被投毒的 tag(升级 action 时需连同 SHA 一起更新) |
+| Workflow permissions | **Read repository contents and packages permissions**(只读) | 工作流已按需自带 `permissions:` —— CI 只读;Release 需要 `contents: write` 才能创建 Release,已在 `release.yml` 顶部声明 |
+| Allow GitHub Actions to create and approve pull requests | **不勾选** | 本工程不需要——Release 只创建 Release 与上传附件 |
+| Approval for running fork pull request workflows | **Require approval for all external contributors** | CI 会执行 PR 里的脚本,最稳妥是人工批准后再跑(本仓库的 CI 不接触任何密钥) |
+| Check/artifact/log retention | 90 天(上限) | `PREFLIGHT-REPORT.md` artifact 是回填 `apps.yaml` 的主要数据来源,留存越久越稳 |
+
+> 若仓库未启用 Actions 或不允许上述 action,`ci.yml` / `release.yml` 不会运行——
+> 这**不影响**主方案:`scripts/install_all.sh` 与本地 `bash build.sh` 都是纯本地路径。
 
 ## 🧭 诚实边界(未验证项)
 

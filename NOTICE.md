@@ -78,14 +78,17 @@
 
 | 环节 | 位置 | 许可 |
 |---|---|---|
-| 上游 | **TODO(待确认,禁止按仓库名规律推断)** | **TODO** |
-| fork | `gx-bangsong/GKUIRecorder`(仓库描述:"基于LineageOS录音机,添加打点功能") | 未声明(仓库内为 `LICENSES/` + `REUSE.toml`,GitHub API 无 SPDX 标识) |
+| 上游 | `LineageOS/android_packages_apps_Recorder`(由 GitHub API 的 `parent` / `source` 字段核实) | Apache-2.0 |
+| fork | `gx-bangsong/GKUIRecorder`(仓库描述:"基于LineageOS录音机,添加打点功能") | Apache-2.0(仓库内 `REUSE.toml` + `LICENSES/Apache-2.0.txt`;GitHub API 的 license 字段"无法识别",故以仓库内 REUSE 元数据为准) |
 | 本仓库 | `apps.yaml` → `id: recorder`,`confidence: unverified`,`enabled: false` | — |
 
 - 该条目**被 `build.sh` 拒绝入包**:`application_id` 为 `TODO`,
-  且 `confidence: unverified`。本仓库**不猜测**其包名(见硬约束 C1)。
+  且 `confidence: unverified`。本仓库**不猜测**其包名(见硬约束 C1)——
+  源码里的 `applicationId = org.lineageos.recorder` 与 `applicationIdSuffix = ".dev"`
+  只是源码意图,不是已构建 APK 的事实。
 - 该 fork 仓库当前**没有任何 Release、也没有任何 Tag**,
   因此不存在可供下载校验的资产。
+- upstream / license 的核实时间:2026-10-08。
 
 ---
 

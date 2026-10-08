@@ -137,19 +137,28 @@ apps:
 
   # ---------------------------------------------------------------------------
   # 录音机(GKUIRecorder)—— **未纳入构建**
-  #   application_id 为 TODO:事实基线中该值 UNVERIFIED,且严禁按 .dev 规律填写
-  #   (C1)。仓库 gx-bangsong/GKUIRecorder 确实存在(描述:"基于LineageOS录音机,
-  #   添加打点功能"),但该仓库当前**没有任何 Release、也没有任何 Tag**,
-  #   因此不存在可供下载与校验的资产;上游与许可同样尚未确认。
-  #   confidence: unverified + enabled: false → build.sh 会跳过它并拒绝入包。
+  #   upstream / license 已核实(2026-10-08,GitHub API + 仓库内元数据):
+  #     * API 的 parent 与 source 字段均为 LineageOS/android_packages_apps_Recorder;
+  #     * fork 仓库内 REUSE.toml 自述 SPDX-PackageDownloadLocation 指向同一上游,
+  #       并声明 SPDX-License-Identifier = "Apache-2.0"
+  #       (LICENSES/Apache-2.0.txt 存在)。GitHub API 的 license 字段为
+  #       "无法识别",故以仓库内 REUSE 元数据为准。
+  #   application_id 仍为 TODO:事实基线中该值 UNVERIFIED。源码 app/build.gradle.kts
+  #   写着 applicationId = org.lineageos.recorder 且 debug 构建带
+  #   applicationIdSuffix = ".dev" —— 但这只是**源码意图,不是已构建 APK 的事实**,
+  #   按 C1 严禁据此回填(反例:GKUICalendar 的包名连基名都不同)。
+  #   name 亦保持 TODO:name 与仓库名/上游名并不同形
+  #   (反例:android_packages_apps_DeskClock → GKUIClock),不构成可验证事实。
+  #   该仓库当前**没有任何 Release、也没有任何 Tag**,因此不存在可供下载与校验的
+  #   资产。confidence: unverified + enabled: false → build.sh 跳过它并拒绝入包。
   # ---------------------------------------------------------------------------
   - id: recorder
     name: TODO
     application_id: TODO
     stock_package: org.lineageos.recorder
     repo: gx-bangsong/GKUIRecorder
-    upstream: TODO
-    license: TODO
+    upstream: LineageOS/android_packages_apps_Recorder
+    license: Apache-2.0
     source_url: TODO
     release_tag: TODO
     asset_name: TODO
