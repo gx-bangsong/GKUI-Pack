@@ -69,7 +69,7 @@
 #   结论:四个应用都装在设备上(与工程最初的事实基线一致)。
 #
 # 仍为 TODO 的字段(必须实测,严禁推断):
-#   录音机条目的 signer_sha256 —— 待真实 APK 的 apksigner 采集(其余值已按 API / 实测回填)。
+#   目前没有(五个条目全部启用且字段齐全;新增条目时按同样的采集流程填值,未知就写 TODO)。
 #
 # 本清单严禁加入 拨号 / 短信 / 联系人 类应用(C4:它们使用系统共享 UID 并依赖
 #   platform 签名,第三方签名无法替换,任何打包尝试都必然失败)。
@@ -203,8 +203,12 @@ apps:
   #       其它分支上"看起来更像"的提交。
   #   name = GKUIRecorder:用户确认的模块内目录名(name 与仓库名/上游名并不同形,不构成可
   #   验证事实,因此必须由用户给出)。
-  #   signer_sha256:TODO —— 唯一无法从 API 得到的值,必须由真实 APK 的
-  #   apksigner verify --print-certs 采集(--collect-only),采集完成后回填并改 confidence。
+  #   signer_sha256:CI 在真实 Release 资产上用 apksigner verify --print-certs 实测
+  #   (2026-10-08,临时 tag v0.0.3-collect 触发 release.yml 的 --collect-only 步骤,
+  #   Actions run 37788746483 / job 113350190290;Signer 数量 1;同一次运行还核实:
+  #   资产 sha256 = f4c00ddb…(与 API digest 一致)、badging 包名 org.lineageos.recorder.dev、
+  #   versionCode 1 / versionName 1.1、无 sharedUserId、申请权限 12 项、特权命中仅
+  #   CAPTURE_AUDIO_OUTPUT)。该临时 tag 采集后已删除;正式 Release 每次都会重新比对(C6)。
   #   C3 显式确认制(2026-10-08 用户决策):该 APK 申请 android.permission.CAPTURE_AUDIO_OUTPUT
   #   (通话录音所需,在 preflight 的 ADVISORY_LIST 内)。privileged_ack: true 表示明知
   #   /system/app 只是"系统应用"标记、**不会授予**该权限、通话录音不会生效,仍以普通系统
@@ -224,12 +228,11 @@ apps:
     release_tag: "beta2"
     asset_name: GKUIRecorder-beta2.apk
     sha256: f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
-    # TODO(待采集):真实 APK 的 apksigner verify --print-certs(见 --collect-only)
-    signer_sha256: TODO
+    signer_sha256: 7cd26af2112c234f9bbfe2b21e3651c4e51a5d4c4de34b462c86bacd881e0985
     installed_version_code: 1
     install_as: system_app
     privileged_ack: true
     privileged_note: "通话录音不会生效,需 priv 变体(分支 recorder-priv)"
     mode: coexist
-    confidence: unverified
+    confidence: confirmed
     enabled: true

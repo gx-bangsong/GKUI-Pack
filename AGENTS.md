@@ -30,8 +30,11 @@
   (不得编造 sha256、版本号、包名、路径、仓库名、commit)。
 - 任何 `TODO` 或 `confidence: unverified` 都会让 `build.sh` **`exit 1`**。
   这是**有意设计**,不是 bug;不要"顺手填上"以让构建通过。
-- 录音机(GKUIRecorder)条目的 `application_id` **必须保持 `TODO`**,
-  它的仓库描述虽然写着"基于 LineageOS 录音机",但这**不构成**包名证据。
+- 录音机(GKUIRecorder)条目的 `application_id = org.lineageos.recorder.dev` 来自
+  2026-10-08 的真机实测(`pm list packages -3` + `dumpsys package`),**不是**从仓库描述
+  "基于 LineageOS 录音机"或源码里的 `applicationIdSuffix` 推出来的 —— 那些**不构成**包名
+  证据,只是事后恰好一致。同理,它的 `signer_sha256` 来自 CI 在真实 APK 上的 `apksigner`
+  采集(临时 tag `v0.0.3-collect`),Release 字段来自 GitHub Releases API 原样抄录。
 
 ## 2. 硬约束(违反任一 = 失败)
 
@@ -47,7 +50,8 @@
 | C8 | 同包名已存在于 `/data` 时必须**中止安装**(提示用户自行 `pm uninstall`),模块**不得**代为卸载 | `module/customize.sh` |
 
 唯一一处对 C7 的宽松处理:**`enabled: false` 的条目**里残留的 `TODO` 不阻断构建
-(它不参与构建)。这样录音机在"包名待确认"的长期状态下不会卡死整个项目。
+(它不参与构建)。这样某个应用在"事实待确认"的长期状态下不会卡死整个项目
+(v0.0.2 之前的录音机即如此;v0.0.3 起五个条目全部启用,当前没有条目用到这条宽松)。
 需要字面语义时用 `--strict`。
 
 ## 3. 目录地图
