@@ -26,7 +26,9 @@
 #      —— 明确不得读解包 manifest 的 package 属性(Etar 系那里是 AOSP 残留
 #         com.android.calendar,会误导)
 #   G2 断言无 sharedUserId(C4 类应用的判定特征之一)
-#   G3 列出 uses-permission,标出 signature / privileged 级
+#   G3 列出 uses-permission;命中「平台签名/特权权限清单」(ADVISORY_LIST)的应用
+#      判为不适合模块化(仅走 adb install,**不生成任何 privapp 白名单**);
+#      另报告本 APK 自声明 <permission> 的 protectionLevel(仅参考,不参与判定)
 #   G4 apksigner verify --print-certs 取证书 SHA-256 并与 apps.yaml 比对(C6)
 #   G5 断言 applicationId != stock_package(C2)
 #   G6 (optional,仅报告,不影响退出码)authorities / <permission> 检查
@@ -185,6 +187,89 @@ sha256_of() { # 计算文件 sha256(纯输出,不夹带文件名)
 }
 APK_SHA="$(sha256_of "$APK")"
 
+# ---------------------------------------------------------------------------
+# badging_field <字段名> <aapt badging 的 package: 行>
+#   从 package: 行里按「引号对」取字段值,字段名做**整字段**比较(绝不做子串匹配)。
+#   真实 aapt 输出示例(CI 上实测,已脱敏):
+#     package: name='ws.xsoh.etar.debug' versionCode='51' versionName='1.0.51' \
+#              platformBuildVersionName='16' platformBuildVersionCode='36' \
+#              compileSdkVersion='36' compileSdkVersionCodename='16'
+#   ⚠️ 曾经的 bug(真实 APK 上踩到):用 sed 's/.*name=.../' 子串匹配时,
+#      compileSdkVersionCodename='16' 里含小写 "name='",贪婪匹配取最后一个命中,
+#      于是把平台代号 16 当成了包名(四个应用全部误判)。必须整字段匹配。
+# ---------------------------------------------------------------------------
+badging_field() {
+  local want="$1" line="$2"
+  printf '%s\n' "$line" | awk -v want="$want" -F"'" '
+    {
+      for (i = 1; i < NF; i += 2) {
+        key = $i
+        sub(/^.*[[:space:]]/, "", key)      # 只保留最后一个空白之后的字段名
+        if (key == want "=") { print $(i + 1); exit }
+      }
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# describe_protection_level <xmltree 中含 protectionLevel 的整行>
+#   把 protectionLevel 的原始值解成可读文本(仅用于报告,不参与判定)。
+#   aapt xmltree 通常输出数值形式:
+#     A: android:protectionLevel(0x01010009)=(type 0x11)0x12
+#   其中 (type 0x11) 表示后面的数字按十六进制书写(0x12 = signature|system);
+#   个别 aapt 版本输出字符串形式,则直接采用原文。
+#   注意:本 APK 自己声明的权限由它自己满足(androidx 的
+#   *.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION 就是 signature 级),不构成
+#   模块化障碍 → 这里只报告,不据此排除应用(判定规则见 G3)。
+# ---------------------------------------------------------------------------
+describe_protection_level() {
+  local line="$1" raw type body token val base bits n
+  raw="$(printf '%s' "$line" | sed -n 's/.*protectionLevel[^=]*=[[:space:]]*//p')"
+  case "$raw" in
+    *'"'*)   # 字符串形式:="signature|privileged"
+      val="$(printf '%s' "$raw" | sed -n 's/^"\([^"]*\)".*/\1/p')"
+      printf '%s' "${val:-$raw}"
+      return 0 ;;
+  esac
+  if [ "${raw#*\(type }" != "$raw" ]; then
+    # 数值形式:(type 0xNN)<值> —— 0x11=十六进制书写、0x10=十进制书写。
+    # 注意:必须按 type 解析,不能笼统地"抓最后一个 0x.." —— 那会把类型码
+    # (0x10/0x11)本身当成保护级别(真实踩到)。
+    type="$(printf '%s' "$raw" | sed -n 's/^[[:space:]]*(type[[:space:]]*\(0x[0-9a-fA-F]*\)).*/\1/p')"
+    body="${raw#*)}"
+    token="$(printf '%s' "$body" | sed -n 's/^[[:space:]]*\([^[:space:]]*\).*/\1/p')"
+    case "$type" in
+      0x11|0x10) : ;;
+      *) printf '原始值(未识别的数值类型 %s):%s' "${type:-?}" "$token"; return 0 ;;
+    esac
+  else
+    token="$(printf '%s' "$raw" | grep -o '0x[0-9a-fA-F][0-9a-fA-F]*' | head -1 || true)"
+  fi
+  if printf '%s' "$token" | grep -qE '^(0x[0-9a-fA-F]+|[0-9]+)$'; then
+    val="$token"
+    n=$(( token ))
+  else
+    printf '原始值无法解析:%s' "$raw"
+    return 0
+  fi
+  case $(( n & 0xF )) in
+    0) base=normal ;;
+    1) base=dangerous ;;
+    2) base=signature ;;
+    3) base=signatureOrSystem ;;
+    *) base="(未知基础值 0x$(printf '%x' $(( n & 0xF ))))" ;;
+  esac
+  bits=""
+  if (( n & 0x10 )); then bits="$bits|system"; fi
+  if (( n & 0x20 )); then bits="$bits|development"; fi
+  if (( n & 0x40 )); then bits="$bits|appop"; fi
+  if (( n & 0x80 )); then bits="$bits|pre23"; fi
+  if (( n & 0x100 )); then bits="$bits|installer"; fi
+  if (( n & 0x200 )); then bits="$bits|verifier"; fi
+  if (( n & 0x400 )); then bits="$bits|preinstalled"; fi
+  if (( n & 0x800 )); then bits="$bits|privileged"; fi
+  printf '%s%s(原始值 %s)' "$base" "$bits" "$val"
+}
+
 printf '%s=== preflight: %s (%s) ===%s\n' "$C_BLD" "$APP_ID" "$(basename "$APK")" "$C_RST"
 say "## $APP_ID — $E_APPID"
 say "- 条目: id=$E_ID enabled=$E_ENABLED confidence=$E_CONF license=$E_LIC upstream=$E_UP"
@@ -205,12 +290,15 @@ if [ -z "$PKG_LINE" ]; then
   GATE_FAIL=1
   APP_ID_FROM_APK=""
 else
-  APP_ID_FROM_APK="$(printf '%s' "$PKG_LINE" | sed -n "s/.*name='\([^']*\)'.*/\1/p")"
-  VER_CODE="$(printf '%s' "$PKG_LINE" | sed -n "s/.*versionCode='\([0-9][0-9]*\)'.*/\1/p")"
-  VER_NAME="$(printf '%s' "$PKG_LINE" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")"
-  say "  package: name=$APP_ID_FROM_APK versionCode=$VER_CODE versionName=${VER_NAME:-未知}"
-  if [ -z "$APP_ID_FROM_APK" ]; then
-    say_bad "无法从 badging 输出解析出包名"
+  # 取字段必须锚定字段名(见 badging_field 的注释):不要用子串匹配
+  APP_ID_FROM_APK="$(badging_field name "$PKG_LINE")"
+  VER_CODE="$(badging_field versionCode "$PKG_LINE")"
+  VER_NAME="$(badging_field versionName "$PKG_LINE")"
+  say "  aapt 原始行: $PKG_LINE"
+  say "  package: name=${APP_ID_FROM_APK:-<解析失败>} versionCode=${VER_CODE:-未知} versionName=${VER_NAME:-未知}"
+  if [ -z "$APP_ID_FROM_APK" ] \
+     || ! printf '%s' "$APP_ID_FROM_APK" | grep -qE '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'; then
+    say_bad "无法从 badging 输出解析出可信包名(得到:'${APP_ID_FROM_APK}');请把上面的原始行反馈"
     GATE_FAIL=1
   elif [ "$APP_ID_FROM_APK" != "$E_APPID" ]; then
     say_bad "包名与 apps.yaml 不一致:APK=$APP_ID_FROM_APK / apps.yaml=$E_APPID"
@@ -269,19 +357,16 @@ while IFS= read -r perm; do
   say "    - $perm"
 done <<< "$REQUESTED"
 
-# 判据一(确定):APK 自己声明的 <permission>/<permission-group> 带 signature/privileged
-#   注意:平台权限的 protectionLevel 无法仅凭 APK 判定,因此下面的"参考清单"只作提示,
-#   不参与退出码,避免误判(误判会把好应用挡在模块外)。
-PRIV_EVIDENCE=""
-while IFS= read -r line; do
-  [ -n "$line" ] || continue
-  case "$line" in
-    *protectionLevel*)
-      case "$line" in
-        *signature*|*privileged*) PRIV_EVIDENCE="${PRIV_EVIDENCE}${line}"$'\n' ;;
-      esac ;;
-  esac
-done <<< "$XMLTREE"
+# 判定(C3)分两层:
+#   ① 硬判据 —— APK **申请**了平台签名/特权权限(见下方 ADVISORY_LIST):非 platform
+#      签名的应用在任何安装位置都拿不到这些权限,按本工程策略判为"不适合模块化"
+#      (仅走 adb install,且**绝不**生成 privapp 白名单 XML)。
+#   ② 仅报告 —— APK **自己声明**的 <permission> 的 protectionLevel。自声明权限由
+#      本应用自行满足(如 androidx 的 *.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+#      就是 signature 级),不构成模块化障碍,因此不参与判定。
+#   ⚠️ 真实 aapt 对 protectionLevel 输出的是数值(如 (type 0x11)0x12),不含
+#      "signature"/"privileged" 字样。早期版本用关键字匹配去判"声明",在真实 APK 上
+#      永不命中——既漏报、又给出"未检出"的虚假通过感;故改为上面的分工。
 
 ADVISORY_LIST="android.permission.WRITE_SECURE_SETTINGS
 android.permission.DEVICE_POWER
@@ -311,17 +396,28 @@ while IFS= read -r perm; do
   esac
 done <<< "$REQUESTED"
 
-if [ -n "$PRIV_EVIDENCE" ]; then
-  say_bad "检出 signature|privileged 级权限声明(确定命中):"
-  printf '%s' "$PRIV_EVIDENCE" | sed '/^$/d;s/^/      /'
-  say_bad "该应用不适合模块化:不应放入系统应用目录,请改走 adb install(见 README)"
+if [ -n "$ADVISORY_HITS" ]; then
+  say_bad "申请了平台签名/特权权限(非 platform 签名无法获得):"
+  while IFS= read -r hit; do
+    [ -n "$hit" ] || continue
+    say "      $hit"
+  done <<< "$ADVISORY_HITS"
+  say_bad "按 C3 策略:该应用不适合模块化 → 不入模块,仅走 adb install(不生成白名单 XML)"
   MODULE_UNSUITABLE=1
 else
-  say_ok "未检出 signature|privileged 权限声明"
+  say_ok "申请清单未命中平台签名/特权权限(ADVISORY_LIST $(printf '%s\n' "$ADVISORY_LIST" | grep -c .) 条)"
 fi
-if [ -n "$ADVISORY_HITS" ]; then
-  say_warn "以下申请项常见于平台特权权限(仅参考,不参与判定,请人工确认):"
-  printf '%s' "$ADVISORY_HITS" | sed '/^$/d;s/^/      /'
+
+# 仅报告:本 APK 声明的自定义权限的 protectionLevel(原始值 + 解码)
+DECLARED_PERMS="$(printf '%s\n' "$XMLTREE" | grep -i 'protectionLevel' | sed 's/^[[:space:]]*//' || true)"
+if [ -n "$DECLARED_PERMS" ]; then
+  say "  本 APK 声明的自定义权限 protectionLevel(原始值 + 解码,仅参考,不影响退出码):"
+  while IFS= read -r pline; do
+    [ -n "$pline" ] || continue
+    say "      $pline  → $(describe_protection_level "$pline")"
+  done <<< "$DECLARED_PERMS"
+else
+  say "  未声明自定义 <permission>(无 protectionLevel 条目)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -384,7 +480,10 @@ fi
 # ---------------------------------------------------------------------------
 say ""
 say "### G6 provider authorities / <permission>(仅报告,不影响退出码)"
-AUTHORITIES="$(printf '%s\n' "$XMLTREE" | grep -i 'authorities' | grep -o '"[^"]*"' | tr -d '"' | tr ';' '\n' | sed '/^$/d' || true)"
+# 注意:同一条 authority 在 xmltree 里会出现两次(类型化值与 "(Raw: ...)" 原值),
+# 因此这里按出现顺序去重,否则报告里每条都会重复一遍(真实 APK 上踩到过)。
+AUTHORITIES="$(printf '%s\n' "$XMLTREE" | grep -i 'authorities' | grep -o '"[^"]*"' \
+  | tr -d '"' | tr ';' '\n' | sed '/^$/d' | awk '!seen[$0]++' || true)"
 if [ -z "$AUTHORITIES" ]; then
   say "  未发现 <provider> authorities 声明"
 else
@@ -399,8 +498,7 @@ else
     esac
   done <<< "$AUTHORITIES"
 fi
-PERM_DECLS="$(printf '%s\n' "$XMLTREE" | grep -o 'protectionLevel([^)]*)[^ ]*' | head -20 || true)"
-[ -n "$PERM_DECLS" ] && say "  自定义权限 protectionLevel 片段:$(printf '%s' "$PERM_DECLS" | tr '\n' ' ')"
+# (自定义权限 protectionLevel 的原始值 + 解码已在 G3 段统一报告)
 
 # ---------------------------------------------------------------------------
 # G7:versionCode 与设备已安装版本比对
@@ -414,16 +512,38 @@ case "$E_IVC" in
     say_bad "请在设备上执行 bash scripts/probe-device.sh 采集实测值后回填"
     GATE_FAIL=1
     ;;
-  *)
+  none|NONE|None)
+    # 实测结果:设备上没有该包名的副本 → /data 不可能压制模块版本
     if [ -z "$VER_CODE" ]; then
-      say_bad "无法取得 APK 的 versionCode"
-      GATE_FAIL=1
-    elif [ "$VER_CODE" -le "$E_IVC" ] 2>/dev/null; then
-      say_bad "模块内 versionCode($VER_CODE) <= 设备已安装版本($E_IVC)"
-      say_bad "将被 /data 版本压制,刷入无效;请使用更新的 Release 或先卸载 /data 版本"
-      GATE_FAIL=1
+      say_warn "该 APK 未声明 versionCode(平台按 0 处理);但设备上无同包名副本 → 不会被压制"
     else
-      say_ok "versionCode $VER_CODE > installed_version_code $E_IVC(不会被压制)"
+      say_ok "设备上无该包名副本(installed_version_code=none)→ 不会被 /data 压制"
+    fi
+    ;;
+  *)
+    # 判定说明(为何不是"必须严格大于"):
+    #   * 真正的"压制"风险由 C8 在刷入时强制拦截(检出 /data 副本 → 整包中止,
+    #     要求先 pm uninstall);卸载之后不存在压制,所以两侧值相等不算危险,只提示;
+    #   * 必须硬拦的只有一种:模块内**比设备上更旧**(回退)。
+    # 2026-10-08 真机实测(构建永远失败的教训):
+    #   * calendar/gallery/calculator 模块内 51/1/1,设备上也是 51/1/1(恰好相等);
+    #   * clock 的 APK **未声明 versionCode**,而设备上那一份的实测值正是
+    #     versionCode=0 —— 与平台语义"未声明按 0 处理"完全吻合。
+    #   因此"未声明"不再是"未知",而是已知的 0:照常参与比较即可。
+    vc_eff="$VER_CODE"
+    if [ -z "$vc_eff" ]; then
+      vc_eff=0
+      say_warn "该 APK 未在 manifest 里声明 versionCode/versionName:平台按 0 处理(设备上那一份的实测值也是 0)"
+    fi
+    if [ "$vc_eff" -lt "$E_IVC" ] 2>/dev/null; then
+      say_bad "模块内 versionCode(${VER_CODE:-未声明→0}) < 设备已安装版本($E_IVC):模块内是更旧的构建"
+      say_bad "要么改用更新的 Release;要么确认后卸载 /data 副本再刷(否则模块版本会被压制)"
+      GATE_FAIL=1
+    elif [ "$vc_eff" -eq "$E_IVC" ] 2>/dev/null; then
+      say_warn "模块内 versionCode($vc_eff) == 设备已安装版本($E_IVC):两侧是同一版本的构建"
+      say_warn "刷入前必须先卸载 /data 副本(C8 会在刷入时强制要求),卸载后模块版本即生效"
+    else
+      say_ok "versionCode $vc_eff > installed_version_code $E_IVC(不会被压制)"
     fi
     ;;
 esac
@@ -455,7 +575,7 @@ if [ -n "$JSON_OUT" ]; then
   [ -z "$APP_ID_FROM_APK" ] && GATE1=fail
   [ -n "$APP_ID_FROM_APK" ] && [ "$APP_ID_FROM_APK" != "$E_APPID" ] && GATE1=fail
   printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && GATE2=fail
-  [ -n "$PRIV_EVIDENCE" ] && GATE3=privileged_detected
+  [ -n "$ADVISORY_HITS" ] && GATE3=privileged_requested
   python3 - "$JSON_OUT" <<PYEOF
 # -*- coding: utf-8 -*-
 import json, sys
@@ -474,7 +594,7 @@ data = {
     "signer_sha256_expected": "$E_SIGNER",
     "signer_count": "$SIGNER_COUNT",
     "shared_user_id_detected": $(printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && echo True || echo False),
-    "privileged_declaration_detected": $([ -n "$PRIV_EVIDENCE" ] && echo True || echo False),
+    "privileged_request_detected": $([ -n "$ADVISORY_HITS" ] && echo True || echo False),
     "requested_permission_count": $REQ_COUNT,
     "authorities": [$(printf '%s\n' "$AUTHORITIES" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
     "gate1_application_id": "$GATE1",

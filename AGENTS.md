@@ -94,7 +94,7 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
    `apksigner verify --print-certs`(本仓库禁止手写)。
 5. 若该应用的 `stock_package` 与已有启用条目重复,`build.sh` 会拒绝(防同类应用重复入包)。
 
-## 6. 两个容易踩的坑
+## 6. 已经踩过的坑(会持续追加)
 
 - **不要读解包 manifest 的 `package` 属性当 applicationId**。
   Etar 系那里是 AOSP 历史残留 `com.android.calendar`,会误导。
@@ -104,6 +104,57 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
   一旦申请 `signature|privileged` 权限就会让 zygote 抛
   `Signature|privileged permissions not in privapp-permissions whitelist` → bootloop。
   检出此情况**不要生成白名单 XML**,而是**不入模块**并提示仅走 adb 安装。
+- **解析 `aapt dump badging` 必须按字段名整体匹配,绝不能做子串匹配**。
+  真实输出形如:
+
+  ```
+  package: name='ws.xsoh.etar.debug' versionCode='51' versionName='1.0.51' platformBuildVersionName='16' platformBuildVersionCode='36' compileSdkVersion='36' compileSdkVersionCodename='16'
+  ```
+
+  其中 `compileSdkVersionCodename='16'` 含**小写** `name='`。曾经的写法
+  `sed "s/.*name='\([^']*\)'.*/\1/p"` 贪婪匹配到最后一个 `name='`,于是把平台代号
+  `16` 当成了包名 —— 四个应用全部误判(CI 报告里 `package: name=16` 即此bug)。
+  一律走 `scripts/preflight-apk.sh` 里的 `badging_field`(按引号对整字段取值),
+  并在 `tests/test_build.sh` 里保留了带该字段的回归夹具。
+- **`aapt xmltree` 的 `protectionLevel` 是数值形式**(如 `(type 0x11)0x12`),
+  不含 `signature`/`privileged` 字样;用关键字匹配去判"声明"会永远命中不了,
+  既漏报又给出"未检出"的虚假通过感。判定改为:**申请**命中平台特权权限清单 →
+  不适合模块化;**声明**只报告(用 `describe_protection_level` 解码)。
+- **xmltree 里同一条 authority 会出现两次**(类型化值 + `(Raw: ...)` 原值),
+  报告输出前必须去重,否则每条都打印两遍。
+- **G7 不能写成"模块内 versionCode 必须严格大于设备已装版本"**。
+  2026-10-08 真机实测:三个已安装应用与模块内 APK 的 versionCode **恰好相同**
+  (51/1/1),旧规则会让构建永远无法通过 —— 而它想防的"压制"其实由 C8 在刷入时
+  强制拦截(检出 /data 副本即中止)。现行语义:小于 → 失败(回退);
+  相等 → 通过并提示(先卸载 /data 副本);`installed_version_code: none`
+  (实测设备无副本)→ 通过;设备上有副本但 APK 未声明 versionCode → 失败。
+- **`installed_version_code` 的合法值是"整数 或 none"**,`none` 表示"实测设备上没有
+  该包名的副本"(是测量结果,不是未知)。
+- **APK 未声明 versionCode ≠ 未知**:Android 平台按 0 处理,设备上那一份的实测值也确实是 0
+  (clock 已验证)。所以 G7 用"有效 versionCode = 0"照常比较,不要再写"未知就拦"的特例;
+  `build.sh` 对该情形记为 `0(未声明)` 并放行(preflight 已负责比较)。
+- **判断"设备上是否安装"要用 `pm list packages`,不要用 dumpsys 是否取到 versionCode**:
+  adb 偶发返回空,会被误读成"未安装"(clock 上真实踩过,一度把 IVC 记成 none)。
+
+- **门禁断言不要绑死在某个具体字段上**。曾有验收写成"recorder 的 `application_id`
+  必须以 `TODO` 开头",结果每回填一个实测值都要求同步改 CI 工作流 —— 而工作流只有
+  用户能推(路径 B),耦合纯属自找。正确写法是断言**不变量**:未证实 → 必须
+  `confidence: unverified`、必须禁用、`application_id != stock_package`、且
+  `_todo_fields` 非空(`build.sh --dump-apps-json` 已提供该字段)。这样回填实测值
+  不再需要碰工作流。
+- **versionName ≠ versionCode**。用户说"版本号是 1.1"时,1.1 只可能是 versionName;
+  versionCode 是整数(该例实测为 1)。`apps.yaml` 的 `installed_version_code`
+  只登记整数,永远不要把小数值当 versionCode 写进去。
+- **`pm list packages <关键词>` 是子串过滤,不是精确匹配**:用 `Contains()` 判定
+  "是否存在"时,理论上可能被相似包名误命中(录音机这次同时拿到了 `versionCode=1`,
+  误命中概率极低)。要更严格可再用 `pm path <完整包名>` 复核一次。
+
+- **`set -o pipefail` + `grep -q` = 假失败**:`grep -q` 一命中就退出并关闭管道,
+  上游还在写(如 `git log`)就会吃到 SIGPIPE,管道整体返回 **141** —— 于是"找到了"
+  被当成"没找到"。本工程的脚本里已经踩过一次(重建脚本的幂等守卫失效)。
+  写法:先把输出重定向到变量或文件,再 `grep -q`;或在该管道后加 `|| true`。
+  (仓库现有的 `printf '%s' "$out" | grep -q ...` 属于小输出、进 64KB 管道缓冲区即写完,
+  暂时安全;但输出一旦变大就会变成随机失败。)
 
 ## 7. 值的来源纪律
 

@@ -420,8 +420,11 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
             if isinstance(val, str) and not is_todo(val) and not RE_HEX64.match(norm_hex(val)):
                 errors.append("%s: %s 必须是 64 位小写 hex(当前为 %r)" % (eid, key, val))
         ivc = entry.get("installed_version_code")
-        if ivc is not None and not is_todo(ivc) and not isinstance(ivc, int):
-            errors.append("%s: installed_version_code 必须是整数(设备实测值)" % eid)
+        # 允许整数(设备实测的 versionCode)或字面量 none(实测:设备上未安装该包名)。
+        # none 是**测量结果**,不是"未知":设备上无副本 → 不存在被 /data 压制的问题。
+        if (ivc is not None and not is_todo(ivc) and not isinstance(ivc, int)
+                and str(ivc).lower() != "none"):
+            errors.append("%s: installed_version_code 必须是整数或 none(均为设备实测值)" % eid)
         lic = entry.get("license")
         if isinstance(lic, str) and not is_todo(lic) and lic.upper().startswith("GPL"):
             src = entry.get("source_url")
@@ -855,7 +858,14 @@ PYC
   [ -f "$pf_json" ] || die "APK 门禁未产出结果文件: $pf_json(门禁脚本异常)"
   vc="$(json_get "$pf_json" version_code)"
   signer="$(json_get "$pf_json" signer_sha256)"
-  [ -n "$vc" ] || die "APK 门禁结果缺少 versionCode: $pf_json"
+  if [ -z "$vc" ]; then
+    # 未声明 versionCode 的 APK(LineageOS 部分仓库如此):平台按 0 处理,且设备上
+    # 那一份的实测值也是 0(2026-10-08 真机证实)。到这里说明 preflight 的 G7 已经
+    # 用"有效 versionCode = 0"比较并通过(要么设备上无副本,要么两侧同为 0),
+    # 因此这里只做记录,不再拦截。
+    vc="0(未声明)"
+    warn "$APP_ID 的 APK 未声明 versionCode → 按平台语义记为 0(未声明)"
+  fi
   [ -n "$signer" ] || die "APK 门禁结果缺少签名摘要: $pf_json"
   printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$vc" "$signer" "$staged_sha" "$APP_ASSET" \
