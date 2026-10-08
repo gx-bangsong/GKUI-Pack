@@ -14,7 +14,7 @@
 # 退出码(约定,调用方 build.sh 依赖此协议):
 #   0  七项门禁全部通过
 #   1  门禁失败(硬阻断:不得入包)
-#   2  APK 不适合模块化(检出 signature|privileged 权限)→ 应改走 adb install
+#   2  APK 不适合模块化(检出平台 privileged 权限且 privileged_ack != true)→ 应改走 adb install
 #   3  环境不完整(aapt / apksigner / java 缺失,无法完成校验)
 #
 # 环境变量:
@@ -26,9 +26,9 @@
 #      —— 明确不得读解包 manifest 的 package 属性(Etar 系那里是 AOSP 残留
 #         com.android.calendar,会误导)
 #   G2 断言无 sharedUserId(C4 类应用的判定特征之一)
-#   G3 列出 uses-permission;命中「平台签名/特权权限清单」(ADVISORY_LIST)的应用
-#      判为不适合模块化(仅走 adb install,**不生成任何 privapp 白名单**);
-#      另报告本 APK 自声明 <permission> 的 protectionLevel(仅参考,不参与判定)
+#   G3 列出 uses-permission;命中「平台签名/特权权限清单」(ADVISORY_LIST)时默认排除。
+#      仅 `privileged_ack: true` 可把 APK 纳入普通 system_app;这不会授予特权权限。
+#      特权版白名单另由设备权限转储与 APK 实际申请集求交集,缺值即 fail-closed。
 #   G4 apksigner verify --print-certs 取证书 SHA-256 并与 apps.yaml 比对(C6)
 #   G5 断言 applicationId != stock_package(C2)
 #   G6 (optional,仅报告,不影响退出码)authorities / <permission> 检查
@@ -116,7 +116,7 @@ import json, sys
 want = sys.argv[1]
 fields = ["id", "application_id", "stock_package", "repo", "upstream", "license",
           "release_tag", "asset_name", "sha256", "signer_sha256",
-          "installed_version_code", "confidence", "enabled"]
+          "installed_version_code", "confidence", "enabled", "privileged_ack"]
 try:
     data = json.load(sys.stdin)
 except Exception:
@@ -126,6 +126,8 @@ for app in data.get("apps", []):
         out = []
         for f in fields:
             v = app.get(f)
+            if isinstance(v, bool):
+                v = "true" if v else "false"
             out.append("" if v is None else str(v))
         sys.stdout.write("\t".join(out))
         break
@@ -134,7 +136,7 @@ else:
 ' "$APP_ID")" || env_fail "apps.yaml 解析失败,或条目 '$APP_ID' 不存在(build.sh --dump-apps-json)"
 
 IFS=$'\t' read -r E_ID E_APPID E_STOCK E_REPO E_UP E_LIC E_TAG E_ASSET \
-  E_SHA E_SIGNER E_IVC E_CONF E_ENABLED <<< "$ENTRY_TSV"
+  E_SHA E_SIGNER E_IVC E_CONF E_ENABLED E_PRIVILEGED_ACK <<< "$ENTRY_TSV"
 
 # aapt 查找:PATH → ANDROID_HOME/build-tools/<最新>
 AAPT="${AAPT:-$(command -v aapt 2>/dev/null || true)}"
@@ -333,7 +335,8 @@ say ""
 say "### G3 权限清单"
 REQUESTED="$(printf '%s\n' "$BADGING" \
   | grep -E "^uses-permission(-sdk-[0-9]+)?: name=" \
-  | sed -n "s/.*name='\([^']*\)'.*/\1/p" || true)"
+  | sed -n "s/.*name='\([^']*\)'.*/\1/p" \
+  | awk 'NF && !seen[$0]++' || true)"
 REQ_COUNT="$(printf '%s' "$REQUESTED" | grep -c . || true)"
 say "  申请权限共 $REQ_COUNT 项"
 # 资产级 sha256(仅当输入文件正是 Release 资产本身时可比对;
@@ -358,9 +361,9 @@ while IFS= read -r perm; do
 done <<< "$REQUESTED"
 
 # 判定(C3)分两层:
-#   ① 硬判据 —— APK **申请**了平台签名/特权权限(见下方 ADVISORY_LIST):非 platform
-#      签名的应用在任何安装位置都拿不到这些权限,按本工程策略判为"不适合模块化"
-#      (仅走 adb install,且**绝不**生成 privapp 白名单 XML)。
+#   ① APK **申请**了平台签名/特权权限(见下方 ADVISORY_LIST):默认排除;
+#      仅 apps.yaml 显式 privileged_ack: true 时允许它作为普通 system_app 入包。
+#      此 ACK 不会授予任何权限或生成白名单;特权版由 build.sh 另行 fail-closed 生成。
 #   ② 仅报告 —— APK **自己声明**的 <permission> 的 protectionLevel。自声明权限由
 #      本应用自行满足(如 androidx 的 *.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
 #      就是 signature 级),不构成模块化障碍,因此不参与判定。
@@ -397,15 +400,28 @@ while IFS= read -r perm; do
 done <<< "$REQUESTED"
 
 if [ -n "$ADVISORY_HITS" ]; then
-  say_bad "申请了平台签名/特权权限(非 platform 签名无法获得):"
-  while IFS= read -r hit; do
-    [ -n "$hit" ] || continue
-    say "      $hit"
-  done <<< "$ADVISORY_HITS"
-  say_bad "按 C3 策略:该应用不适合模块化 → 不入模块,仅走 adb install(不生成白名单 XML)"
-  MODULE_UNSUITABLE=1
+  if [ "$E_PRIVILEGED_ACK" = "true" ]; then
+    say_warn "已显式 privileged_ack: true(C3),允许纳入普通 /system/app;这不会授予特权权限:"
+    while IFS= read -r hit; do
+      [ -n "$hit" ] || continue
+      say "      $hit"
+    done <<< "$ADVISORY_HITS"
+    say_warn "普通 system_app 不能因此获得以上权限;通话录音不会生效,需要单独构建/刷入特权变体"
+    say_ok "已通过 C3 显式确认门禁;本 APK 仍不会进入 priv-app 或自动生成白名单"
+  else
+    say_bad "申请了平台签名/特权权限(非 platform 签名无法获得):"
+    while IFS= read -r hit; do
+      [ -n "$hit" ] || continue
+      say "      $hit"
+    done <<< "$ADVISORY_HITS"
+    say_bad "按 C3 策略:默认排除出模块,仅走 adb install;如确需普通 system_app,须显式写 privileged_ack: true"
+    MODULE_UNSUITABLE=1
+  fi
 else
   say_ok "申请清单未命中平台签名/特权权限(ADVISORY_LIST $(printf '%s\n' "$ADVISORY_LIST" | grep -c .) 条)"
+  if [ "$E_PRIVILEGED_ACK" = "true" ]; then
+    say_warn "条目写有 privileged_ack: true,但本 APK 未命中当前 ADVISORY_LIST;将继续按普通 system_app 处理"
+  fi
 fi
 
 # 仅报告:本 APK 声明的自定义权限的 protectionLevel(原始值 + 解码)
@@ -576,6 +592,18 @@ if [ -n "$JSON_OUT" ]; then
   [ -n "$APP_ID_FROM_APK" ] && [ "$APP_ID_FROM_APK" != "$E_APPID" ] && GATE1=fail
   printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && GATE2=fail
   [ -n "$ADVISORY_HITS" ] && GATE3=privileged_requested
+  REQUESTED_JSON="$(python3 - "$REQUESTED" <<'PYC'
+import json, sys
+print(json.dumps([line for line in sys.argv[1].splitlines() if line], ensure_ascii=False))
+PYC
+)"
+  PRIVILEGED_HITS_JSON="$(python3 - "$ADVISORY_HITS" <<'PYC'
+import json, sys
+print(json.dumps([line for line in sys.argv[1].splitlines() if line], ensure_ascii=False))
+PYC
+)"
+  PRIVILEGED_ACK_JSON=False
+  [ "$E_PRIVILEGED_ACK" = "true" ] && PRIVILEGED_ACK_JSON=True
   python3 - "$JSON_OUT" <<PYEOF
 # -*- coding: utf-8 -*-
 import json, sys
@@ -594,7 +622,10 @@ data = {
     "signer_sha256_expected": "$E_SIGNER",
     "signer_count": "$SIGNER_COUNT",
     "shared_user_id_detected": $(printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && echo True || echo False),
+    "privileged_ack": $PRIVILEGED_ACK_JSON,
     "privileged_request_detected": $([ -n "$ADVISORY_HITS" ] && echo True || echo False),
+    "requested_permissions": $REQUESTED_JSON,
+    "privileged_request_permissions": $PRIVILEGED_HITS_JSON,
     "requested_permission_count": $REQ_COUNT,
     "authorities": [$(printf '%s\n' "$AUTHORITIES" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
     "gate1_application_id": "$GATE1",

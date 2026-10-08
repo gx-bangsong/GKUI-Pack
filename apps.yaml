@@ -22,8 +22,10 @@
 #   signer_sha256          APK 签名证书 SHA-256(去冒号小写 hex,来自 apksigner)
 #   installed_version_code 【设备实测】设备当前已安装同包名应用的 versionCode;
 #                          实测"设备上没有该包名"时写 none(测量结果,不是未知)
-#   install_as             仅允许 system_app
-#                          (见 C3:模块一律装到 system/app,禁止使用特权应用目录)
+#   install_as             清单的普通版落点,仅允许 system_app
+#                          (priv_variant 另显式选择特权变体落点,见 C3;ack 不改变普通版路径)
+#   privileged_ack         C3 显式确认:允许申请特权权限的 APK 进入普通 system/app;
+#                          默认 false,不授予任何权限,不自动写白名单 XML
 #   mode                   仅允许 coexist(见 C2:绝不 replace,绝不碰 stock 应用)
 #   confidence             confirmed / unverified(unverified 一律不得入包)
 #   enabled                是否纳入构建
@@ -164,48 +166,51 @@ apps:
     enabled: true
 
   # ---------------------------------------------------------------------------
-  # 录音机(GKUIRecorder)—— **未纳入构建**
+  # 录音机(GKUIRecorder)——已明确纳入普通版;签名指纹仍待真实 APK 采集
   #   upstream / license 已核实(2026-10-08,GitHub API + 仓库内元数据):
   #     * API 的 parent 与 source 字段均为 LineageOS/android_packages_apps_Recorder;
-  #     * fork 仓库内 REUSE.toml 自述 SPDX-PackageDownloadLocation 指向同一上游,
-  #       并声明 SPDX-License-Identifier = "Apache-2.0"
-  #       (LICENSES/Apache-2.0.txt 存在)。GitHub API 的 license 字段为
-  #       "无法识别",故以仓库内 REUSE 元数据为准。
-  #   application_id 已回填为 org.lineageos.recorder.dev —— 依据是**设备实测**
-  #   (2026-10-08,用户真机):采集走 README「🪟 Windows」那段 PowerShell ——
-  #   先用 pm list packages -3 判该包名是否存在,存在才继续 dumpsys package 取
-  #   versionCode,输出行为
+  #     * fork 仓库 REUSE.toml 指向同一上游并声明 Apache-2.0。
+  #   Release 元数据已核实:beta2 tag 指向 4650818fbc158d996263b4a21b378af4deb9970a,
+  #   资产名 GKUIRecorder-beta2.apk;GitHub API digest 为下方 sha256。
+  #   注意:受限环境无法从 release-assets.githubusercontent.com 下载 APK,所以该 digest
+  #   尚未本地复算,APK signer 也尚未由 apksigner 实测。CI 会下载资产、复算 digest 并在
+  #   --collect-only 报告真实 signer;在人工核对并回填之前,signer_sha256 保持 TODO、
+  #   confidence 保持 unverified。由于该条目 enabled:true,C7 会 fail-closed 阻止出包。
+  #   application_id 与 installed_version_code 均来自 2026-10-08 真机实测:
   #       org.lineageos.recorder.dev   installed_version_code = 1
-  #   即"设备上确实存在该包名,且 versionCode=1"。
-  #     * 源码 app/build.gradle.kts 里 applicationId = org.lineageos.recorder
-  #       且 debug 构建带 applicationIdSuffix = ".dev",与实测恰好一致 —— 但填写
-  #       依据是上面的实测输出,**不是**源码意图(C1;反例:GKUICalendar 的包名
-  #       连基名都不同)。规律只是巧合,不是证据。
-  #     * 下游防护:APK 下载后 preflight 会把 badging 里的真实包名与本字段逐字符
-  #       比对,不一致即 CI 失败 —— 错值不可能带着出包。
-  #   installed_version_code 同为实测:1。用户补充的人工可读版本 1.1 是 versionName
-  #   (versionCode 只能是整数),本清单只登记 versionCode。
-  #   name 仍保持 TODO:name 与仓库名/上游名并不同形
-  #   (反例:android_packages_apps_DeskClock → GKUIClock),不构成可验证事实。
-  #   该仓库当前**没有任何 Release、也没有任何 Tag**:拿不到可下载、可校验 sha256
-  #   的资产,所以 source_url(commit 级)/ release_tag / asset_name / sha256 /
-  #   signer_sha256 仍为 TODO。
-  #   confidence: unverified + enabled: false → build.sh 跳过它并拒绝入包。
+  #   源码 applicationId + debug suffix 与实测恰好一致,但填写依据仍是设备实测(C1)。
+  #   name GKUIRecorder 是所选静态 ZIP 目录名;APK 通过门禁后目标为 system/app/GKUIRecorder/。
   # ---------------------------------------------------------------------------
   - id: recorder
-    name: TODO
+    name: GKUIRecorder
     application_id: org.lineageos.recorder.dev
     stock_package: org.lineageos.recorder
     repo: gx-bangsong/GKUIRecorder
     upstream: LineageOS/android_packages_apps_Recorder
     license: Apache-2.0
-    source_url: TODO
-    release_tag: TODO
-    asset_name: TODO
-    sha256: TODO
+    source_url: https://github.com/gx-bangsong/GKUIRecorder/commit/4650818fbc158d996263b4a21b378af4deb9970a
+    release_tag: beta2
+    asset_name: GKUIRecorder-beta2.apk
+    sha256: f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
     signer_sha256: TODO
     installed_version_code: 1
     install_as: system_app
     mode: coexist
+    # 显式确认:申请 CAPTURE_AUDIO_OUTPUT 等特权权限时,普通版仍只按 system_app 纳入;
+    # privileged_ack 绝不授予权限。提升只可能发生在另一个特权变体的交集校验后。
+    privileged_ack: true
     confidence: unverified
-    enabled: false
+    enabled: true
+
+# 特权版仍使用同一模块 id(gkui-pack)。普通版始终把所有纳入应用放在 system/app;
+# privileged_ack 只解除默认排除,不提升落点也不授予权限。Priv ZIP 仅在所选应用通过
+# APK 门禁且设备 dump 可解析并产生非空申请权限交集时生成;构建与安装都会 fail-closed。
+# 当前 signer_sha256 仍待真实 APK 实测(C7),device/framework-permissions.txt 也未采集;
+# 任一门禁未满足时都不出相应 ZIP。不可用测试夹具/其他设备转储替代。
+priv_variant:
+  enabled: true
+  app_ids:
+    - recorder
+  device_permission_dump: device/framework-permissions.txt
+  xml_name: privapp-permissions-gkuirecorder.xml
+  dir_name: GKUIRecorder

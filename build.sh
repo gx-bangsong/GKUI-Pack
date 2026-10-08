@@ -39,10 +39,11 @@
 # 设计要点(勿改,改了会破坏硬约束):
 #   C1/C7  未知值必须是 TODO,并且在构建时**失败**,绝不降级为 warning。
 #   C2     mode 只允许 coexist;绝不生成任何写入 stock 应用目录的代码路径。
-#   C3     只装 system/app;检出 privileged 权限的条目**被排除出模块**,
-#          在摘要与 README 中标注"仅走 adb install"(绝不生成白名单 XML)。
+#   C3     普通变体永远只装 system/app;申请 privileged 权限默认排除,只有
+#          privileged_ack: true 才按普通 system_app 纳入(仍不授予权限)。
+#          可选特权变体只由真实 APK 请求集 ∩ 同设备 privileged dump 生成白名单。
 #   C5     构建产物只进 dist/(已被 .gitignore 忽略),仓库内不落任何 APK。
-#   C8     与 /data 同包名的冲突检查由 module/customize.sh 在安装期执行。
+#   C8     与 /data 同包名的冲突检查由两个变体的 customize.sh 在安装期执行。
 # =============================================================================
 
 set -euo pipefail
@@ -98,7 +99,10 @@ FIELDS = [
     "id", "name", "application_id", "stock_package", "repo", "upstream", "license",
     "source_url", "release_tag", "asset_name", "sha256", "signer_sha256",
     "installed_version_code", "install_as", "mode", "confidence", "enabled",
+    "privileged_ack",
 ]
+# Keep the long-standing TSV interface stable for install/probe/release scripts.
+TSV_FIELDS = [field for field in FIELDS if field != "privileged_ack"]
 REQUIRED = [
     "id", "name", "application_id", "stock_package", "repo", "upstream", "license",
     "release_tag", "asset_name", "sha256", "signer_sha256", "installed_version_code",
@@ -110,10 +114,18 @@ RE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 RE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 RE_PKG = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
 RE_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+RE_XML_NAME = re.compile(r"^privapp-permissions-[A-Za-z0-9._-]+\.xml$")
 # 目录名卫生:这些名字不能作为模块内 app 目录名
 FORBIDDEN_NAMES = {"priv-app", "priv_app", "app", "system", "build", "dist"}
 ALLOWED_MODE = {"coexist"}
 ALLOWED_INSTALL_AS = {"system_app"}
+DEFAULT_PRIV_VARIANT = {
+    "enabled": False,
+    "app_ids": [],
+    "device_permission_dump": "",
+    "xml_name": "",
+    "dir_name": "",
+}
 
 
 class YamlError(Exception):
@@ -319,7 +331,7 @@ def norm_entry(raw, idx):
         if key not in FIELDS:
             unknown.append(key)
     for key in FIELDS:
-        entry[key] = raw.get(key)
+        entry[key] = raw.get(key, False if key == "privileged_ack" else None)
     entry["_unknown"] = unknown
     entry["_todo_fields"] = [k for k in FIELDS if is_todo(entry.get(k))]
     if isinstance(raw.get("enabled"), bool):
@@ -331,15 +343,85 @@ def norm_entry(raw, idx):
 def load(path):
     doc = load_apps_yaml(path)
     for key in doc:
-        if key not in ("schema_version", "apps"):
+        if key not in ("schema_version", "apps", "priv_variant"):
             raise YamlError("顶层出现未知键: %s" % key)
     if "apps" not in doc or not isinstance(doc.get("apps"), list):
         raise YamlError("缺少顶层 apps 列表")
     entries = [norm_entry(a, i) for i, a in enumerate(doc["apps"])]
-    return doc.get("schema_version"), entries
+    priv_variant = doc.get("priv_variant", dict(DEFAULT_PRIV_VARIANT))
+    if priv_variant is None:
+        priv_variant = dict(DEFAULT_PRIV_VARIANT)
+    return doc.get("schema_version"), entries, priv_variant
 
 
-def validate(schema_version, entries, strict=False, allow_todo=False):
+def validate_priv_variant(priv_variant, entries):
+    """Validate the opt-in privileged ZIP recipe without needing a device dump."""
+    errors = []
+    if not isinstance(priv_variant, dict):
+        return ["priv_variant 必须是映射"]
+
+    allowed = {"enabled", "app_ids", "device_permission_dump", "xml_name", "dir_name"}
+    for key in priv_variant:
+        if key not in allowed:
+            errors.append("priv_variant 出现未知字段 %s" % key)
+
+    enabled = priv_variant.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append("priv_variant.enabled 必须是 true/false")
+
+    app_ids = priv_variant.get("app_ids", [])
+    if not isinstance(app_ids, list) or any(not isinstance(app_id, str) for app_id in app_ids):
+        errors.append("priv_variant.app_ids 必须是应用 id 列表")
+        app_ids = []
+    if len(app_ids) != len(set(app_ids)):
+        errors.append("priv_variant.app_ids 不得重复")
+    for app_id in app_ids:
+        if not RE_ID.fullmatch(app_id):
+            errors.append("priv_variant.app_ids 含非法 id: %r" % app_id)
+
+    dump_path = priv_variant.get("device_permission_dump", "")
+    if not isinstance(dump_path, str):
+        errors.append("priv_variant.device_permission_dump 必须是相对仓库路径")
+    elif dump_path:
+        normalized = dump_path.replace("\\", "/")
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized) or ".." in normalized.split("/"):
+            errors.append("priv_variant.device_permission_dump 必须位于仓库内,不得使用绝对路径或 ..")
+    elif enabled:
+        errors.append("priv_variant.enabled=true 时必须设置 device_permission_dump")
+
+    xml_name = priv_variant.get("xml_name", "")
+    if not isinstance(xml_name, str) or (xml_name and not RE_XML_NAME.fullmatch(xml_name)):
+        errors.append("priv_variant.xml_name 必须匹配 privapp-permissions-<name>.xml")
+    elif enabled and not xml_name:
+        errors.append("priv_variant.enabled=true 时必须设置 xml_name")
+
+    dir_name = priv_variant.get("dir_name", "")
+    if not isinstance(dir_name, str) or (dir_name and not RE_NAME.fullmatch(dir_name)):
+        errors.append("priv_variant.dir_name 必须是合法应用目录名")
+    elif enabled and not dir_name:
+        errors.append("priv_variant.enabled=true 时必须设置 dir_name")
+
+    by_id = {entry.get("id"): entry for entry in entries}
+    for app_id in app_ids:
+        app = by_id.get(app_id)
+        if app is None:
+            errors.append("priv_variant.app_ids 引用了不存在的应用: %s" % app_id)
+        elif app.get("privileged_ack") is not True:
+            errors.append("%s: 被选入 priv_variant 的条目必须 privileged_ack: true(C3)" % app_id)
+
+    if enabled and not app_ids:
+        errors.append("priv_variant.enabled=true 时 app_ids 不得为空")
+    if enabled and app_ids:
+        primary = by_id.get(app_ids[0])
+        if (primary and primary.get("_enabled") and not is_todo(primary.get("name"))
+                and dir_name and primary.get("name") != dir_name):
+            errors.append(
+                "priv_variant.dir_name 必须与首个启用应用的 name 一致(否则 APK 来源路径不匹配)"
+            )
+    return errors
+
+
+def validate(schema_version, entries, priv_variant=None, strict=False, allow_todo=False):
     """返回 (errors, warnings, skipped)
 
     allow_todo=True(仅 --collect-only 采集模式使用)时,把 TODO / confidence 类问题
@@ -394,6 +476,8 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
             problems.append("confidence=%r 不是 confirmed" % (entry.get("confidence"),))
         if entry.get("enabled") is not None and not isinstance(entry.get("enabled"), bool):
             errors.append("%s: enabled 必须是 true/false" % eid)
+        if not isinstance(entry.get("privileged_ack"), bool):
+            errors.append("%s: privileged_ack 必须是 true/false(默认 false)" % eid)
 
         # --- 字段格式 ---
         if isinstance(entry.get("id"), str) and not is_todo(entry["id"]) and not RE_ID.match(entry["id"]):
@@ -446,6 +530,9 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
             skipped.append((eid, "条目已禁用(enabled: false),未参与构建", []))
 
         notes and warnings.extend(notes)
+
+    errors.extend(validate_priv_variant(priv_variant or dict(DEFAULT_PRIV_VARIANT), entries))
+
     # --- 重复检查 ---
     seen_ids, seen_names, seen_stock = {}, {}, {}
     for entry in entries:
@@ -502,12 +589,12 @@ def main():
     strict = "--strict" in flags
     allow_todo = "--allow-todo" in flags
     try:
-        schema_version, entries = load(path)
+        schema_version, entries, priv_variant = load(path)
     except YamlError as exc:
         sys.stderr.write("[失败] 解析 apps.yaml 失败: %s\n" % exc)
         return 1
     if mode == "--dump-apps-json":
-        out = {"schema_version": schema_version, "apps": []}
+        out = {"schema_version": schema_version, "apps": [], "priv_variant": priv_variant}
         for entry in entries:
             clean = {k: entry.get(k) for k in FIELDS}
             clean["_line"] = entry["_line"]
@@ -517,7 +604,9 @@ def main():
         json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
         return 0
-    errors, warnings, skipped = validate(schema_version, entries, strict=strict, allow_todo=allow_todo)
+    errors, warnings, skipped = validate(
+        schema_version, entries, priv_variant=priv_variant, strict=strict, allow_todo=allow_todo
+    )
     if mode == "--list":
         sys.stdout.write(emit_report(schema_version, entries, [], warnings, skipped) + "\n")
         return 0
@@ -526,7 +615,7 @@ def main():
             if not entry["_enabled"] and mode == "--emit-tsv":
                 continue
             row = []
-            for k in FIELDS:
+            for k in TSV_FIELDS:
                 val = entry.get(k)
                 if isinstance(val, bool):
                     val = "true" if val else "false"
@@ -590,6 +679,21 @@ sys.stdout.write("" if val is None else str(val))
 ' "$1" "$2"
 }
 
+json_list_get() { # $1=json 文件 $2=array 字段名 → 一行一个元素
+  python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    values = data.get(sys.argv[2], [])
+except Exception:
+    values = []
+if isinstance(values, list):
+    for value in values:
+        if isinstance(value, str):
+            print(value)
+' "$1" "$2"
+}
+
 collect_values() { # $1=门禁json $2=app-id $3=包名 $4=解包后 APK sha256 $5=资产 sha256 $6=资产名
   python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PYEOF'
 # -*- coding: utf-8 -*-
@@ -648,6 +752,8 @@ data = json.load(sys.stdin)
 for app in data["apps"]:
     if app.get("id") == sys.argv[1]:
         val = app.get(sys.argv[2], "")
+        if isinstance(val, bool):
+            val = "true" if val else "false"
         sys.stdout.write("" if val is None else str(val))
         break
 ' "$1" "$2"
@@ -702,6 +808,26 @@ fi
 # 1) 清单校验(任何 TODO/规则违例都会在这里失败 C1/C2/C3/C7)
 apps_python --validate "${STRICT_FLAG[@]}"
 
+# Priv variant 配置只从唯一 YAML 解析器读取;不在 build.sh 外另写 YAML parser。
+APPS_JSON="$(apps_python --dump-apps-json)"
+config_value() {
+  printf '%s' "$APPS_JSON" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+value = data.get("priv_variant", {}).get(sys.argv[1], "")
+if isinstance(value, bool):
+    value = "true" if value else "false"
+elif isinstance(value, list):
+    value = ",".join(str(item) for item in value)
+print("" if value is None else value)
+' "$1"
+}
+PRIV_ENABLED="$(config_value enabled)"
+PRIV_APP_IDS="$(config_value app_ids)"
+PRIV_DUMP_REL="$(config_value device_permission_dump)"
+PRIV_XML_NAME="$(config_value xml_name)"
+PRIV_DIR_NAME="$(config_value dir_name)"
+
 # 2) 版本信息
 if [ -z "${VERSION:-}" ]; then
   VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || true)"
@@ -753,7 +879,8 @@ while IFS=$'\t' read -r APP_ID APP_NAME APP_PKG STOCK_PKG APP_REPO APP_UP APP_LI
   [ -n "$APP_ID" ] || continue
   log ""
   printf '%s--- %s (%s) ---%s\n' "$C_BLD" "$APP_ID" "$APP_PKG" "$C_RST"
-  info "mode=$APP_MODE install_as=$APP_AS confidence=$APP_CONF enabled=$APP_ENABLED"
+  APP_PRIVILEGED_ACK="$(entry_field "$APP_ID" privileged_ack)"
+  info "mode=$APP_MODE install_as=$APP_AS confidence=$APP_CONF enabled=$APP_ENABLED privileged_ack=$APP_PRIVILEGED_ACK"
   info "上游=$APP_UP 许可=$APP_LIC"
   info "来源=$APP_REPO @ $APP_TAG / $APP_ASSET"
   info "对应源码=$APP_SRC"
@@ -867,9 +994,13 @@ PYC
     warn "$APP_ID 的 APK 未声明 versionCode → 按平台语义记为 0(未声明)"
   fi
   [ -n "$signer" ] || die "APK 门禁结果缺少签名摘要: $pf_json"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  PRIV_HITS="$(json_list_get "$pf_json" privileged_request_permissions | paste -sd, -)"
+  if [ -n "$PRIV_HITS" ]; then
+    info "C3 privileged_ack=$APP_PRIVILEGED_ACK;普通 system_app 仅入包、不授予权限:$PRIV_HITS"
+  fi
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$vc" "$signer" "$staged_sha" "$APP_ASSET" \
-    >> "$WORK/included.txt"
+    "$PRIV_HITS" "$APP_PRIVILEGED_ACK" >> "$WORK/included.txt"
 done < "$WORK/enabled.tsv"
 
 if [ "$COLLECT" = 1 ]; then
@@ -906,89 +1037,248 @@ included_count="$(grep -c . "$WORK/included.txt" || true)"
 excluded_count="$(grep -c . "$WORK/excluded.txt" || true)"
 [ "$included_count" -gt 0 ] || die "没有任何条目通过门禁,模块为空,已中止"
 
-# 4) 渲染模块
-STAGE="$WORK/stage"
-mkdir -p "$STAGE/apks"
-cp -a "$ROOT/module/." "$STAGE/"
+# 4) 渲染普通变体(静态 ZIP 布局:APK 直接位于 system/app/<Name>/<Name>.apk)
+STAGE_MAIN="$WORK/stage-main"
+mkdir -p "$STAGE_MAIN"
+cp -a "$ROOT/module/." "$STAGE_MAIN/"
 
-ENTRY_LINES=""
-STOCK_LINES=""
-while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET; do
-  [ -n "$APP_ID" ] || continue
-  cp "$WORK/apks/$APP_NAME.apk" "$STAGE/apks/$APP_NAME.apk"
-  ENTRY_LINES="${ENTRY_LINES}${APP_PKG}|${APP_NAME}|${APK_SHA}"$'\n'
-  case "$(printf '%s\n' "$STOCK_LINES")" in
-    *"$STOCK_PKG"*) : ;;
-    *) STOCK_LINES="${STOCK_LINES}${STOCK_PKG}"$'\n' ;;
-  esac
-done < "$WORK/included.txt"
-ENTRY_LINES="${ENTRY_LINES%$'\n'}"
-STOCK_LINES="${STOCK_LINES%$'\n'}"
+is_priv_app() {
+  case ",$PRIV_APP_IDS," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
 
-render_placeholder "$STAGE/module.prop"   '__VERSION__'      "$VERSION"
-render_placeholder "$STAGE/module.prop"   '__VERSION_CODE__' "$VERSION_CODE"
-render_placeholder "$STAGE/customize.sh"  '__APP_ENTRIES__'  "$ENTRY_LINES"
-render_placeholder "$STAGE/uninstall.sh"  '__STOCK_PACKAGES__' "$STOCK_LINES"
+render_variant() { # $1=main|priv $2=stage $3=模板目录 $4=zip 路径
+  local variant="$1" stage="$2" template="$3" zip_out="$4"
+  local entry_lines="" stock_lines="" location="app" app_dir="" app_root app_dest
+  local app_id app_name app_pkg stock_pkg vc signer apk_sha asset hits ack
 
-leftover="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$STAGE" || true)"
-if [ -n "$leftover" ]; then
-  die "模块内仍有未渲染的占位符,拒绝打包:
-$leftover"
-fi
-chmod 0755 "$STAGE"/*.sh "$STAGE/META-INF/com/google/android/update-binary"
+  mkdir -p "$stage"
+  cp -a "$template/." "$stage/"
+  while IFS='|' read -r app_id app_name app_pkg stock_pkg vc signer apk_sha asset hits ack; do
+    [ -n "$app_id" ] || continue
+    location="app"
+    app_dir="$app_name"
+    if [ "$variant" = "priv" ] && is_priv_app "$app_id"; then
+      location="priv"
+      # dir_name 是列表首项(当前 recorder)的显式目标目录;后续扩展项沿用 apps.yaml name。
+      if [ "$app_id" = "$PRIV_PRIMARY_ID" ]; then app_dir="$PRIV_DIR_NAME"; fi
+    fi
+    if [ "$location" = "priv" ]; then app_root="$stage/system/priv-app"; else app_root="$stage/system/app"; fi
+    app_dest="$app_root/$app_dir/$app_dir.apk"
+    mkdir -p "${app_dest%/*}"
+    cp "$WORK/apks/$app_name.apk" "$app_dest"
+    chmod 0755 "${app_dest%/*}"
+    chmod 0644 "$app_dest"
+    entry_lines="${entry_lines}${app_pkg}|${app_dir}|${apk_sha}|${location}"$'\n'
+    case "$(printf '%s\n' "$stock_lines")" in
+      *"$stock_pkg"*) : ;;
+      *) stock_lines="${stock_lines}${stock_pkg}"$'\n' ;;
+    esac
+  done < "$WORK/included.txt"
+  entry_lines="${entry_lines%$'\n'}"
+  stock_lines="${stock_lines%$'\n'}"
 
-# 5) 打包
+  render_placeholder "$stage/module.prop" '__VERSION__' "$VERSION"
+  render_placeholder "$stage/module.prop" '__VERSION_CODE__' "$VERSION_CODE"
+  render_placeholder "$stage/customize.sh" '__APP_ENTRIES__' "$entry_lines"
+  render_placeholder "$stage/uninstall.sh" '__STOCK_PACKAGES__' "$stock_lines"
+  if [ "$variant" = "main" ]; then
+    render_placeholder "$stage/customize.sh" '__PRIVAPP_XML_NAME__' "$PRIV_XML_NAME"
+  else
+    render_placeholder "$stage/customize.sh" '__PRIVAPP_XML_NAME__' "$PRIV_XML_NAME"
+    render_placeholder "$stage/service.sh" '__PRIVAPP_XML_NAME__' "$PRIV_XML_NAME"
+    mkdir -p "$stage/system/etc/permissions"
+    cp "$PRIV_XML_TEMP" "$stage/system/etc/permissions/$PRIV_XML_NAME"
+    chmod 0755 "$stage/system" "$stage/system/etc" "$stage/system/etc/permissions"
+    chmod 0644 "$stage/system/etc/permissions/$PRIV_XML_NAME"
+  fi
+
+  leftover="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$stage" || true)"
+  [ -z "$leftover" ] || die "$variant 模块仍有未渲染占位符:\n$leftover"
+  chmod 0755 "$stage"/*.sh "$stage/META-INF/com/google/android/update-binary"
+  if [ "$NO_ZIP" = 1 ]; then
+    info "--no-zip:$variant 变体已渲染,跳过 zip"
+  else
+    rm -f "$zip_out"
+    ( cd "$stage" && zip -q -r9 "$zip_out" . )
+    info "模块包: $zip_out ($(wc -c < "$zip_out" | tr -d ' ') 字节)"
+  fi
+}
+
 ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION.zip"
-if [ "$NO_ZIP" = 1 ]; then
-  info "--no-zip:已跳过打包,渲染结果在 $STAGE"
-else
-  rm -f "$ZIP_OUT"
-  ( cd "$STAGE" && zip -q -r9 "$ZIP_OUT" . )
-  info "模块包: $ZIP_OUT ($(wc -c < "$ZIP_OUT" | tr -d ' ') 字节)"
+PRIV_ZIP_OUT="$DIST_DIR/GKUI-Pack-Priv-$VERSION.zip"
+PRIV_MANIFEST="$DIST_DIR/priv-build-manifest.txt"
+rm -f "$ZIP_OUT" "$PRIV_ZIP_OUT" "$PRIV_MANIFEST"
+render_variant main "$STAGE_MAIN" "$ROOT/module" "$ZIP_OUT"
+
+# 5) 可选特权变体:任何缺失/未知/不匹配都不允许生成 Priv ZIP。
+PRIV_VARIANT_STATE="disabled"
+PRIV_XML_TEMP=""
+PRIV_XML_COUNT=0
+PRIV_SKIP_REASON=""
+if [ "$PRIV_ENABLED" = "true" ]; then
+  PRIV_PRIMARY_ID="${PRIV_APP_IDS%%,*}"
+  PRIV_READY=1
+  if [ -z "$PRIV_APP_IDS" ]; then
+    PRIV_READY=0
+    PRIV_SKIP_REASON="priv_variant.app_ids 为空"
+  else
+    OLD_IFS="$IFS"
+    IFS=','
+    for PRIV_ID in $PRIV_APP_IDS; do
+      if ! awk -F'|' -v want="$PRIV_ID" '$1 == want { found=1 } END { exit !found }' "$WORK/included.txt"; then
+        PRIV_READY=0
+        PRIV_SKIP_REASON="$PRIV_ID 尚未通过 APK 门禁并纳入普通变体(可能仍 disabled/TODO)"
+        break
+      fi
+    done
+    IFS="$OLD_IFS"
+  fi
+
+  if [ "$PRIV_READY" = 1 ]; then
+    PRIV_DUMP="$ROOT/$PRIV_DUMP_REL"
+    if [ ! -f "$PRIV_DUMP" ]; then
+      PRIV_READY=0
+      PRIV_SKIP_REASON="缺少实测设备权限转储 $PRIV_DUMP;按 device/README.md 采集后才能构建特权版"
+    fi
+  fi
+
+  PRIV_XML_TEMP="$WORK/priv/system/etc/permissions/$PRIV_XML_NAME"
+  GEN_ARGS=(--dump "$ROOT/$PRIV_DUMP_REL" --out "$PRIV_XML_TEMP")
+  if [ "$PRIV_READY" = 1 ]; then
+    mkdir -p "$(dirname "$PRIV_XML_TEMP")"
+    OLD_IFS="$IFS"
+    IFS=','
+    for PRIV_ID in $PRIV_APP_IDS; do
+      PF_JSON="$WORK/preflight-$PRIV_ID.json"
+      if [ ! -s "$PF_JSON" ]; then
+        PRIV_READY=0
+        PRIV_SKIP_REASON="缺少 $PRIV_ID 的 APK preflight JSON"
+        break
+      fi
+      GEN_ARGS+=(--app-json "$PF_JSON")
+    done
+    IFS="$OLD_IFS"
+  fi
+
+  if [ "$PRIV_READY" = 0 ]; then
+    PRIV_VARIANT_STATE="skipped"
+    warn "privileged ZIP 未生成(fail-closed):$PRIV_SKIP_REASON;普通版仍可构建"
+    {
+      printf '\n## 特权变体未生成(fail-closed)\n\n'
+      printf -- '- 状态: skipped\n- 原因: %s\n' "$PRIV_SKIP_REASON"
+      printf -- '- 未生成特权白名单 XML 或 Priv ZIP;普通 ZIP 不受影响。\n'
+    } >> "$REPORT"
+  elif ! PRIV_PERMISSION_REPORT="$(python3 "$ROOT/scripts/generate-privapp-permissions.py" "${GEN_ARGS[@]}" 2>&1)"; then
+    PRIV_VARIANT_STATE="skipped"
+    PRIV_SKIP_REASON="白名单生成失败;详见 PREFLIGHT-REPORT.md"
+    warn "privileged ZIP 未生成(fail-closed):白名单输入不合格;普通版仍可构建"
+    {
+      printf '\n## 特权变体白名单生成失败(fail-closed)\n\n```text\n%s\n```\n' "$PRIV_PERMISSION_REPORT"
+      printf '\n未生成特权白名单 XML 或 Priv ZIP;普通 ZIP 不受影响。\n'
+    } >> "$REPORT"
+  else
+    PRIV_XML_COUNT="$(grep -c '<permission name=' "$PRIV_XML_TEMP" || true)"
+    if [ "$PRIV_XML_COUNT" -lt 1 ]; then
+      PRIV_VARIANT_STATE="skipped"
+      PRIV_SKIP_REASON="生成的白名单 XML 为空"
+      warn "privileged ZIP 未生成(fail-closed):$PRIV_SKIP_REASON;普通版仍可构建"
+      printf '\n## 特权变体未生成(fail-closed)\n\n- 原因: %s\n- 未生成 Priv ZIP;普通 ZIP 不受影响。\n' "$PRIV_SKIP_REASON" >> "$REPORT"
+    else
+      PRIV_VARIANT_STATE="built"
+      {
+        printf '\n## 特权变体白名单生成报告\n\n```text\n%s\n```\n' "$PRIV_PERMISSION_REPORT"
+        printf '\n## 特权变体风险与恢复\n\n'
+        printf -- '- ⚠ 特权版可能因设备白名单/分区不匹配导致无法开机。\n'
+        printf -- '- 恢复:管理器禁用/删除模块,或在 recovery/root shell 删除 `/data/adb/modules/gkui-pack`。\n'
+        printf -- '- 回到零风险状态:刷回同 id 的普通版 `GKUI-Pack-%s.zip`。\n' "$VERSION"
+        printf -- '- 不要使用 `magisk --remove-modules` 除非别无他法(它会移除所有模块)。\n'
+      } >> "$REPORT"
+      render_variant priv "$WORK/stage-priv" "$ROOT/module-priv" "$PRIV_ZIP_OUT"
+
+      {
+        printf '# GKUI-Pack 特权变体构建清单\n'
+        printf '# ZIP: %s\n' "$PRIV_ZIP_OUT"
+        printf '# XML: /system/etc/permissions/%s (%s 条)\n' "$PRIV_XML_NAME" "$PRIV_XML_COUNT"
+        printf 'state\tapp_id\tapplication_id\tname\tinstall_path\tprivileged_permissions\tapk_sha256\n'
+        while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET HITS _ACK; do
+          [ -n "$APP_ID" ] || continue
+          if is_priv_app "$APP_ID"; then
+            INSTALL_PATH="/system/priv-app/$PRIV_DIR_NAME"
+            if [ "$APP_ID" != "$PRIV_PRIMARY_ID" ]; then INSTALL_PATH="/system/priv-app/$APP_NAME"; fi
+          else
+            INSTALL_PATH="/system/app/$APP_NAME"
+          fi
+          printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$APP_ID" "$APP_PKG" "$APP_NAME" "$INSTALL_PATH" "$HITS" "$APK_SHA"
+        done < "$WORK/included.txt"
+        printf '# 白名单权限总数: %s\n' "$PRIV_XML_COUNT"
+      } > "$PRIV_MANIFEST"
+    fi
+  fi
 fi
 
-# 6) 构建清单
+# 6) 主构建清单(旧列保持兼容;新增 C3 ack 与 privileged 权限记录)
 MANIFEST="$DIST_DIR/build-manifest.txt"
 {
   printf '# GKUI-Pack 构建清单\n'
   printf '# 生成时间(UTC): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf '# 模块版本: %s (versionCode %s)\n' "$VERSION" "$VERSION_CODE"
-  printf '# 产物: %s\n' "$ZIP_OUT"
+  printf '# 普通版 ZIP: %s\n' "$ZIP_OUT"
+  printf '# 特权变体状态: %s\n' "$PRIV_VARIANT_STATE"
+  if [ "$PRIV_VARIANT_STATE" = "built" ]; then
+    printf '# 特权版 ZIP: %s\n' "$PRIV_ZIP_OUT"
+    printf '# 白名单 XML: system/etc/permissions/%s (%s 条)\n' "$PRIV_XML_NAME" "$PRIV_XML_COUNT"
+  elif [ "$PRIV_VARIANT_STATE" = "skipped" ]; then
+    printf '# 特权版未生成(安全失败关闭): %s\n' "$PRIV_SKIP_REASON"
+  fi
   printf '#\n# 说明:asset_sha256 是 Release 资产文件的 sha256(即 apps.yaml 的 sha256);\n'
-  printf '#       apk_sha256 是解包后实际写入 /system/app 的 APK 的 sha256。\n'
-  printf 'state\tapp_id\tapplication_id\tname\tasset_sha256\tapk_sha256\tversion_code\tsigner_sha256\n'
-  while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET; do
+  printf '#       apk_sha256 是解包后实际 APK 的 sha256;privileged_ack 不会改变普通版安装位置。\n'
+  printf 'state\tapp_id\tapplication_id\tname\tasset_sha256\tapk_sha256\tversion_code\tsigner_sha256\tprivileged_ack\tprivileged_permissions\n'
+  while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET HITS ACK; do
     [ -n "$APP_ID" ] || continue
-    printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$APP_ID" "$APP_PKG" "$APP_NAME" "$(entry_field "$APP_ID" sha256)" "$APK_SHA" "$VC" "$SIGNER"
+    printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$APP_ID" "$APP_PKG" "$APP_NAME" "$(entry_field "$APP_ID" sha256)" "$APK_SHA" "$VC" "$SIGNER" "$ACK" "$HITS"
   done < "$WORK/included.txt"
   while IFS='|' read -r APP_ID APP_NAME APP_PKG REASON; do
     [ -n "$APP_ID" ] || continue
-    printf 'excluded\t%s\t%s\t%s\t-\t-\t-\t-\n' "$APP_ID" "$APP_PKG" "$APP_NAME"
+    printf 'excluded\t%s\t%s\t%s\t-\t-\t-\t-\t-\t%s\n' \
+      "$APP_ID" "$APP_PKG" "$APP_NAME" "$REASON"
   done < "$WORK/excluded.txt"
 } > "$MANIFEST"
 
 # 7) 摘要
 log ""
 printf '%s=== 构建摘要 ===%s\n' "$C_BLD" "$C_RST"
-printf '纳入模块(%s 项):\n' "$included_count"
-while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET; do
+printf '普通版纳入模块(%s 项):\n' "$included_count"
+while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET HITS ACK; do
   [ -n "$APP_ID" ] || continue
   printf '  ✔ %-12s %-28s → system/app/%s/%s.apk  versionCode=%s  签名=%s…\n' \
     "$APP_ID" "$APP_PKG" "$APP_NAME" "$APP_NAME" "$VC" "$(printf '%s' "$SIGNER" | cut -c1-16)"
+  if [ -n "$HITS" ]; then
+    printf '      C3 privileged_ack=%s;仅普通 system_app,不会授予:%s\n' "$ACK" "$HITS"
+    printf '      通话录音等特权功能不会生效;需刷入独立生成的特权变体。\n'
+  fi
 done < "$WORK/included.txt"
 if [ "$excluded_count" -gt 0 ]; then
-  printf '%s因检出 privileged 权限被排除(仅走 adb install,见 README):%s\n' "$C_YEL" "$C_RST"
+  printf '%s因申请平台特权权限且未显式确认而排除(仅走 adb install):%s\n' "$C_YEL" "$C_RST"
   while IFS='|' read -r APP_ID APP_NAME APP_PKG REASON; do
     [ -n "$APP_ID" ] || continue
     printf '  ✘ %-12s %-28s (%s)\n' "$APP_ID" "$APP_PKG" "$REASON"
   done < "$WORK/excluded.txt"
 fi
-printf '被跳过的条目(未参与构建):\n'
+if [ "$PRIV_VARIANT_STATE" = "built" ]; then
+  printf '\n特权版: %s\n' "$PRIV_ZIP_OUT"
+  printf '  XML: system/etc/permissions/%s (%s 条;APK 申请集 ∩ 设备 privileged 集)\n' "$PRIV_XML_NAME" "$PRIV_XML_COUNT"
+  printf '  仅 priv_variant.app_ids 指定的应用安装于 system/priv-app;其余仍在 system/app。\n'
+elif [ "$PRIV_VARIANT_STATE" = "skipped" ]; then
+  printf '\n%s特权版未生成(安全失败关闭): %s%s\n' "$C_YEL" "$PRIV_SKIP_REASON" "$C_RST"
+fi
+printf '被跳过的 apps.yaml 条目(未参与构建):\n'
 apps_python --list 2>/dev/null | grep -E '^  \[跳过\] [a-z][a-z0-9_]*:' | sed 's/^/  /' || true
 printf '报告: %s\n' "$REPORT"
 printf '清单: %s\n' "$MANIFEST"
-[ "$NO_ZIP" = 1 ] || printf '模块包: %s\n' "$ZIP_OUT"
+[ "$NO_ZIP" = 1 ] || printf '普通版模块包: %s\n' "$ZIP_OUT"
+[ "$NO_ZIP" = 1 ] || [ "$PRIV_VARIANT_STATE" != "built" ] || printf '特权版模块包: %s\n' "$PRIV_ZIP_OUT"
 log ""
-printf '%s完成。%s模块为 coexist 模式:不替换、不修改任何 stock 应用。\n' "$C_GRN" "$C_RST"
-printf '提醒:模块与设备 /data 中已安装的同包名应用会冲突,刷入前请先按 README 处理(C8)。\n'
+printf '%s完成。普通版保持 system/app/coexist;特权版仅在 APK 权限与实测设备转储完全匹配时生成。%s\n' "$C_GRN" "$C_RST"
+printf '刷入任一变体前,先处理设备 /data 中同包名应用(C8)。特权版如启动失败,用 README 中的方法禁用模块或刷回普通版。\n'

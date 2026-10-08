@@ -1,17 +1,18 @@
 # GKUI-Pack
 
 把 [gx-bangsong](https://github.com/gx-bangsong) 的 LineageOS 本土化应用
-(GKUI 日历 / 图库 / 计算器 / 时钟)打包安装到你**已经能正常运行的设备**上。
+(GKUI 日历 / 图库 / 计算器 / 时钟 / 录音机,共五款)打包安装到你**已经能正常运行的设备**上。
 
 本仓库是**打包与安装工程**,不含任何 APK、不含任何上游源码:
 APK 由 CI 或你本机从各应用的 GitHub Releases 下载,并逐个校验 sha256 与签名证书。
 
 ---
 
-## ⚠️ 先读这一节:全部 APK 都是 debug 构建
+## ⚠️ 先读这一节:已验证的 APK 是 debug 构建
 
-> **GKUI 系列 APK 均为 debug 构建**(包名带 `.debug` / `.dev` 后缀,
-> 由 **debug keystore** 签名),不是正式发行签名。
+> 已实际取得并检查的 GKUI APK 为 **debug 构建**(包名带 `.debug` / `.dev` 后缀,
+> 由 **debug keystore** 签名),不是正式发行签名。GKUIRecorder beta2 的 Release asset
+> 元数据已登记,但 APK 本体尚未取得,其构建类型与 signer 必须等 CI 下载后实测,不能据源码推断。
 >
 > * 调试签名可能随构建环境变化。当签名与设备上已安装版本不一致时,
 >   覆盖安装会失败(`INSTALL_FAILED_UPDATE_INCOMPATIBLE`),
@@ -149,6 +150,7 @@ $want = @{
   'app-debug.apk'                 = 'b5e039fb867c76d1ca17935b51186564ebcb409c50a90c2ee20a231c08e172f7'
   'ExactCalculator-debug.apk.zip' = 'dfae8f8731797a7ffe09377a8c0141579077fb389d37f730d052cc4b2e400fc0'
   'DeskClock-debug.apk'           = '206d5e9cc348622036ed6cdbfe78d8db3bae9080bfa5836de2d2af8cca34f0fa'
+  'GKUIRecorder-beta2.apk'         = 'f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f' # GitHub API asset digest; APK 本体 / signer 尚未本地实测
 }
 foreach ($f in $want.Keys) {
   if (-not (Test-Path $f)) { "缺少   $f"; continue }
@@ -163,6 +165,7 @@ foreach ($f in $want.Keys) {
 & $adb install -r .\GKUICalendar-1.0.apk
 & $adb install -r .\app-debug.apk
 & $adb install -r .\DeskClock-debug.apk
+& $adb install -r .\GKUIRecorder-beta2.apk  # 仅在核对 Release asset digest 后使用;签名还需实测
 
 # calculator 的 Release 资产是 zip 包装:先解压,再装里面的 APK
 Expand-Archive -Path .\ExactCalculator-debug.apk.zip -DestinationPath .\calc -Force
@@ -188,7 +191,8 @@ $inner = Get-ChildItem .\calc -Recurse -Filter *.apk | Select-Object -First 1
 `build-manifest.txt` 会作为 artifact 上传,可下载查看实测值。
 
 > ℹ️ `clock` 的 APK 未声明 `versionCode`(设备上那一份实测为 0)→ 按 G7 语义**放行**
-> (见下文专节);四个应用的字段已齐全,标签构建不会再被门禁挡住。
+> (见下文专节)。录音机已设为启用并进入五应用清单,但 APK signer 尚未由真实 APK 实测；
+> 当前 `signer_sha256: TODO` 会按 C7 阻止正式构建,CI 的 collect-only 报告可用于补齐。
 
 ### 想在 Windows 上用原脚本?
 
@@ -202,13 +206,16 @@ $inner = Get-ChildItem .\calc -Recurse -Filter *.apk | Select-Object -First 1
 
 ## 🧩 次方案:systemless 模块(Magisk / KernelSU / APatch)
 
-模块为 **coexist 模式**:APK 挂载到 `/system/app/<Name>/`,与 ROM 自带应用**共存**,
-**绝不替换、绝不修改、绝不禁用**任何自带应用。
+普通变体为 **coexist 模式**:APK 在 ZIP 中已静态放入
+`system/app/<Name>/<Name>.apk`,安装时不由脚本从临时目录复制;与 ROM 自带应用**共存**,
+**绝不替换、绝不修改、绝不禁用**任何自带应用。另有需明确 opt-in 的特权变体:只将
+`priv_variant.app_ids` 中的应用静态放入 `system/priv-app/`,其他应用仍在 `system/app/`。
+两个 ZIP 共享 `module.prop` 的 `id=gkui-pack`,设备上只能启用一个变体。
 
 ### ⚠️ 刷入前必须先做的一件事(C8)
 
 GKUI 应用目前通常已经通过 adb 安装在 **`/data` 用户空间**;模块版与之**同包名**,
-必然冲突。所以 `module/customize.sh` 会在安装时逐个执行 `pm path <application_id>`:
+必然冲突。所以普通版 `module/customize.sh` 与特权版 `module-priv/customize.sh` 都会在安装时逐个执行 `pm path <application_id>`;特权版还会在部署前复核目标设备权限转储:
 
 * 返回 `/data/...` → **中止整个安装**(exit 1)并打印:
 
@@ -224,7 +231,8 @@ GKUI 应用目前通常已经通过 adb 安装在 **`/data` 用户空间**;模�
   bash scripts/uninstall_all.sh --yes     # 或用 adb uninstall <application_id>
   ```
 
-* 返回 `/system/...` → 认为模块已生效,该条目跳过。
+* 返回目标 `/system/...` 路径 → 认为模块已生效,该条目跳过;若发现同模块的另一变体落点,则清理旧路径并迁移。
+* 特权版会额外读取 APK 清单 XML,对每条权限调用 `pm list permissions -f`(必要时 `-fg`)复核其保护级别仍含 `privileged`;无法解析或不匹配时在部署 APK/XML 前中止。
 
 另外:安装环境必须有可用的 `pm`(在 recovery 下刷入会被拒绝),
 此时请改用管理器在系统内安装,或直接用上面的**主方案**。
@@ -233,18 +241,34 @@ GKUI 应用目前通常已经通过 adb 安装在 **`/data` 用户空间**;模�
 
 ```bash
 bash build.sh
-# → dist/GKUI-Pack-<version>.zip        模块包(刷入用)
-# → dist/PREFLIGHT-REPORT.md            APK 七项门禁报告
-# → dist/build-manifest.txt             本次构建的每个 APK 的实际 sha256 / 签名 / versionCode
+# → dist/GKUI-Pack-<version>.zip        普通变体(所有纳入的应用均为 system/app)
+# → dist/GKUI-Pack-Priv-<version>.zip   可选特权变体;仅所有特权门禁通过后生成
+# → dist/PREFLIGHT-REPORT.md            APK 七项门禁 + 特权权限交集报告
+# → dist/build-manifest.txt             普通版清单/特权版状态;若生成另有 priv-build-manifest.txt
 ```
 
 构建会依次执行:清单校验 → 资产 sha256 校验 → 解包 → **APK 七项门禁**
-→ 渲染模块 → 打包。任何一项不满足都会失败(见「硬约束」)。
+→ 将普通版 APK 静态放入 `system/app/<Name>/<Name>.apk` → (可选)按实测设备权限转储
+生成特权 XML/变体 → 打包。任一选定特权 APK 缺权限定义、转储不可解析、纯 signature、
+交集为空时 fail-closed,跳过 Priv ZIP,但不影响合格的普通 ZIP。录音机当前 enabled 且
+`privileged_ack: true`,但 signer 指纹仍为 TODO;C7 会阻止当前正式构建,直到真实 APK
+经 `apksigner` 验证并回填。设备权限转储也未采集,所以当前不能生成/发布 Priv ZIP。
+
+### ⚠️ 特权变体(实验性、高风险)
+
+- 特权 ZIP 只将 `priv_variant.app_ids` 里显式选中的应用放入 `/system/priv-app/`;本设计仅把 recorder 选入特权路径,另外四款仍是 `/system/app/`。
+- 白名单 XML **仅**包含“APK 实际申请权限 ∩ 同一设备 dump 中 protectionLevel 含 privileged 的权限”。输入缺失/歧义、权限不在 dump、纯 signature 或空交集均失败,绝不猜测。
+- 安装器在目标真机再用 `pm list permissions -f` / `-fg` 逐项复核。ROM/SDK 改变、设备 dump 不匹配、白名单分区错位都可能导致 bootloop;API 28+ 的 `ro.control_privapp_permissions=enforce` 尤其需谨慎。
+- 普通版的 `privileged_ack: true` 只表示“允许作为普通 system app 入普通版”;**不**授予这些权限、不写 XML,也不会改变安装路径。
+- recorder 的 beta2 Release 元数据与 asset digest 已登记在 `apps.yaml`,但 APK 本体暂未下载核验,signer 仍是 TODO;设备 `framework-permissions.txt` 也不存在,当前不生成/不发布特权版。
+- 设备只安装其中一个 ZIP。切换变体时脚本清理旧录音机落点和白名单;先按 C8 处理 `/data` 副本。完整采集/安装/恢复说明见 [`module-priv/README.md`](module-priv/README.md) 与 [`device/README.md`](device/README.md)。
+- `release.yml` 保持零改动;它现有的 `dist/GKUI-Pack-*.zip` glob 会在两份都生成时上传两个 ZIP。若某个 Release 确实附带 Priv ZIP,发布说明请使用 [`docs/privileged-release-notes.md`](docs/privileged-release-notes.md) 的特权风险/恢复段落;当前工作流生成的自动 notes 模板不自动内嵌此文件。
 
 ### 刷入
 
-* **Magisk**:Magisk 应用 → 模块 → 从本地安装,选择 `dist/GKUI-Pack-*.zip`。
-* **KernelSU / APatch**:用各自管理器安装同一个 zip。
+* **普通版(Magisk)**:Magisk 应用 → 模块 → 从本地安装,明确选择 `dist/GKUI-Pack-<version>.zip`(不要使用会同时匹配两份 ZIP 的通配符)。
+* **特权版(Magisk)**:仅当本次构建确实生成 `GKUI-Pack-Priv-<version>.zip` 且你已阅读高风险恢复说明时,选择该文件;不可与普通版同时启用。
+* **KernelSU / APatch**:用各自管理器安装所选的单个 ZIP。
   ⚠️ **本工程未在 KernelSU / APatch 真机上验证**(见「诚实边界」)。
 
 ### 开机自愈(bootloop 自救)
@@ -272,17 +296,17 @@ adb shell pm disable-user --user 0 <stock_package>
 |---|---|---|
 | C1 | **不推断包名** | known 反例:`GKUICalendar` fork 自 Etar,但它的 applicationId 是 `ws.xsoh.etar.debug`,不是 `org.lineageos.etar.debug`。凡不在事实基线中的值一律写 `TODO`,构建失败。 |
 | C2 | **只做 coexist** | `mode` 只允许 `coexist`;不生成任何写入 stock 应用目录的代码;不使用 Magisk 的 `REPLACE` 变量或 `.replace` 文件。 |
-| C3 | **只装 `system/app`** | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。门禁若检出某 APK **申请**此类权限,**不生成白名单 XML**,而是**把它排除出模块**,并在此标注「该应用仅走 adb install」。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
+| C3 | **默认走普通 `system/app`;特权版必须显式选择并通过 fail-closed 验证** | 申请平台特权权限的 APK 默认排除。`privileged_ack: true` 可明确接受其以普通 `/system/app` 纳入,但不授予权限、不生成 XML。只有 `priv_variant.app_ids` 指定的应用可进独立 `GKUI-Pack-Priv-*.zip` 的 `/system/priv-app`;白名单按“APK 实际申请 ∩ 同 ROM dump 中 protectionLevel 含 privileged”生成,缺失/歧义/纯 signature/空交集均失败,安装时再由 `pm` 复核。APK **自己声明**的 signature 权限只报告,不因此排除。 |
 | C4 | **不含拨号 / 短信 / 联系人** | 它们使用 `sharedUserId="android.uid.shared"` 并依赖 platform 签名,第三方签名无法替换,任何打包尝试都必然失败。因此本仓库**不接受**这类应用,即使被要求也不做。 |
 | C5 | **仓库不含 APK** | `.gitignore` 含 `*.apk`、`dist/`、`build/`、`*.keystore`;验收 `git ls-files \| grep -c '\.apk$'` 必须为 `0`;APK 由 CI 下载并校验 sha256。 |
 | C6 | **签名必须匹配** | 每个 APK 的证书 SHA-256 与 `apps.yaml` 记录不一致 → 构建失败,并提示「需卸载重装,应用内数据会丢失」。 |
 | C7 | **TODO 必须失败** | 任何必填字段为 `TODO` 或 `confidence: unverified` 都让构建**失败**,绝不降级为 warning。 |
 | C8 | **`/data` 冲突必须中止** | 见上文「刷入前必须先做的一件事」。 |
 
-> 唯一的一处宽松处理:**`enabled: false` 的条目**(目前只有录音机)里残留的
-> `TODO` 不会阻断构建 —— 因为它根本不参与构建。这是为了让项目在"录音机包名
-> 待确认"的长期状态下仍能出包。想恢复字面语义请加 `--strict`:
-> `bash build.sh --check --strict` 或 `bash build.sh --strict`。
+> `enabled: false` 的条目不参与构建,其 TODO 默认不阻断(加 `--strict` 才会检查所有条目)。
+> recorder 已启用、`privileged_ack: true`,且 beta2 Release 元数据已登记;但签名指纹尚未由
+> APK 本体采集,因此其 `signer_sha256: TODO` / `confidence: unverified` 会按 C7 阻止当前构建。
+> 这保证五应用目标明确纳入门禁,但不伪造签名或输出未经验证的 ZIP。
 
 ---
 
@@ -296,8 +320,8 @@ adb shell pm disable-user --user 0 <stock_package>
 | 字段 | 来源 | 采集方式 |
 |---|---|---|
 | `sha256` | Release 资产的 sha256 | 已按 GitHub Releases API 的 asset digest 填好(核查时间 2026-10-08);CI 每次构建都会重新下载并逐字节复算 |
-| `signer_sha256` | APK 签名证书 SHA-256 | ✅ **已填**(2026-10-08 CI Release 运行在真实 APK 上由 `apksigner` 实测,见 `PREFLIGHT-REPORT.md` G4);CI 每次构建都会重新比对,不一致即 fail(C6) |
-| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none`。录音机条目另实测到 `org.lineageos.recorder.dev=1`(条目仍禁用,原因见下节) |
+| `signer_sha256` | APK 签名证书 SHA-256 | 四个已验证 APK 的值由真实 `apksigner` 实测;recorder 仍为 TODO,因本环境无法取得 beta2 APK 本体。CI 的 release collect-only 会报告 recorder 的真实值;人工核对回填前 C7 阻止出包,其余 APK 每次构建仍会按 C6 比对 |
+| `installed_version_code` | 设备上已安装版本的 versionCode | ✅ **已填**(2026-10-08 真机 adb 实测:`ws.xsoh.etar.debug=51`、`org.lineageos.glimpse.dev=1`、`com.android.calculator2.dev=1`、`com.android.deskclock.dev=0`、`org.lineageos.recorder.dev=1`)。Windows 用户可用「Windows 用户」一节的 PowerShell 命令重采;设备上确实没装该包名时才写 `none`。 |
 
 ### 设备侧:`scripts/probe-device.sh`(只读)
 
@@ -324,27 +348,30 @@ bash build.sh --collect-only     # 打印每个 APK 的真实 applicationId / ve
 * CI 的 tag 构建(`release.yml`)会自动跑一遍这个步骤,并把报告作为 artifact
   上传 —— 于是你可以:打 tag → 下载 artifact → 回填 `apps.yaml` → 重新打 tag。
 
-### 录音机(GKUIRecorder)为什么仍然是 `enabled: false`
+### 录音机(GKUIRecorder):普通版纳入已明确,签名门禁仍待真实 APK 验证
 
-* **包名与已装版本都已实测**(2026-10-08):真机采集得到 `org.lineageos.recorder.dev`,
-  `installed_version_code = 1` —— 用的就是上一节「Windows 用户」那段 PowerShell
-  (先 `pm list packages -3` 判存在、再 `dumpsys package` 取 versionCode)。
-  源码里 `applicationIdSuffix = ".dev"` 恰与实测一致,但那只是巧合:
-  填写依据是实测输出,不是规律。
-* **真正的拦路石是资产**:仓库 `gx-bangsong/GKUIRecorder` 目前**没有任何 Release、
-  也没有任何 Tag**,拿不到可下载、可校验 sha256 的 APK,于是 `source_url`(commit 级)、
-  `release_tag`、`asset_name`、`sha256`、`signer_sha256` 只能继续留 `TODO`,
-  条目保持 `enabled: false`。
-* 上游与许可**已核实**:上游为 `LineageOS/android_packages_apps_Recorder`
-  (GitHub API 的 `parent` / `source` 字段),许可为 **Apache-2.0**
-  (仓库内 `REUSE.toml` + `LICENSES/Apache-2.0.txt`;API 的 license 字段"无法识别")。
-* **想让它进包?** 给 GKUIRecorder 打一个 Release(附 debug APK),然后:
-  打 tag 触发 CI → 下载 `PREFLIGHT-REPORT.md`(真实 APK 的包名 / versionCode /
-  签名证书 / 资产 sha256 都在里面)→ 回填 `apps.yaml` → 再打 tag。
-  回填前条目保持禁用;万一 `application_id` 填错,preflight 会拿 APK 的真实包名
-  逐字符比对并让 CI 失败,错值带不出包。
-* 复核命令:`bash scripts/probe-device.sh --filter recorder`(列出设备上用户空间的包名
-  —— 那里的结果才是证据,规律不是)。
+* **包名与已装版本已实测**(2026-10-08):`org.lineageos.recorder.dev`,
+  `installed_version_code = 1`。源码里 `applicationIdSuffix = ".dev"` 恰与实测一致,
+  但登记依据是设备输出,不是命名规律。
+* **Release 已存在**:GitHub API 可查到 `beta2` tag 与资产 `GKUIRecorder-beta2.apk`;
+  API 返回的 asset digest 已写入 `apps.yaml`。源代码 tag 对应 commit 也已登记。
+  但本工作环境无法从 `release-assets.githubusercontent.com` 取得 APK 本体,所以
+  digest 尚未本地复算,签名证书 SHA-256 尚未用 `apksigner` 测量。不得据源码或 API
+  元数据猜 signer。
+* 清单已设置 `name: GKUIRecorder`、`enabled: true`、`privileged_ack: true`。
+  这表示最终普通 ZIP 明确包含五款应用的目标;recorder 的普通版落点为
+  `system/app/GKUIRecorder/GKUIRecorder.apk`。`privileged_ack` 不授予任何权限。
+* 由于 `signer_sha256: TODO` 且 `confidence: unverified`,C7 当前会阻止正式出包。
+  连接可下载 GitHub Release asset 的 CI 会在 `--collect-only` 报告真实包名、versionCode、
+  asset digest 与 signer;请下载报告、人工核对 APK 身份,再把实测 signer SHA-256 填入
+  `apps.yaml` 并将 confidence 设为 confirmed。`build.sh` 不会自动回填或猜测。
+* 上游与许可已核实:上游为 `LineageOS/android_packages_apps_Recorder`
+  (GitHub API 的 parent/source 字段),许可为 **Apache-2.0**
+  (仓库 `REUSE.toml` 与 `LICENSES/Apache-2.0.txt`)。
+* 另一个独立门槛是特权版设备转储:真实 `device/framework-permissions.txt` 尚未采集。
+  因此在设备 dump、权限交集与安装期复核都通过前,不能生成 Priv ZIP。
+* 复核命令:`bash scripts/probe-device.sh --filter recorder`(列出设备上用户空间的包名;
+  真机输出才是事实依据)。
 ---
 
 ## 🧰 命令速查
@@ -356,8 +383,8 @@ bash build.sh --check --strict        # 连 disabled 条目的 TODO 也算失败
 bash build.sh --list                  # 打印条目摘要
 bash build.sh --dump-apps-json        # 规范化 JSON(其它脚本统一从这里读清单)
 bash build.sh --collect-only          # 只采集真实值,不产出模块(永远返回非零)
-bash build.sh                         # 完整构建模块 zip
-bash build.sh --no-zip                # 只渲染模块,不打包(调试)
+bash build.sh                         # 完整构建普通 ZIP;特权输入齐备且合格时另生成 Priv ZIP
+bash build.sh --no-zip                # 只渲染变体,不打包(调试)
 bash scripts/preflight-apk.sh <apk> <app-id>   # 单个 APK 的七项门禁
 bash scripts/install_all.sh           # 【主方案】adb 免 root 批量安装
 bash scripts/uninstall_all.sh         # 逐个确认卸载
@@ -370,7 +397,7 @@ bash scripts/probe-device.sh          # 只读采集设备事实
 |---|---|---|
 | G1 | `aapt dump badging` 取 `package: name=`(**不读解包 manifest 的 package 属性** —— Etar 系那里是 AOSP 残留 `com.android.calendar`,会误导);取值按**整字段**匹配 —— 真实 badging 行里有 `compileSdkVersionCodename='16'`,它含小写 `name='`,子串匹配会把平台代号当成包名(本工程实际踩过,已加回归测试) | 失败 |
 | G2 | 断言无 `sharedUserId` | 失败 |
-| G3 | 列出 `uses-permission`;申请**平台签名/特权权限清单**(`ADVISORY_LIST`)则判为不适合模块化;另把本 APK **自己声明**的 `<permission>` 的 `protectionLevel` 解码后一并报告(如 `0x12` → `signature\|system`) | 申请命中 → 该应用**不适合模块化**,仅走 adb install(排除出模块,绝不生成白名单 XML);自声明权限**不影响**判定(androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 就是 signature 级,属正常做法) |
+| G3 | 列出 `uses-permission`;申请平台签名/特权权限(`ADVISORY_LIST`)默认不适合普通模块,但 `privileged_ack: true` 可显式允许仅按普通 `system_app` 入包;另报告 APK **自己声明**的 `<permission>` protectionLevel(如 `0x12` → `signature\|system`) | 未 ACK → excluded,仅走 adb install;已 ACK → 仍无特权权限。进入特权 ZIP 还须从 APK 请求集与同设备 dump privileged 集求交,并通过安装期 `pm` 复核;缺失、纯 signature、歧义、空交集均 fail-closed |
 | G4 | `apksigner verify --print-certs` 的证书 SHA-256 与 `apps.yaml` 比对 | 失败(提示数据丢失) |
 | G5 | 断言 `applicationId != stock_package`(C2) | 失败 |
 | G6 | 提取 `<provider>` authorities 与 `<permission>`,authority 不以 applicationId 为前缀则标红 | **仅报告,不影响退出码** |
@@ -414,9 +441,14 @@ scripts/
   uninstall_all.sh        逐个确认卸载
   probe-device.sh         只读采集设备事实(用于回填 TODO)
   preflight-apk.sh        APK 七项门禁
-module/                   systemless 模块源码(构建时被 build.sh 渲染进 zip)
+module/                   普通变体模板(仅 system/app;构建时渲染)
   module.prop  customize.sh  post-fs-data.sh  service.sh  uninstall.sh
   META-INF/com/google/android/{update-binary,updater-script}
+module-priv/              特权变体模板(同 module id;含安装复核/自检/恢复文档)
+  META-INF/com/google/android/{update-binary,updater-script}
+scripts/generate-privapp-permissions.py  从实测权限交集生成白名单 XML
+device/README.md          采集真机权限转储的步骤(转储文件目前缺失)
+docs/privileged-release-notes.md  特权 ZIP 的发布说明模板
 tests/test_build.sh       离线全流程测试(桩工具 + 假 APK)
 .github/workflows/        ci.yml(push/PR,离线)/ release.yml(tag v*,下载 APK 出包)
 AGENTS.md                 agent / 贡献者工作守则(硬约束与踩坑清单)
@@ -464,11 +496,11 @@ NOTICE.md                 上游 → fork → 本仓库 的归属与许可链条
   Magisk 模块约定(读取 `module.prop`、执行 `customize.sh`)"这一公开约定;
   Magisk 侧走标准 `install_module` 流程。`update-binary` 里为非 Magisk 环境提供了
   保守兜底流程(不确定就失败,绝不半成品安装),但同样未在真机验证。
-* **recorder(GKUIRecorder)拦在门外的不是包名,而是资产**:包名与 versionCode 已实测
-  (`org.lineageos.recorder.dev` / 1),但该仓库**没有任何 Release / Tag**,拿不到可下载、
-  可校验 sha256 的 APK;因此条目保持 `confidence: unverified` + `enabled: false`
-  (上游与许可已核实为 `LineageOS/android_packages_apps_Recorder` / Apache-2.0)。
-  G7 按"未声明=0"参与比较。但"versionCode=0 的 APK 装入 `/system/app` 后的真机行为"**未实测**。
+* **recorder(GKUIRecorder) 的 APK 本体 / 签名尚未实测**:包名与设备 versionCode 已实测
+  (`org.lineageos.recorder.dev` / 1);GitHub API 可查到 beta2 Release、asset 名和 SHA-256 digest,
+  但当前环境取不到重定向后的 APK 文件,所以 `signer_sha256` 保持 TODO、`confidence`
+  为 `unverified`。条目已启用并设 `privileged_ack: true`;C7 会在签名核验前阻止出包。
+  上游与许可已核实为 `LineageOS/android_packages_apps_Recorder` / Apache-2.0。
 * **采集过程留痕**:第一次采集 clock 时 adb 偶发返回空,一度被误读成"未安装";
   已在 apps.yaml 的注释里如实记录,采集命令也改为先用 `pm list packages` 判是否安装。
 * 各应用的**权限与 provider authorities 实际内容**由 CI 的 preflight 在真实 APK 上判定,

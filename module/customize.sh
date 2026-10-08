@@ -5,14 +5,15 @@
 # 由 Magisk / KernelSU / APatch 的模块安装器在解包后执行。
 # 本文件中的 __APP_ENTRIES__ 占位符由仓库根目录的 build.sh 在构建时渲染为:
 #
-#     <application_id>|<目录名>|<该 APK 的 sha256>
+#     <application_id>|<目录名>|<该 APK 的 sha256>|app
 #
-# 一行一个应用。**直接打包本目录(不经过 build.sh)得到的 zip 是无效的**:
+# 一行一个应用。普通版所有条目的落点均为 /system/app。
+# **直接打包本目录(不经过 build.sh)得到的 zip 是无效的**:
 # 此时清单为空,脚本会拒绝安装(见下面的清单检查)。
 #
 # 硬约束落实:
 #   C2  只写 system/app,绝不动任何 ROM 自带应用,不产生任何替换语义
-#   C3  只装 system/app(绝不使用特权应用目录),也不生成任何权限白名单
+#   C3  普通版只装 system/app;切换时清理本模块旧版特权挂载与 XML
 #   C8  与 /data 中同包名应用冲突时:**中止整个安装**并让用户自行卸载,
 #       模块绝不代为执行 pm uninstall
 # =============================================================================
@@ -29,14 +30,13 @@ if ! has_func abort; then
   abort() { ui_print "$1"; exit 1; }
 fi
 if ! has_func set_perm; then
-  set_perm() { chown "$1:$2" "$4" 2>/dev/null; chmod "$3" "$4" 2>/dev/null; }
+  set_perm() { chown "$2:$3" "$1" 2>/dev/null; chmod "$4" "$1" 2>/dev/null; }
 fi
 if ! has_func set_perm_recursive; then
   set_perm_recursive() {
-    chown "$1:$2" "$5" 2>/dev/null
-    chmod "$3" "$5" 2>/dev/null
-    find "$5" -type d -exec chmod "$3" {} + 2>/dev/null
-    find "$5" -type f -exec chmod "$4" {} + 2>/dev/null
+    chown -R "$2:$3" "$1" 2>/dev/null
+    find "$1" -type d -exec chmod "$4" {} + 2>/dev/null
+    find "$1" -type f -exec chmod "$5" {} + 2>/dev/null
   }
 fi
 
@@ -75,16 +75,17 @@ if [ -z "$(printf '%s' "$APP_ENTRIES" | tr -d ' \n')" ]; then
   abort "拒绝安装:未渲染/空的模块清单"
 fi
 
-# 清单格式门禁:每行必须是 <application_id>|<目录名>|<64 位 hex 的 sha256>
+# 清单格式门禁:每行必须是 <application_id>|<目录名>|<64 位 hex 的 sha256>|app。
 # 这样可以在安装前就发现"直接打包 module/ 目录"这类未渲染产物。
 BAD_ENTRY=""
-while IFS='|' read -r PKG DIR APK_SHA; do
+while IFS='|' read -r PKG DIR APK_SHA LOCATION; do
   [ -n "$PKG" ] || continue
   case "$PKG" in
     *.*) : ;;
     *) BAD_ENTRY="$PKG" ;;
   esac
   [ -n "$DIR" ] || BAD_ENTRY="$PKG"
+  [ "$LOCATION" = "app" ] || BAD_ENTRY="$PKG"
   if [ "${#APK_SHA}" -ne 64 ]; then
     BAD_ENTRY="$PKG"
   else
@@ -122,47 +123,66 @@ if [ -z "$PM_BIN" ]; then
   ui_print "!! 或改用免 root 的 adb 安装方案(scripts/install_all.sh)。"
   abort "拒绝安装:无法检测 /data 冲突(C8)"
 fi
-if ! "$PM_BIN" list packages >/dev/null 2>&1; then
-  ui_print "!! pm 存在但不可用(pm list packages 失败),无法完成冲突检查。"
-  abort "拒绝安装:pm 不可用(C8)"
-fi
+PM_PACKAGE_LIST="$("$PM_BIN" list packages 2>/dev/null)" || abort "拒绝安装:pm list packages 失败,无法完成冲突检查(C8)"
+[ -n "$PM_PACKAGE_LIST" ] || abort "拒绝安装:pm list packages 未返回任何条目,无法完成冲突检查(C8)"
 
 # -----------------------------------------------------------------------------
 # 4) C8:与 /data 用户空间中的同包名应用冲突检查
 #    任一命中 → 中止整个安装(禁止模块自行卸载)
-#    /system 已有同包名 → 视为模块已生效,该条目跳过
+#    /system 目标路径已有同包名 → 视为模块已生效,该条目跳过
 # -----------------------------------------------------------------------------
+OLD_PRIV_APP_DIR="priv"
+OLD_PRIV_APP_DIR="${OLD_PRIV_APP_DIR}-app"
 ui_print "- 检查 /data 用户空间中的同包名应用(C8):"
 CONFLICT=""
 SKIP_LIST="|"
-while IFS='|' read -r PKG DIR APK_SHA; do
+while IFS='|' read -r PKG DIR APK_SHA LOCATION; do
   [ -n "$PKG" ] || continue
   [ -n "$DIR" ] || continue
-  PATHS="$("$PM_BIN" path "$PKG" 2>/dev/null)"
-  if [ -z "$PATHS" ]; then
+  PACKAGE_LISTED=0
+  while IFS= read -r PACKAGE_LINE; do
+    [ "$PACKAGE_LINE" = "package:$PKG" ] && PACKAGE_LISTED=1
+  done <<EOF
+$PM_PACKAGE_LIST
+EOF
+  if [ "$PACKAGE_LISTED" -eq 0 ]; then
     ui_print "    [ok] $PKG 未安装,可安全挂载"
     continue
   fi
+  PATHS="$("$PM_BIN" path "$PKG" 2>/dev/null)" || abort "安装中止:pm path $PKG 失败,无法检查 /data 冲突(C8)"
+  [ -n "$PATHS" ] || abort "安装中止:pm list packages 含 $PKG 但 pm path 无结果,无法检查 /data 冲突(C8)"
   HIT_DATA=""
   HIT_SYSTEM=""
+  BAD_PATH=""
   while IFS= read -r p; do
-    case "$p" in
-      package:/data/*|/data/*) HIT_DATA="$p" ;;
-      package:/system/*|/system/*) HIT_SYSTEM="$p" ;;
-      *) : ;;
+    [ -n "$p" ] || continue
+    case "$p" in package:*) PATH_VALUE="${p#package:}" ;; *) PATH_VALUE="$p" ;; esac
+    case "$PATH_VALUE" in
+      /data/*|/mnt/expand/*) HIT_DATA="$p" ;;
+      /*) HIT_SYSTEM="$p" ;;
+      *) BAD_PATH="$p" ;;
     esac
   done <<EOF
 $PATHS
 EOF
+  [ -z "$BAD_PATH" ] || abort "安装中止:pm path $PKG 返回无法识别的路径 '$BAD_PATH',C8 检查不完整"
   if [ -n "$HIT_DATA" ]; then
     ui_print "    [冲突] $PKG 已安装于用户空间: $HIT_DATA"
     [ -n "$CONFLICT" ] || CONFLICT="$PKG"
     continue
   fi
   if [ -n "$HIT_SYSTEM" ]; then
-    ui_print "    [跳过] $PKG 已由系统分区提供($HIT_SYSTEM):模块已生效,不再重复挂载"
-    SKIP_LIST="$SKIP_LIST$PKG|"
-    continue
+    case "$HIT_SYSTEM" in
+      *"/system/$OLD_PRIV_APP_DIR/$DIR/"*)
+        ui_print "    [切换] $PKG 当前位于旧特权落点,将由普通变体迁移到 /system/app"
+        continue
+        ;;
+      *)
+        ui_print "    [跳过] $PKG 已由系统分区提供($HIT_SYSTEM):模块已生效,不再重复挂载"
+        SKIP_LIST="$SKIP_LIST$PKG|"
+        continue
+        ;;
+    esac
   fi
   ui_print "    [ok] $PKG 未在用户空间安装(路径: $PATHS)"
 done <<EOF
@@ -181,74 +201,65 @@ if [ -n "$CONFLICT" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 5) 逐个应用:APK → system/app/<目录名>/<目录名>.apk,并设置权限
+# 5) 验证 ZIP 中的静态 APK 布局与哈希,不在安装期复制 APK。
 # -----------------------------------------------------------------------------
-ui_print "- 开始挂载应用:"
-INSTALLED_COUNT=0
-while IFS='|' read -r PKG DIR APK_SHA; do
+ui_print "- 校验静态 APK (system/app/<Name>/<Name>.apk):"
+while IFS='|' read -r PKG DIR APK_SHA LOCATION; do
   [ -n "$PKG" ] || continue
-  [ -n "$DIR" ] || continue
-
-  case "$SKIP_LIST" in
-    *"|$PKG|"*)
-      ui_print "    [跳过] $PKG:系统分区已有同包名应用,无需挂载"
-      continue
-      ;;
-  esac
-
-  SRC="$MODPATH/apks/$DIR.apk"
-  DEST_DIR="$MODPATH/system/app/$DIR"
-  DEST="$DEST_DIR/$DIR.apk"
-
-  if [ ! -f "$SRC" ]; then
-    abort "!! 模块内缺少 $SRC(应来自 build.sh 构建产物)"
-  fi
-
-  # 完整性:比对该 APK 的 sha256 与构建时记录值(缺少 sha256sum 时降级为警告)
+  SRC="$MODPATH/system/app/$DIR/$DIR.apk"
+  [ -f "$SRC" ] || abort "!! ZIP 中缺少静态 APK: $SRC"
   if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL="$(sha256sum "$SRC")"
     ACTUAL="${ACTUAL%% *}"
-    if [ "$ACTUAL" != "$APK_SHA" ]; then
-      ui_print "!! $DIR.apk 校验失败:期望 $APK_SHA,实际 $ACTUAL"
-      abort "安装中止:APK 完整性校验失败"
-    fi
+    [ "$ACTUAL" = "$APK_SHA" ] || abort "安装中止:$DIR.apk sha256 不匹配"
   else
-    ui_print "    [警告] 缺少 sha256sum,跳过 $DIR.apk 的完整性校验"
+    ui_print "    [警告] 缺少 sha256sum,跳过 $DIR.apk 哈希复核"
   fi
-
-  mkdir -p "$DEST_DIR" || abort "!! 无法创建 $DEST_DIR"
-  cp -f "$SRC" "$DEST" || abort "!! 无法写入 $DEST"
-  set_perm_recursive "$DEST_DIR" 0 0 0755 0644
-  INSTALLED_COUNT=$((INSTALLED_COUNT + 1))
-  ui_print "    [完成] $PKG → /system/app/$DIR/$DIR.apk"
 done <<EOF
 $APP_ENTRIES
 EOF
 
-if [ "$INSTALLED_COUNT" -eq 0 ]; then
-  ui_print "!! 所有条目都已由系统分区提供:本模块没有需要挂载的内容。"
-  ui_print "!! 这通常说明你已经刷过本模块(或同等内容),无需重复安装。"
-  abort "安装中止:没有需要挂载的应用"
-fi
+# -----------------------------------------------------------------------------
+# 6) 变体切换:普通版移除旧特权树/XML;若 ROM 已提供同包,移除 ZIP 内副本。
+# -----------------------------------------------------------------------------
+rm -rf "$MODPATH/system/$OLD_PRIV_APP_DIR" 2>/dev/null
+PRIVAPP_XML_NAME="__PRIVAPP_XML_NAME__"
+rm -f "$MODPATH/system/etc/permissions/$PRIVAPP_XML_NAME" 2>/dev/null
 
-# 安装期辅助目录不再需要,清理掉(避免占用模块空间)
-rm -rf "$MODPATH/apks" 2>/dev/null
+INSTALLED_COUNT=0
+ui_print "- 准备普通版静态挂载:"
+while IFS='|' read -r PKG DIR APK_SHA LOCATION; do
+  [ -n "$PKG" ] || continue
+  DEST_DIR="$MODPATH/system/app/$DIR"
+  case "$SKIP_LIST" in
+    *"|$PKG|"*)
+      rm -rf "$DEST_DIR" 2>/dev/null
+      ui_print "    [跳过] $PKG:系统分区已有同包名应用,已移除 ZIP 副本"
+      continue
+      ;;
+  esac
+  [ -f "$DEST_DIR/$DIR.apk" ] || abort "!! 静态 APK 意外缺失: $DEST_DIR/$DIR.apk"
+  set_perm_recursive "$DEST_DIR" 0 0 0755 0644
+  INSTALLED_COUNT=$((INSTALLED_COUNT + 1))
+  ui_print "    [完成] $PKG → /system/app/$DIR/$DIR.apk (ZIP 静态布局)"
+done <<EOF
+$APP_ENTRIES
+EOF
 
 # -----------------------------------------------------------------------------
-# 6) 安装摘要(路径 + 体积)
+# 7) 安装摘要(路径 + 体积)
 # -----------------------------------------------------------------------------
 ui_print "- 安装摘要:"
 TOTAL=0
-while IFS='|' read -r PKG DIR APK_SHA; do
+while IFS='|' read -r PKG DIR APK_SHA LOCATION; do
   [ -n "$PKG" ] || continue
-  [ -n "$DIR" ] || continue
   F="$MODPATH/system/app/$DIR/$DIR.apk"
   if [ -f "$F" ]; then
     SZ="$(wc -c < "$F" | tr -d ' ')"
     TOTAL=$((TOTAL + SZ))
     ui_print "    /system/app/$DIR/$DIR.apk  $SZ 字节  ($PKG)"
   else
-    ui_print "    (未挂载) $PKG —— 系统分区已有同包名应用"
+    ui_print "    (未挂载) $PKG —— ROM 已提供同包名应用"
   fi
 done <<EOF
 $APP_ENTRIES

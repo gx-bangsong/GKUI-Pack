@@ -30,8 +30,11 @@
   (不得编造 sha256、版本号、包名、路径、仓库名、commit)。
 - 任何 `TODO` 或 `confidence: unverified` 都会让 `build.sh` **`exit 1`**。
   这是**有意设计**,不是 bug;不要"顺手填上"以让构建通过。
-- 录音机(GKUIRecorder)条目的 `application_id` **必须保持 `TODO`**,
-  它的仓库描述虽然写着"基于 LineageOS 录音机",但这**不构成**包名证据。
+- 录音机(GKUIRecorder)的 `application_id=org.lineageos.recorder.dev` 与
+  `installed_version_code=1` 已由真机实测。GitHub API 已核实 beta2 tag、asset 名和
+  asset digest,因此条目设 `enabled: true`、`privileged_ack: true`、普通路径
+  `system/app/GKUIRecorder/`。APK 本体尚未取得,`signer_sha256` 必须保持 TODO、
+  `confidence: unverified`;C7 会在真实 `apksigner` 采集前阻止出包。绝不可猜 signer。
 
 ## 2. 硬约束(违反任一 = 失败)
 
@@ -39,16 +42,16 @@
 |---|---|---|
 | C1 | 禁止推断 applicationId;未知值 `TODO` + 构建失败 | `build.sh` 字段校验 |
 | C2 | `mode` 恒为 `coexist`,**严禁** `replace`;禁止任何写 stock 目录的路径;禁止 Magisk `REPLACE` / `.replace` | `build.sh`、`module/customize.sh` |
-| C3 | 一律装到 `/system/app/<Name>/`,**严禁 `priv-app`**;检出 privileged 权限则**不入模块**,README 标注"仅走 adb install" | `preflight-apk.sh`、`build.sh` |
+| C3 | 默认排除申请平台 privileged 权限的 APK;只有 `privileged_ack: true` 才可进普通版 `/system/app`(仍不授予权限)。单独特权 ZIP 只将 `priv_variant.app_ids` 指定应用放入 `/system/priv-app`,白名单必须由 APK 实际申请集 ∩ 真机转储的 `privileged` 集生成;缺失/歧义/纯 signature/空交集一律 fail-closed。安装期再用 `pm list permissions -f/-fg` 复核 | `preflight-apk.sh`、`build.sh`、`scripts/generate-privapp-permissions.py`、`module-priv/` |
 | C4 | 严禁纳入拨号 / 短信 / 联系人(`sharedUserId="android.uid.shared"` + platform 签名,第三方签名无法替换) | `apps.yaml` 字段校验 + CI 检查 |
 | C5 | 仓库不得提交任何 `.apk` | `.gitignore`、`tests/test_build.sh` |
 | C6 | 记录 APK 签名证书 SHA-256;证书与 `apps.yaml` 不一致时 CI fail 并提示卸载重装会丢数据 | `preflight-apk.sh`、`release.yml` |
 | C7 | 不确定的值写 `TODO` 并让构建失败 | `build.sh` |
-| C8 | 同包名已存在于 `/data` 时必须**中止安装**(提示用户自行 `pm uninstall`),模块**不得**代为卸载 | `module/customize.sh` |
+| C8 | 同包名已存在于 `/data` 时必须**中止安装**(提示用户自行 `pm uninstall`),模块**不得**代为卸载 | `module/customize.sh`、`module-priv/customize.sh` |
 
-唯一一处对 C7 的宽松处理:**`enabled: false` 的条目**里残留的 `TODO` 不阻断构建
-(它不参与构建)。这样录音机在"包名待确认"的长期状态下不会卡死整个项目。
-需要字面语义时用 `--strict`。
+唯一一处对 C7 的宽松处理:**`enabled: false` 的条目**里残留的 `TODO` 默认不阻断
+(它不参与构建);`--strict` 会检查所有条目。recorder 当前启用且已确认普通版纳入,
+但签名指纹仍 TODO / unverified,所以常规构建必须失败;不能为让 CI 变绿而禁用或伪填。
 
 ## 3. 目录地图
 
@@ -60,8 +63,11 @@ scripts/install_all.sh        【主推】adb 免 root 批量安装
 scripts/uninstall_all.sh      adb 卸载(逐个确认)
 scripts/probe-device.sh       只读采集设备事实(用于回填 apps.yaml 的 TODO)
 scripts/preflight-apk.sh      七项门禁(APK 侧;可校验单个 APK 或整个 APK_DIR)
-module/                       systemless 模块源码(构建时被渲染进 zip)
-tests/test_build.sh           离线全流程测试:桩 aapt/apksigner + 假 APK
+module/                       普通版 systemless 模块源码(构建时渲染;仅 system/app)
+module-priv/                  特权变体模板(同 module id;由真机权限转储生成白名单)
+scripts/generate-privapp-permissions.py  APK 申请权限 ∩ 设备 privileged 权限;fail-closed
+device/README.md              真机权限转储采集方法;当前不得伪造转储
+tests/test_build.sh           离线全流程测试:桩 aapt/apksigner/pm + 假 APK
 .github/workflows/ci.yml      push/PR:shellcheck + yamllint + 离线测试
 .github/workflows/release.yml tag v*:下载 APK → 校验 → preflight → 构建 zip
 ```
@@ -93,17 +99,22 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 4. 新签名 `signer_sha256` 只能来自真实 APK 的
    `apksigner verify --print-certs`(本仓库禁止手写)。
 5. 若该应用的 `stock_package` 与已有启用条目重复,`build.sh` 会拒绝(防同类应用重复入包)。
+6. APK 若申请平台 privileged 权限,默认会从模块排除;只有人工明确接受“普通 system_app 不会获得这些权限”时才设 `privileged_ack: true`。
+7. 要加入特权变体时,必须先取得真实 APK/preflight 和同 ROM `device/framework-permissions.txt`;在 `priv_variant.app_ids` 中显式列出,验证权限交集与恢复文档后再构建。
 
 ## 6. 已经踩过的坑(会持续追加)
 
 - **不要读解包 manifest 的 `package` 属性当 applicationId**。
   Etar 系那里是 AOSP 历史残留 `com.android.calendar`,会误导。
   必须用 `aapt dump badging` 的 `package: name=`(已编译进 APK 的真值)。
-- **不要把带后缀的新包名放进 `priv-app`**。
-  它不在 ROM 自带的 `privapp-permissions` 白名单里,
-  一旦申请 `signature|privileged` 权限就会让 zygote 抛
-  `Signature|privileged permissions not in privapp-permissions whitelist` → bootloop。
-  检出此情况**不要生成白名单 XML**,而是**不入模块**并提示仅走 adb 安装。
+- **绝不能仅凭包名后缀、源码意图或另一台设备的权限声明提升为 `priv-app`**。
+  默认仍排除申请特权权限的 APK;`privileged_ack: true` 只允许其进入普通 `/system/app`,
+  不授予权限。若明确选择特权变体,必须从**同一设备/ROM**采集 `pm list permissions -f`
+  并用 APK 实际 `uses-permission` 与 dump 中 `protectionLevel` 含 `privileged` 的权限求交。
+  任一权限缺记录、级别解析不清、纯 `signature` 或空交集都不得产出 Priv ZIP。
+  特权版安装时再向目标设备复核,否则拒绝部署。白名单或分区放置错误仍可能令
+  zygote 报 `Signature|privileged permissions not in privapp-permissions whitelist` 并 bootloop;
+  所以必须同时交付恢复路径,绝不把测试假 dump 当真机证据。
 - **解析 `aapt dump badging` 必须按字段名整体匹配,绝不能做子串匹配**。
   真实输出形如:
 
@@ -118,8 +129,9 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
   并在 `tests/test_build.sh` 里保留了带该字段的回归夹具。
 - **`aapt xmltree` 的 `protectionLevel` 是数值形式**(如 `(type 0x11)0x12`),
   不含 `signature`/`privileged` 字样;用关键字匹配去判"声明"会永远命中不了,
-  既漏报又给出"未检出"的虚假通过感。判定改为:**申请**命中平台特权权限清单 →
-  不适合模块化;**声明**只报告(用 `describe_protection_level` 解码)。
+  既漏报又给出"未检出"的虚假通过感。平台清单的**申请权限**默认导致排除;
+  `privileged_ack: true` 才能按普通 system_app 显式放行。APK **自声明权限**只报告
+  (用 `describe_protection_level` 解码),不因此排除。
 - **xmltree 里同一条 authority 会出现两次**(类型化值 + `(Raw: ...)` 原值),
   报告输出前必须去重,否则每条都打印两遍。
 - **G7 不能写成"模块内 versionCode 必须严格大于设备已装版本"**。
@@ -136,12 +148,10 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 - **判断"设备上是否安装"要用 `pm list packages`,不要用 dumpsys 是否取到 versionCode**:
   adb 偶发返回空,会被误读成"未安装"(clock 上真实踩过,一度把 IVC 记成 none)。
 
-- **门禁断言不要绑死在某个具体字段上**。曾有验收写成"recorder 的 `application_id`
-  必须以 `TODO` 开头",结果每回填一个实测值都要求同步改 CI 工作流 —— 而工作流只有
-  用户能推(路径 B),耦合纯属自找。正确写法是断言**不变量**:未证实 → 必须
-  `confidence: unverified`、必须禁用、`application_id != stock_package`、且
-  `_todo_fields` 非空(`build.sh --dump-apps-json` 已提供该字段)。这样回填实测值
-  不再需要碰工作流。
+- **门禁断言要检查任务不变量,不能靠禁用条目绕过**。recorder 必须保持
+  `enabled: true`、`privileged_ack: true`、`install_as: system_app` 且
+  `application_id != stock_package`;签名未实测时 signer 必须是 TODO、confidence 必须
+  unverified,由 C7 阻止出包。实测 signer 回填后再改为 confirmed;不要伪造字段来让构建变绿。
 - **versionName ≠ versionCode**。用户说"版本号是 1.1"时,1.1 只可能是 versionName;
   versionCode 是整数(该例实测为 1)。`apps.yaml` 的 `installed_version_code`
   只登记整数,永远不要把小数值当 versionCode 写进去。
@@ -172,7 +182,8 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 ```bash
 git ls-files | grep -c '\.apk$'                      # 必须为 0
 grep -rn "mode: replace" apps.yaml                   # 必须无结果
-grep -rn "priv-app" module/                          # 必须无结果
+grep -rn "priv-app" module/                          # 普通模板必须无特权应用路径
+# module-priv/ 才能包含特权路径;其输出必须通过真实设备 dump 与离线 fail-closed 测试
 grep -rniE "dialer|telephony|messaging|contacts" apps.yaml   # 必须无结果
 bash tests/test_build.sh                             # 必须通过(含上述全部验收项的自动检查)
 find . -name '*.apk' -not -path './.git/*' | wc -l   # 必须为 0(含未跟踪文件)

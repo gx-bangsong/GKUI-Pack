@@ -1,0 +1,6 @@
+id=gkui-pack
+name=GKUI-Pack (特权变体)
+version=__VERSION__
+versionCode=__VERSION_CODE__
+author=GKUI-Pack contributors
+description=⚠ 特权变体:普通应用仍位于 system/app,指定应用位于 system/priv-app 并带设备实测白名单;可能导致无法开机。仅与同 id 普通版二选一,详见 README。

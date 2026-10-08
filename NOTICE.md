@@ -74,22 +74,25 @@
 - 对应源码链接:<https://github.com/gx-bangsong/android_packages_apps_DeskClock/commit/e7fd65ec8f5fb1496ee7ac85e70327f97689380c>
 - 备注:上游仓库在 GitHub API 上未声明 SPDX 许可标识;许可取值来自本工程事实基线。
 
-### 2.5 GKUIRecorder(录音机)—— **未纳入构建**
+### 2.5 GKUIRecorder(录音机)——已启用,signer 仍待实测
 
 | 环节 | 位置 | 许可 |
 |---|---|---|
 | 上游 | `LineageOS/android_packages_apps_Recorder`(由 GitHub API 的 `parent` / `source` 字段核实) | Apache-2.0 |
 | fork | `gx-bangsong/GKUIRecorder`(仓库描述:"基于LineageOS录音机,添加打点功能") | Apache-2.0(仓库内 `REUSE.toml` + `LICENSES/Apache-2.0.txt`;GitHub API 的 license 字段"无法识别",故以仓库内 REUSE 元数据为准) |
-| 本仓库 | `apps.yaml` → `id: recorder`,`confidence: unverified`,`enabled: false` | — |
+| Release 源码 | `beta2` → commit `4650818fbc158d996263b4a21b378af4deb9970a` | Apache-2.0 |
+| 本仓库 | `apps.yaml` → `id: recorder`,`enabled: true`,`privileged_ack: true`,`confidence: unverified` | Apache-2.0(并入 GPL-3.0 分发) |
 
-- 该条目**被 `build.sh` 拒绝入包**:`application_id` 为 `TODO`,
-  且 `confidence: unverified`。本仓库**不猜测**其包名(见硬约束 C1)——
-  源码里的 `applicationId = org.lineageos.recorder` 与 `applicationIdSuffix = ".dev"`
-  只是源码意图,不是已构建 APK 的事实。
-- 该 fork 仓库当前**没有任何 Release、也没有任何 Tag**,
-  因此不存在可供下载校验的资产。
-- upstream / license 的核实时间:2026-10-08。
-
+- GitHub API 已核实 `beta2` tag、资产 `GKUIRecorder-beta2.apk` 与 asset digest
+  `f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f`。
+  该 digest 是 API 返回值,当前环境未能下载 APK 本体进行本地复算。
+- `application_id=org.lineageos.recorder.dev` 与 `installed_version_code=1` 来自
+  2026-10-08 真机实测;`name=GKUIRecorder` 是本工程选定的 ZIP 目录名。源码中的
+  `applicationId` / `.dev` suffix 与设备结果一致,但不是包名的推断依据。
+- APK signer 尚未通过真实 APK 的 `apksigner` 实测,所以 `signer_sha256: TODO`、
+  `confidence: unverified`。虽然 `enabled: true` 明确表达五应用普通版目标,C7 会在
+  签名指纹经核验并回填前拒绝正式构建。不得猜测 signer 或伪造 APK。
+- upstream / license / Release 元数据核实时间:2026-10-08.
 ---
 
 ## 3. 免责声明

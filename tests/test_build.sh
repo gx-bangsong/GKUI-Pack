@@ -53,6 +53,8 @@ cp "$REPO_ROOT/build.sh" "$WORK/repo/build.sh"
 cp "$REPO_ROOT/apps.yaml" "$WORK/repo/apps.yaml"
 cp -a "$REPO_ROOT/scripts" "$WORK/repo/scripts"
 cp -a "$REPO_ROOT/module" "$WORK/repo/module"
+cp -a "$REPO_ROOT/module-priv" "$WORK/repo/module-priv"
+cp -a "$REPO_ROOT/device" "$WORK/repo/device"
 chmod +x "$WORK/repo/scripts/"*.sh "$WORK/repo/build.sh"
 
 # -----------------------------------------------------------------------------
@@ -85,6 +87,9 @@ case "${1:-}" in
       # 标记 #priv → 申请平台特权权限(硬判据:该应用不适合模块化)
       if grep -q '^#priv$' "$apk"; then
         printf "uses-permission: name='android.permission.WRITE_SECURE_SETTINGS'\n"
+      fi
+      if grep -q '^#capture$' "$apk"; then
+        printf "uses-permission: name='android.permission.CAPTURE_AUDIO_OUTPUT'\n"
       fi
       sed -n '4,$p' "$apk" | grep -v '^#' || true
       exit 0
@@ -129,18 +134,54 @@ chmod +x "$WORK/bin/apksigner"
 
 cat > "$WORK/bin/pm" <<'STUB'
 #!/usr/bin/env bash
-# 桩 pm:FAKE_PM_PKG + FAKE_PM_MODE(data|system|absent)控制 pm path 的输出
+# 桩 pm:控制 package path、privileged 权限转储与 service.sh 自检。
 set -uo pipefail
 case "${1:-}" in
-  list) exit 0 ;;
+  list)
+    if [ "${2:-}" = "permissions" ]; then
+      mode="${FAKE_PM_PERMISSION_MODE:-good}"
+      if [ "$mode" = "no-level" ]; then
+        printf 'All Permissions:\n+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n'
+        exit 0
+      fi
+      printf 'All Permissions:\n'
+      printf '+ permission:android.permission.INTERNET\n  protectionLevel: normal\n'
+      printf '+ permission:android.permission.RECEIVE_BOOT_COMPLETED\n  protectionLevel: normal\n'
+      case "$mode" in
+        missing) : ;;
+        signature) printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel: signature\n' ;;
+        ambiguous)
+          printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel: signature|privileged\n'
+          printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel: normal\n'
+          ;;
+        *) printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel: signature|privileged\n' ;;
+      esac
+      [ "$mode" != "partial-fail" ] || exit 1
+    else
+      printf 'package:android\n'
+      pkg="${FAKE_PM_PKG:-}"
+      if [ -n "$pkg" ] && [ "$pkg" != "__none__" ]; then printf 'package:%s\n' "$pkg"; fi
+    fi
+    exit 0
+    ;;
   path)
     pkg="${2:-}"
     if [ "$pkg" = "${FAKE_PM_PKG:-}" ]; then
+      case "${FAKE_PM_PATH_MODE:-ok}" in
+        fail) echo "fake pm path error" >&2; exit 1 ;;
+        bad-output) echo "Error: package path unavailable"; exit 0 ;;
+      esac
       case "${FAKE_PM_MODE:-absent}" in
-        data)   echo "package:/data/app/~~stub==/$pkg-stub/base.apk" ;;
-        system) echo "package:/system/app/$pkg/$pkg.apk" ;;
+        data)      echo "package:/data/app/~~stub==/$pkg-stub/base.apk" ;;
+        system)    echo "package:/system/app/$pkg/$pkg.apk" ;;
+        systemapp) echo "package:/system/app/GKUIRecorder/GKUIRecorder.apk" ;;
+        systempriv) echo "package:/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ;;
       esac
     fi
+    exit 0
+    ;;
+  check-permission)
+    printf '%s\n' "${FAKE_PM_PERMISSION_RESULT:-granted}"
     exit 0
     ;;
 esac
@@ -164,7 +205,10 @@ make_fake_apk() { # $1=输出文件 $2=包名 $3=versionCode $4=签名 $5=额外
     printf "uses-permission: name='android.permission.INTERNET'\n"
     printf "uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'\n"
     if [ -n "${5:-}" ]; then printf '%s\n' "$5"; fi
-    if [ "${6:-0}" = "1" ]; then printf '#priv\n'; fi
+    case "${6:-0}" in
+      1|priv) printf '#priv\n' ;;
+      capture) printf '#capture\n' ;;
+    esac
   } > "$1"
 }
 
@@ -218,6 +262,86 @@ for blk in blocks[1:]:
 open(path, "w", encoding="utf-8").write("".join(out))
 print("[fixtures] apps.yaml 已按夹具补齐")
 PYEOF
+  # 普通版验收一律使用五应用夹具;真实 APK/签名值只在此测试临时生成。
+  prepare_recorder_fixture "$1" "$2"
+}
+
+prepare_recorder_fixture() { # $1=workspace repo $2=APK_DIR
+  local repo="$1" apk_dir="$2" asset="GKUIRecorder-fixture.apk"
+  mkdir -p "$apk_dir"
+  make_fake_apk "$apk_dir/$asset" "org.lineageos.recorder.dev" "2" \
+    "5555555555555555555555555555555555555555555555555555555555555555" "" capture
+  python3 - "$repo/apps.yaml" "$apk_dir/$asset" <<'PYEOF'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+yaml_path, asset_path = map(Path, sys.argv[1:])
+asset_sha = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+text = yaml_path.read_text(encoding="utf-8")
+blocks = text.split("  - id: ")
+updated = [blocks[0]]
+for block in blocks[1:]:
+    lines = block.splitlines()
+    if lines and lines[0].strip() == "recorder":
+        replacements = {
+            "name": "GKUIRecorder",
+            "source_url": "https://github.com/gx-bangsong/GKUIRecorder/commit/fixture",
+            "release_tag": "fixture-recorder-v1",
+            "asset_name": asset_path.name,
+            "sha256": asset_sha,
+            "signer_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "confidence": "confirmed",
+            "enabled": "true",
+        }
+        for key, value in replacements.items():
+            pattern = re.compile(r"^    " + re.escape(key) + r": .*?$", re.M)
+            block, count = pattern.subn("    " + key + ": " + value, block, count=1)
+            if count != 1:
+                raise SystemExit("missing recorder field: " + key)
+    updated.append("  - id: " + block)
+yaml_path.write_text("".join(updated), encoding="utf-8")
+PYEOF
+}
+
+set_privilege_dump_fixture() { # $1=workspace repo $2=capture protectionLevel expression or missing
+  mkdir -p "$1/device"
+  cat > "$1/device/framework-permissions.txt" <<'EOF'
+# Device: offline test fixture
+# SDK: 35; Android 15
+# Captured: 2026-10-08
+All Permissions:
++ permission:android.permission.INTERNET
+  protectionLevel: normal
++ permission:android.permission.RECEIVE_BOOT_COMPLETED
+  protectionLevel: normal
+EOF
+  if [ "$2" != "missing" ]; then
+    printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel: %s\n' "$2" \
+      >> "$1/device/framework-permissions.txt"
+  fi
+}
+
+acknowledge_clock_privilege() { # $1=workspace apps.yaml
+  python3 - "$1/apps.yaml" <<'PYEOF'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+blocks = text.split("  - id: ")
+for i, block in enumerate(blocks[1:], 1):
+    if block.splitlines()[0].strip() == "clock":
+        if "    privileged_ack:" not in block:
+            block = block.replace("    confidence: confirmed", "    privileged_ack: true" + chr(10) + "    confidence: confirmed", 1)
+        else:
+            block = block.replace("    privileged_ack: false", "    privileged_ack: true", 1)
+        blocks[i] = block
+        break
+else:
+    raise SystemExit("clock entry missing")
+p.write_text("  - id: ".join(blocks), encoding="utf-8")
+PYEOF
 }
 
 run_build() { # $1=工作区repo $2=APK_DIR $3=dist $4...=额外参数与环境(形式 VAR=VAL)
@@ -228,24 +352,31 @@ run_build() { # $1=工作区repo $2=APK_DIR $3=dist $4...=额外参数与环境(
 }
 
 # -----------------------------------------------------------------------------
-head1 "1) 真实仓库状态:四个应用字段已齐全;recorder 已实测回填但仍留 TODO(禁用)"
+head1 "1) 真实仓库状态:五应用目标已启用;recorder ack=true,签名 TODO 按 C7 阻止出包"
 # -----------------------------------------------------------------------------
 out="$(cd "$REPO_ROOT" && bash build.sh --check 2>&1)"; rc=$?
-if [ $rc -eq 0 ]; then ok "bash build.sh --check 通过(rc=0):启用条目已无 TODO"; else bad "字段已齐全却未通过校验(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
-if printf '%s' "$out" | grep -q '\[跳过\].*recorder'; then ok "报告里 recorder 仍被显式跳过并打印"; else bad "未打印 recorder 跳过信息"; fi
-if (cd "$REPO_ROOT" && bash build.sh --check --strict >/dev/null 2>&1); then
-  bad "--strict 下 disabled 条目的 TODO 仍通过(违反字面版 C7)"
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'signer_sha256 为 TODO'; then
+  ok "recorder signer 未实测时 build.sh --check 按 C7 失败"
 else
-  ok "--strict 下 disabled 条目的 TODO 仍会失败(字面版 C7)"
+  bad "未验证 signer 未被 C7 挡住(rc=$rc)"; printf '%s\n' "$out" | tail -20
 fi
-# C7 的反向验证:启用条目里注入一个 TODO 后必须失败
-# (真实仓库已填齐,所以这里显式造出 C7 场景,避免该规则失去覆盖)
+if (cd "$REPO_ROOT" && bash build.sh --check --strict >/dev/null 2>&1); then
+  bad "--strict 下的未验证 recorder 意外通过"
+else
+  ok "--strict 同样拒绝未验证 recorder"
+fi
+dump="$(cd "$REPO_ROOT" && bash build.sh --dump-apps-json 2>/dev/null)"
+if printf '%s' "$dump" | python3 -c 'import json,sys; a=next(x for x in json.load(sys.stdin)["apps"] if x["id"]=="recorder"); assert a["_enabled"] is True and a["privileged_ack"] is True and a["install_as"]=="system_app" and a["name"]=="GKUIRecorder" and a["signer_sha256"]=="TODO" and a["confidence"]=="unverified" and "signer_sha256" in a["_todo_fields"]'; then
+  ok "recorder 已启用、ack=true、普通 system_app 路径明确,未验证 signer 仍是 TODO"
+else
+  bad "recorder 普通版纳入 / C3 显式确认或 C7 未验证状态不符合要求"
+fi
+# C7 的反向验证:启用条目里 signer 为 TODO 必须失败。
 cp "$REPO_ROOT/apps.yaml" "$WORK/c7-apps.yaml"
-sed -i 's/^    signer_sha256: 815d90d0.*/    signer_sha256: TODO/' "$WORK/c7-apps.yaml"
 cp "$WORK/c7-apps.yaml" "$WORK/repo/apps.yaml"
 out="$(cd "$WORK/repo" && bash build.sh --check 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'signer_sha256 为 TODO'; then
-  ok "启用条目出现 TODO 时仍被 C7 挡住(反向验证)"
+  ok "启用的 recorder 出现 TODO 时被 C7 挡住"
 else
   bad "启用条目的 TODO 未被挡住(rc=$rc)"
 fi
@@ -264,6 +395,7 @@ else
   ok "collect 夹具仍含 TODO(普通校验如 C7 所述失败)"
 fi
 build_assets "$WORK/collect-apks" 0
+prepare_recorder_fixture "$WORK/collect-repo" "$WORK/collect-apks"
 out="$( cd "$WORK/collect-repo" && env PATH="$WORK/bin:$PATH" APK_DIR="$WORK/collect-apks" \
         DIST_DIR="$WORK/collect-dist" AAPT="$WORK/bin/aapt" APKSIGNER="$WORK/bin/apksigner" \
         bash build.sh --collect-only 2>&1 )"; rc=$?
@@ -300,16 +432,16 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-head1 "2) 桩环境:补齐夹具后应能通过校验"
+head1 "2) 桩环境:补齐五应用夹具后应能通过校验"
 # -----------------------------------------------------------------------------
 build_assets "$WORK/apks" 0
 patch_yaml "$WORK/repo" "$WORK/apks"
 out="$(cd "$WORK/repo" && bash build.sh --check 2>&1)"; rc=$?
-if [ $rc -eq 0 ]; then ok "补齐后 --check 通过"; else bad "补齐后 --check 仍失败"; printf '%s\n' "$out" | tail -20; fi
+if [ $rc -eq 0 ]; then ok "五应用夹具补齐后 --check 通过"; else bad "补齐后 --check 仍失败"; printf '%s\n' "$out" | tail -20; fi
 if (cd "$WORK/repo" && bash build.sh --check 2>&1 | grep -q 'recorder'); then
-  ok "disabled 的 recorder 条目被显式跳过并打印"
+  ok "五应用清单中的 recorder 被纳入校验"
 else
-  bad "未打印 recorder 跳过信息"
+  bad "校验输出未覆盖 recorder"
 fi
 
 # -----------------------------------------------------------------------------
@@ -337,9 +469,19 @@ if [ -f "$ZIP" ]; then
               META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script; do
     if printf '%s\n' "$listing" | grep -q "^$need\$"; then ok "zip 内含 $need"; else bad "zip 缺少 $need"; fi
   done
-  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock; do
-    if printf '%s\n' "$listing" | grep -q "^apks/$name.apk\$"; then ok "zip 内含 apks/$name.apk"; else bad "zip 缺少 apks/$name.apk"; fi
+  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock GKUIRecorder; do
+    if printf '%s\n' "$listing" | grep -q "^system/app/$name/$name.apk\$"; then
+      ok "zip 静态包含 system/app/$name/$name.apk"
+    else
+      bad "zip 缺少静态 APK system/app/$name/$name.apk"
+    fi
   done
+  if printf '%s\n' "$listing" | grep -q '^apks/'; then bad "ZIP 仍包含安装期临时 apks/ 布局"; else ok "ZIP 无 apks/ 临时 APK 目录"; fi
+  if unzip -p "$ZIP" customize.sh | grep -qE 'cp .*MODPATH/apks|mkdir .*MODPATH/apks'; then
+    bad "普通安装器仍依赖安装期复制 APK"
+  else
+    ok "普通安装器只处理 ZIP 内静态 APK,不从临时目录复制"
+  fi
   # 渲染检查:不得残留占位符
   if unzip -p "$ZIP" customize.sh | grep -q '__APP_ENTRIES__'; then
     bad "customize.sh 未渲染(仍含占位符)"
@@ -423,8 +565,8 @@ ZIP_PRIV="$WORK/dist-priv/GKUI-Pack-test-1.zip"
 if [ $rc -eq 0 ] && [ -f "$ZIP_PRIV" ]; then ok "存在 privileged 应用时构建仍成功(该应用被排除)"; else bad "构建失败(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
 if printf '%s' "$out" | grep -q '不适合模块化'; then ok "明确提示该应用不适合模块化,仅走 adb install"; else bad "缺少不适合模块化的提示"; fi
 if [ -f "$ZIP_PRIV" ]; then
-  if unzip -l "$ZIP_PRIV" | grep -q 'apks/GKUIClock.apk'; then bad "被排除的应用仍进了模块"; else ok "被排除的应用未进入模块"; fi
-  if unzip -l "$ZIP_PRIV" | grep -q 'apks/GKUICalendar.apk'; then ok "其余应用仍正常入包"; else bad "其余应用未入包"; fi
+  if unzip -Z1 "$ZIP_PRIV" | grep -q '^system/app/GKUIClock/'; then bad "被排除的应用仍进了模块"; else ok "被排除的应用未进入模块"; fi
+  if unzip -Z1 "$ZIP_PRIV" | grep -q '^system/app/GKUICalendar/GKUICalendar.apk$'; then ok "其余应用按静态 system/app 布局入包"; else bad "其余应用未入包"; fi
   if grep -q '^excluded.*clock' "$WORK/dist-priv/build-manifest.txt" 2>/dev/null; then ok "build-manifest.txt 标记了 excluded"; else bad "清单未标记 excluded"; fi
 fi
 # 触发原因必须可核:报告要列出具体权限
@@ -439,17 +581,115 @@ if printf '%s' "$out" | grep -q '未检出 signature|privileged 权限声明'; t
 auth_n="$(printf '%s' "$out" | grep -c 'com.example.stub.fileprovider' || true)"
 if [ "$auth_n" -eq 1 ]; then ok "authorities 已去重(只出现 1 次)"; else bad "authority 重复出现 ${auth_n} 次"; fi
 
+# 7.2 显式确认制:ack=true 允许 APK 仍以普通 system_app 入包,绝不生成白名单。
+acknowledge_clock_privilege "$WORK/repo"
+out="$(run_build "$WORK/repo" "$WORK/apks-priv" "$WORK/dist-ack" 2>&1)"; rc=$?
+ZIP_ACK="$WORK/dist-ack/GKUI-Pack-test-1.zip"
+if [ $rc -eq 0 ] && [ -f "$ZIP_ACK" ]; then ok "privileged_ack=true 时普通版仍成功构建"; else bad "acknowledged APK 未能进入普通版(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
+if [ -f "$ZIP_ACK" ]; then
+  if unzip -Z1 "$ZIP_ACK" | grep -q '^system/app/GKUIClock/GKUIClock.apk$'; then ok "acknowledged privileged APK 已静态纳入普通版"; else bad "acknowledged APK 仍被排除"; fi
+  if unzip -Z1 "$ZIP_ACK" | grep -q 'system/etc/permissions/'; then bad "普通版生成了特权白名单 XML"; else ok "普通版没有白名单 XML"; fi
+  if unzip -p "$ZIP_ACK" customize.sh | grep -q 'com.android.deskclock.dev|GKUIClock|.*|app'; then ok "acknowledged APK 落点仍为普通 system/app"; else bad "acknowledged APK 落点不是普通 system/app"; fi
+  if grep -q '^included.*clock.*true.*WRITE_SECURE_SETTINGS' "$WORK/dist-ack/build-manifest.txt"; then ok "manifest 记录 ack 与申请权限,可审计"; else bad "manifest 未记录 privileged_ack / 权限"; fi
+fi
+if printf '%s' "$out" | grep -q '普通 system_app.*授予权限'; then ok "构建摘要说明普通系统应用不会获得特权权限"; else bad "缺少普通 system_app 权限限制说明"; fi
+
+# 7.3 特权变体:两份 ZIP 共用 id;白名单严格等于 APK 申请集与设备 privileged 集的交集。
+PRIV_REPO="$WORK/privrepo"
+PRIV_APKS="$WORK/priv-apks"
+mkdir -p "$PRIV_REPO"
+cp "$REPO_ROOT/build.sh" "$PRIV_REPO/build.sh"
+cp "$REPO_ROOT/apps.yaml" "$PRIV_REPO/apps.yaml"
+cp -a "$REPO_ROOT/scripts" "$PRIV_REPO/scripts"
+cp -a "$REPO_ROOT/module" "$PRIV_REPO/module"
+cp -a "$REPO_ROOT/module-priv" "$PRIV_REPO/module-priv"
+cp -a "$REPO_ROOT/device" "$PRIV_REPO/device"
+chmod +x "$PRIV_REPO/build.sh" "$PRIV_REPO/scripts/"*.sh
+build_assets "$PRIV_APKS" 0
+patch_yaml "$PRIV_REPO" "$PRIV_APKS"
+prepare_recorder_fixture "$PRIV_REPO" "$PRIV_APKS"
+set_privilege_dump_fixture "$PRIV_REPO" 'signature|privileged'
+out="$(run_build "$PRIV_REPO" "$PRIV_APKS" "$WORK/dist-variants" 2>&1)"; rc=$?
+ZIP_VARIANT_MAIN="$WORK/dist-variants/GKUI-Pack-test-1.zip"
+ZIP_VARIANT_PRIV="$WORK/dist-variants/GKUI-Pack-Priv-test-1.zip"
+if [ $rc -eq 0 ] && [ -f "$ZIP_VARIANT_MAIN" ] && [ -f "$ZIP_VARIANT_PRIV" ]; then
+  ok "录音机有效且 dump 可验证时一次构建生成两个变体 ZIP"
+else
+  bad "有效 priv fixture 未生成两个 ZIP(rc=$rc)"
+  printf '%s\n' "$out" | tail -40
+fi
+if [ -f "$ZIP_VARIANT_MAIN" ] && [ -f "$ZIP_VARIANT_PRIV" ]; then
+  main_id="$(unzip -p "$ZIP_VARIANT_MAIN" module.prop | sed -n 's/^id=//p')"
+  priv_id="$(unzip -p "$ZIP_VARIANT_PRIV" module.prop | sed -n 's/^id=//p')"
+  if [ "$main_id" = "gkui-pack" ] && [ "$priv_id" = "$main_id" ]; then ok "普通版与特权版 module id 相同(gkui-pack)"; else bad "两个变体 module id 不一致"; fi
+  if unzip -Z1 "$ZIP_VARIANT_MAIN" | grep -q '^system/priv-app/'; then bad "普通版 ZIP 含特权 APK 落点"; else ok "普通版 ZIP 不含 system/priv-app APK 落点"; fi
+  if unzip -Z1 "$ZIP_VARIANT_MAIN" | grep -q 'system/etc/permissions/'; then bad "普通版 ZIP 含白名单 XML"; else ok "普通版 ZIP 不含白名单 XML"; fi
+  XML_OUT="$(unzip -p "$ZIP_VARIANT_PRIV" system/etc/permissions/privapp-permissions-gkuirecorder.xml)"
+  if printf '%s' "$XML_OUT" | grep -q 'android.permission.CAPTURE_AUDIO_OUTPUT' \
+     && ! printf '%s' "$XML_OUT" | grep -q 'android.permission.INTERNET' \
+     && ! printf '%s' "$XML_OUT" | grep -q 'RECEIVE_BOOT_COMPLETED'; then
+    ok "XML 只包含实际申请集 ∩ privileged 集(CAPTURE_AUDIO_OUTPUT)"
+  else
+    bad "XML 不是 fail-closed 交集:\n$XML_OUT"
+  fi
+  if unzip -Z1 "$ZIP_VARIANT_PRIV" | grep -q '^system/priv-app/GKUIRecorder/GKUIRecorder.apk$'; then ok "特权 ZIP 静态包含 system/priv-app 录音机 APK"; else bad "特权 ZIP 缺录音机 APK"; fi
+  if unzip -Z1 "$ZIP_VARIANT_PRIV" | grep -q '^apks/'; then bad "特权 ZIP 仍包含安装期临时 apks/ 布局"; else ok "特权 ZIP 无 apks/ 临时目录"; fi
+  if unzip -p "$ZIP_VARIANT_PRIV" customize.sh | grep -q 'org.lineageos.recorder.dev|GKUIRecorder|.*|priv'; then ok "特权版清单将录音机落到 priv 位置"; else bad "特权版录音机落点错误"; fi
+  if unzip -p "$ZIP_VARIANT_PRIV" customize.sh | grep -q 'ws.xsoh.etar.debug|GKUICalendar|.*|app'; then ok "四个常规应用仍留在普通 app 位置"; else bad "常规应用被提升到特权位置"; fi
+  if grep -q '^included.*recorder.*org.lineageos.recorder.dev.*/system/priv-app/GKUIRecorder.*CAPTURE_AUDIO_OUTPUT' \
+      "$WORK/dist-variants/priv-build-manifest.txt"; then ok "priv manifest 标记录音机落点与白名单权限"; else bad "priv manifest 缺少审计字段"; fi
+  if [ -f "$WORK/dist-variants/build-manifest.txt" ] \
+     && grep -q '特权版 ZIP:' "$WORK/dist-variants/build-manifest.txt"; then ok "主构建清单列出第二 ZIP"; else bad "主构建清单未列出第二 ZIP"; fi
+fi
+
+# Fail-closed:没有 dump、权限缺失、纯 signature 或无 privileged 权限时绝不出 Priv ZIP。
+rm -f "$PRIV_REPO/device/framework-permissions.txt"
+out="$(run_build "$PRIV_REPO" "$PRIV_APKS" "$WORK/dist-no-dump" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -f "$WORK/dist-no-dump/GKUI-Pack-test-1.zip" ] \
+   && [ ! -f "$WORK/dist-no-dump/GKUI-Pack-Priv-test-1.zip" ] \
+   && grep -q '缺少实测设备权限转储' "$WORK/dist-no-dump/PREFLIGHT-REPORT.md"; then
+  ok "缺少设备 dump 时只跳过特权 ZIP,普通版仍可构建(fail-closed)"
+else
+  bad "缺少 dump 的变体状态不正确(rc=$rc)"
+fi
+set_privilege_dump_fixture "$PRIV_REPO" missing
+out="$(run_build "$PRIV_REPO" "$PRIV_APKS" "$WORK/dist-missing-permission" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -f "$WORK/dist-missing-permission/GKUI-Pack-Priv-test-1.zip" ] \
+   && grep -q '未出现在设备权限转储' "$WORK/dist-missing-permission/PREFLIGHT-REPORT.md"; then ok "APK 申请权限在设备转储中缺失时跳过 priv ZIP"; else bad "缺失申请权限未 fail-closed"; fi
+set_privilege_dump_fixture "$PRIV_REPO" 'signature|privileged'
+cat >> "$PRIV_REPO/device/framework-permissions.txt" <<'EOF'
++ permission:android.permission.CAPTURE_AUDIO_OUTPUT
+  protectionLevel: normal
+EOF
+out="$(run_build "$PRIV_REPO" "$PRIV_APKS" "$WORK/dist-ambiguous-level" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -f "$WORK/dist-ambiguous-level/GKUI-Pack-Priv-test-1.zip" ] \
+   && grep -q '冲突的 protectionLevel' "$WORK/dist-ambiguous-level/PREFLIGHT-REPORT.md"; then
+  ok "同一权限的设备转储级别冲突时跳过特权 ZIP"
+else
+  bad "设备转储级别冲突未 fail-closed(rc=$rc)"
+fi
+set_privilege_dump_fixture "$PRIV_REPO" 'signature'
+out="$(run_build "$PRIV_REPO" "$PRIV_APKS" "$WORK/dist-signature-only" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -f "$WORK/dist-signature-only/GKUI-Pack-Priv-test-1.zip" ] \
+   && grep -q '纯 signature 权限' "$WORK/dist-signature-only/PREFLIGHT-REPORT.md"; then ok "纯 signature 权限被拒绝且不生成 XML/Priv ZIP"; else bad "纯 signature 权限未 fail-closed"; fi
+set_privilege_dump_fixture "$PRIV_REPO" 'normal'
+out="$(run_build "$PRIV_REPO" "$PRIV_APKS" "$WORK/dist-no-privileged" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -f "$WORK/dist-no-privileged/GKUI-Pack-Priv-test-1.zip" ] \
+   && grep -q '没有交集' "$WORK/dist-no-privileged/PREFLIGHT-REPORT.md"; then ok "没有 privileged 交集时拒绝空白 XML/Priv ZIP"; else bad "空交集未 fail-closed"; fi
+set_privilege_dump_fixture "$PRIV_REPO" 'signature|privileged'
+
 # -----------------------------------------------------------------------------
 head1 "8) C8:/data 冲突检查(渲染后的 customize.sh + 桩 pm)"
 # -----------------------------------------------------------------------------
 stage_module() { # $1=目标目录:从构建产物准备一个"已安装模块"的等价目录
   local d="$1" name
   rm -rf "$d"
-  mkdir -p "$d/apks"
+  mkdir -p "$d"
   cp -a "$WORK/repo/module/." "$d/"
   unzip -p "$ZIP" customize.sh > "$d/customize.sh"
-  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock; do
-    unzip -p "$ZIP" "apks/$name.apk" > "$d/apks/$name.apk"
+  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock GKUIRecorder; do
+    mkdir -p "$d/system/app/$name"
+    unzip -p "$ZIP" "system/app/$name/$name.apk" > "$d/system/app/$name/$name.apk"
   done
 }
 
@@ -472,7 +712,11 @@ if [ -f "$ZIP" ]; then
     *"本模块不会替你执行卸载"*) ok "明确声明模块不会代为卸载" ;;
     *) bad "未声明不代为卸载" ;;
   esac
-  if [ -d "$MODTEST/system" ]; then bad "中止安装后仍写入了 system/ 目录"; else ok "中止安装后未留下任何挂载内容"; fi
+  if [ -f "$MODTEST/system/app/GKUICalendar/GKUICalendar.apk" ]; then
+    ok "C8 中止发生在静态 ZIP 内容变更之前"
+  else
+    bad "C8 中止前错误移除了静态 APK"
+  fi
 
   # 8.2 已由系统分区提供 → 该条目跳过,其余继续
   MODSYS="$WORK/modsys"
@@ -501,11 +745,11 @@ if [ -f "$ZIP" ]; then
   out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODOK" FAKE_PM_PKG="__none__" \
           FAKE_PM_MODE="absent" sh "$MODOK/customize.sh" 2>&1 )"; rc=$?
   if [ $rc -eq 0 ]; then ok "无冲突时安装成功"; else bad "无冲突却安装失败(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
-  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock; do
+  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock GKUIRecorder; do
     f="$MODOK/system/app/$name/$name.apk"
     if [ -f "$f" ]; then ok "已安装到 system/app/$name/$name.apk"; else bad "缺少 $f"; fi
   done
-  if [ ! -d "$MODOK/apks" ]; then ok "安装后清理了 apks/ 临时目录"; else bad "apks/ 未被清理"; fi
+  if [ ! -e "$MODOK/apks" ]; then ok "模块布局不依赖 apks/ 临时目录"; else bad "模块中出现 apks/ 临时目录"; fi
   if command -v stat >/dev/null 2>&1; then
     dmode="$(stat -c '%a' "$MODOK/system/app/GKUICalendar" 2>/dev/null)"
     fmode="$(stat -c '%a' "$MODOK/system/app/GKUICalendar/GKUICalendar.apk" 2>/dev/null)"
@@ -515,10 +759,10 @@ if [ -f "$ZIP" ]; then
   # 8.4 完整性校验:篡改 APK 后必须中止
   MODBAD="$WORK/modbad"
   stage_module "$MODBAD"
-  printf 'x' >> "$MODBAD/apks/GKUICalendar.apk"
+  printf 'x' >> "$MODBAD/system/app/GKUICalendar/GKUICalendar.apk"
   out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODBAD" FAKE_PM_PKG="__none__" \
           FAKE_PM_MODE="absent" sh "$MODBAD/customize.sh" 2>&1 )"; rc=$?
-  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '完整性校验失败'; then
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'sha256 不匹配'; then
     ok "APK 完整性校验失败时中止安装"
   else
     bad "APK 被篡改却未中止(rc=$rc)"
@@ -533,6 +777,202 @@ if [ -f "$ZIP" ]; then
   fi
 else
   bad "第 4 步未产出 zip,跳过 C8 测试"
+fi
+
+# -----------------------------------------------------------------------------
+head1 "8.5) 特权变体安装期复核、C8、目录切换与启动自检"
+# -----------------------------------------------------------------------------
+stage_priv_module() { # $1=目标目录 $2=priv zip
+  local d="$1" zip_file="$2" name apk_path
+  rm -rf "$d"
+  mkdir -p "$d/system/etc/permissions"
+  cp -a "$PRIV_REPO/module-priv/." "$d/"
+  unzip -p "$zip_file" customize.sh > "$d/customize.sh"
+  unzip -p "$zip_file" service.sh > "$d/service.sh"
+  unzip -p "$zip_file" system/etc/permissions/privapp-permissions-gkuirecorder.xml \
+    > "$d/system/etc/permissions/privapp-permissions-gkuirecorder.xml"
+  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock; do
+    apk_path="system/app/$name/$name.apk"
+    mkdir -p "$d/system/app/$name"
+    unzip -p "$zip_file" "$apk_path" > "$d/$apk_path"
+  done
+  name=GKUIRecorder
+  apk_path="system/priv-app/$name/$name.apk"
+  mkdir -p "$d/system/priv-app/$name"
+  unzip -p "$zip_file" "$apk_path" > "$d/$apk_path"
+}
+
+stage_main_recorder_module() { # $1=目标目录 $2=main zip
+  local d="$1" zip_file="$2" name apk_path
+  rm -rf "$d"
+  mkdir -p "$d"
+  cp -a "$PRIV_REPO/module/." "$d/"
+  unzip -p "$zip_file" customize.sh > "$d/customize.sh"
+  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock GKUIRecorder; do
+    apk_path="system/app/$name/$name.apk"
+    mkdir -p "$d/system/app/$name"
+    unzip -p "$zip_file" "$apk_path" > "$d/$apk_path"
+  done
+}
+
+if [ -f "$ZIP_VARIANT_PRIV" ]; then
+  MOD_PRIV_OK="$WORK/mod-priv-ok"
+  stage_priv_module "$MOD_PRIV_OK" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_OK" FAKE_PM_PKG="__none__" \
+      FAKE_PM_MODE=absent FAKE_PM_PERMISSION_MODE=good sh "$MOD_PRIV_OK/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -eq 0 ]; then ok "privileged_permission 真机复核通过后安装成功"; else bad "有效 privileged 模块安装失败(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
+  for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock; do
+    if [ -f "$MOD_PRIV_OK/system/app/$name/$name.apk" ]; then ok "$name 仍部署到 system/app"; else bad "$name 未部署到普通 system/app"; fi
+  done
+  if [ -f "$MOD_PRIV_OK/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then ok "录音机部署到 system/priv-app"; else bad "录音机未部署到 priv 路径"; fi
+  if [ ! -e "$MOD_PRIV_OK/system/app/GKUIRecorder" ]; then ok "priv ZIP 内没有 system/app 录音机副本"; else bad "出现同包名双份录音机"; fi
+  if [ -f "$MOD_PRIV_OK/system/etc/permissions/privapp-permissions-gkuirecorder.xml" ]; then ok "白名单 XML 与 APK 同在一个模块目录"; else bad "安装后丢失白名单 XML"; fi
+  if [ ! -e "$MOD_PRIV_OK/apks" ]; then ok "特权模块布局不依赖 apks/ 临时目录"; else bad "特权 ZIP 仍依赖 apks/ 临时目录"; fi
+  if printf '%s' "$out" | grep -q 'privapp 白名单 1 条'; then ok "安装摘要打印白名单条数"; else bad "安装摘要缺少白名单条数"; fi
+
+  MOD_PRIV_TAMPER="$WORK/mod-priv-tamper"
+  stage_priv_module "$MOD_PRIV_TAMPER" "$ZIP_VARIANT_PRIV"
+  printf 'tampered' >> "$MOD_PRIV_TAMPER/system/priv-app/GKUIRecorder/GKUIRecorder.apk"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_TAMPER" FAKE_PM_PKG=__none__ \
+      FAKE_PM_PERMISSION_MODE=good sh "$MOD_PRIV_TAMPER/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'sha256 不匹配'; then
+    ok "特权 ZIP 内静态 APK 被篡改时完整性预检中止"
+  else
+    bad "特权静态 APK 被篡改未阻止(rc=$rc)"
+  fi
+
+  MOD_PRIV_DATA="$WORK/mod-priv-data"
+  stage_priv_module "$MOD_PRIV_DATA" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_DATA" \
+      FAKE_PM_PKG=org.lineageos.recorder.dev FAKE_PM_MODE=data \
+      FAKE_PM_PERMISSION_MODE=good sh "$MOD_PRIV_DATA/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'C8'; then ok "特权版 recorder /data 副本触发 C8 中止"; else bad "特权版未拦截 recorder /data 冲突(rc=$rc)"; fi
+  if printf '%s' "$out" | grep -q 'adb uninstall org.lineageos.recorder.dev'; then ok "冲突提示给出 adb uninstall,模块不代卸载"; else bad "缺少用户自行卸载提示"; fi
+  if [ -f "$MOD_PRIV_DATA/system/app/GKUICalendar/GKUICalendar.apk" ] \
+     && [ -f "$MOD_PRIV_DATA/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "C8 中止前保留 ZIP 内静态 APK,未执行清理/迁移"
+  else
+    bad "C8 中止前错误修改了静态 ZIP 内容"
+  fi
+
+  MOD_PRIV_BAD="$WORK/mod-priv-bad-level"
+  stage_priv_module "$MOD_PRIV_BAD" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_BAD" FAKE_PM_PKG=__none__ \
+      FAKE_PM_PERMISSION_MODE=signature sh "$MOD_PRIV_BAD/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '不含 privileged'; then ok "安装期复核发现纯 signature 定义时 fail-closed"; else bad "安装期权限级别不匹配未中止(rc=$rc)"; fi
+  if [ -f "$MOD_PRIV_BAD/system/app/GKUICalendar/GKUICalendar.apk" ] \
+     && [ -f "$MOD_PRIV_BAD/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "权限复核失败时静态 ZIP 内容未被更改"
+  else
+    bad "权限复核失败前错误修改了静态 APK"
+  fi
+
+  MOD_PRIV_AMBIG="$WORK/mod-priv-ambiguous-level"
+  stage_priv_module "$MOD_PRIV_AMBIG" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_AMBIG" FAKE_PM_PKG=__none__ \
+      FAKE_PM_PERMISSION_MODE=ambiguous sh "$MOD_PRIV_AMBIG/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '不唯一/不明确'; then
+    ok "目标设备转储对同一权限给出冲突级别时 fail-closed"
+  else
+    bad "目标设备权限级别冲突未 fail-closed(rc=$rc)"
+  fi
+
+  MOD_PRIV_MISSING="$WORK/mod-priv-missing-permission"
+  stage_priv_module "$MOD_PRIV_MISSING" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_MISSING" FAKE_PM_PKG=__none__ \
+      FAKE_PM_PERMISSION_MODE=missing sh "$MOD_PRIV_MISSING/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '不唯一/不明确'; then
+    ok "目标设备转储缺少白名单权限定义时 fail-closed"
+  else
+    bad "目标设备缺少的白名单权限未 fail-closed(rc=$rc)"
+  fi
+
+  MOD_PRIV_NODATA="$WORK/mod-priv-no-level"
+  stage_priv_module "$MOD_PRIV_NODATA" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_NODATA" FAKE_PM_PKG=__none__ \
+      FAKE_PM_PERMISSION_MODE=no-level sh "$MOD_PRIV_NODATA/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '未输出 protectionLevel'; then ok "-f/-fg 均无 protectionLevel 时拒绝安装"; else bad "pm 输出缺失 protectionLevel 时没有 fail-closed"; fi
+
+  MOD_PRIV_PMFAIL="$WORK/mod-priv-pm-fail"
+  stage_priv_module "$MOD_PRIV_PMFAIL" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_PMFAIL" FAKE_PM_PKG=__none__ \
+      FAKE_PM_PERMISSION_MODE=partial-fail sh "$MOD_PRIV_PMFAIL/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '调用失败'; then ok "pm 权限转储命令非零时拒绝使用部分输出"; else bad "pm 转储命令失败未 fail-closed"; fi
+  if [ -f "$MOD_PRIV_PMFAIL/system/app/GKUICalendar/GKUICalendar.apk" ] \
+     && [ -f "$MOD_PRIV_PMFAIL/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "pm 命令失败前静态 ZIP 内容未被更改"
+  else
+    bad "pm 命令失败前错误修改了静态 APK"
+  fi
+
+  MOD_PRIV_PATHFAIL="$WORK/mod-priv-path-fail"
+  stage_priv_module "$MOD_PRIV_PATHFAIL" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_PATHFAIL" \
+      FAKE_PM_PKG=org.lineageos.recorder.dev FAKE_PM_PATH_MODE=fail \
+      FAKE_PM_PERMISSION_MODE=good sh "$MOD_PRIV_PATHFAIL/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'pm path .*失败'; then ok "pm list packages 与 pm path 不一致时 C8 fail-closed"; else bad "pm path 检查失败未中止"; fi
+  if [ -f "$MOD_PRIV_PATHFAIL/system/app/GKUICalendar/GKUICalendar.apk" ] \
+     && [ -f "$MOD_PRIV_PATHFAIL/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "pm path 检查失败前静态 ZIP 内容未被更改"
+  else
+    bad "pm path 检查失败前错误修改了静态 APK"
+  fi
+
+  MOD_PRIV_PATHBAD="$WORK/mod-priv-path-bad-output"
+  stage_priv_module "$MOD_PRIV_PATHBAD" "$ZIP_VARIANT_PRIV"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_PRIV_PATHBAD" \
+      FAKE_PM_PKG=org.lineageos.recorder.dev FAKE_PM_PATH_MODE=bad-output \
+      FAKE_PM_PERMISSION_MODE=good sh "$MOD_PRIV_PATHBAD/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q '无法识别的路径'; then ok "pm path 非路径输出时拒绝继续 C8 检查"; else bad "pm path 非路径输出未 fail-closed"; fi
+  if [ -f "$MOD_PRIV_PATHBAD/system/app/GKUICalendar/GKUICalendar.apk" ] \
+     && [ -f "$MOD_PRIV_PATHBAD/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "pm path 输出异常前静态 ZIP 内容未被更改"
+  else
+    bad "pm path 输出异常前错误修改了静态 APK"
+  fi
+
+  # 从普通版切到特权版:即使 PackageManager 仍看见旧 /system/app 路径,也迁移而非跳过。
+  MOD_SWITCH_TO_PRIV="$WORK/mod-switch-to-priv"
+  stage_priv_module "$MOD_SWITCH_TO_PRIV" "$ZIP_VARIANT_PRIV"
+  mkdir -p "$MOD_SWITCH_TO_PRIV/system/app/GKUIRecorder"
+  printf 'old main mount' > "$MOD_SWITCH_TO_PRIV/system/app/GKUIRecorder/old.apk"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_SWITCH_TO_PRIV" \
+      FAKE_PM_PKG=org.lineageos.recorder.dev FAKE_PM_MODE=systemapp \
+      FAKE_PM_PERMISSION_MODE=good sh "$MOD_SWITCH_TO_PRIV/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && [ -f "$MOD_SWITCH_TO_PRIV/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ] \
+     && [ ! -e "$MOD_SWITCH_TO_PRIV/system/app/GKUIRecorder" ]; then
+    ok "普通版 → 特权版切换:清理 app 副本并迁移到 priv 路径"
+  else
+    bad "普通版 → 特权版切换失败(rc=$rc)"
+  fi
+
+  # 开机完成后的 service 自检记录授权状态,并清除 boot flag。
+  touch "$MOD_PRIV_OK/.boot_flag"
+  env PATH="$WORK/bin:$PATH" FAKE_PM_PERMISSION_RESULT=granted sh "$MOD_PRIV_OK/service.sh" >/dev/null 2>&1
+  if [ ! -f "$MOD_PRIV_OK/.boot_flag" ] && grep -q 'permission_self_check=1/1 granted' "$MOD_PRIV_OK/last_boot.log"; then
+    ok "service.sh 清除 boot flag 并记录权限授予自检"
+  else
+    bad "service.sh 未清理标记或权限自检日志缺失"
+  fi
+
+  MOD_SWITCH_TO_MAIN="$WORK/mod-switch-to-main"
+  stage_main_recorder_module "$MOD_SWITCH_TO_MAIN" "$ZIP_VARIANT_MAIN"
+  mkdir -p "$MOD_SWITCH_TO_MAIN/system/priv-app/GKUIRecorder" \
+           "$MOD_SWITCH_TO_MAIN/system/etc/permissions"
+  printf 'old priv mount' > "$MOD_SWITCH_TO_MAIN/system/priv-app/GKUIRecorder/old.apk"
+  printf 'old xml' > "$MOD_SWITCH_TO_MAIN/system/etc/permissions/privapp-permissions-gkuirecorder.xml"
+  out="$(env PATH="$WORK/bin:$PATH" MODPATH="$MOD_SWITCH_TO_MAIN" \
+      FAKE_PM_PKG=org.lineageos.recorder.dev FAKE_PM_MODE=systempriv \
+      sh "$MOD_SWITCH_TO_MAIN/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && [ -f "$MOD_SWITCH_TO_MAIN/system/app/GKUIRecorder/GKUIRecorder.apk" ] \
+     && [ ! -e "$MOD_SWITCH_TO_MAIN/system/priv-app" ] \
+     && [ ! -e "$MOD_SWITCH_TO_MAIN/system/etc/permissions/privapp-permissions-gkuirecorder.xml" ]; then
+    ok "特权版 → 普通版切换:移除 priv-app 树与白名单 XML,恢复普通落点"
+  else
+    bad "特权版 → 普通版切换失败(rc=$rc)"
+  fi
+else
+  bad "跳过特权安装测试:priv ZIP 未生成"
 fi
 
 # -----------------------------------------------------------------------------
@@ -640,14 +1080,14 @@ if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q '\[dry-run\] adb install -r'; t
 else
   bad "install_all --dry-run 异常(rc=$rc)"
 fi
-for pkg in ws.xsoh.etar.debug org.lineageos.glimpse.dev com.android.calculator2.dev com.android.deskclock.dev; do
+for pkg in ws.xsoh.etar.debug org.lineageos.glimpse.dev com.android.calculator2.dev com.android.deskclock.dev org.lineageos.recorder.dev; do
   if printf '%s' "$out" | grep -q "$pkg"; then ok "dry-run 覆盖 $pkg"; else bad "dry-run 未覆盖 $pkg"; fi
 done
 
 # 10.2 install_all:正常路径
 out="$(ADB_STUB_MODE=ok ia 2>&1)"; rc=$?
-if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q '成功: 4'; then
-  ok "install_all 正常路径:4 个应用全部成功"
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q '成功: 5'; then
+  ok "install_all 正常路径:五个应用全部成功"
 else
   bad "install_all 正常路径异常(rc=$rc)"; printf '%s\n' "$out" | tail -12
 fi
@@ -710,7 +1150,7 @@ fi
 out="$(ADB_STUB_MODE=ok ua --yes --dry-run 2>&1)"
 if printf '%s' "$out" | grep -q 'adb uninstall'; then ok "uninstall_all --dry-run 打印卸载命令"; else bad "uninstall_all dry-run 异常"; fi
 out="$(ADB_STUB_MODE=ok ua --yes 2>&1)"; rc=$?
-if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q '成功: 4'; then ok "uninstall_all --yes 正常卸载 4 项"; else bad "uninstall_all 异常(rc=$rc)"; fi
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q '成功: 5'; then ok "uninstall_all --yes 正常卸载 5 项"; else bad "uninstall_all 异常(rc=$rc)"; fi
 if printf '%s' "$out" | grep -q 'pm enable org.lineageos.etar'; then ok "提示用户自行 pm enable 恢复自带应用"; else bad "缺少 pm enable 提示"; fi
 if printf '%s' "$out" | grep -q 'adb uninstall com.android.deskclock.dev'; then bad "打印了错误的自带应用卸载命令"; else ok "未给出卸载自带应用的命令"; fi
 
@@ -770,22 +1210,26 @@ if python3 - "$REPO_ROOT" <<'PYEOF'
 # -*- coding: utf-8 -*-
 import json, subprocess, sys
 out = subprocess.run(["bash", "build.sh", "--dump-apps-json"], cwd=sys.argv[1],
-                     capture_output=True, text=True).stdout
+                     capture_output=True, text=True, check=True).stdout
 data = json.loads(out)
 for app in data["apps"]:
     if app["id"] == "recorder":
-        # 设计要点:断言写成**不变量**(未证实 → 必须 unverified/禁用/不得指向官方包名/
-        # 仍留 TODO),而不是"application_id 必须以 TODO 开头"。后者每回填一个实测字段
-        # 就要连 CI 工作流一起改,而工作流只能由用户经网页编辑器落地 —— 徒增耦合。
-        ok = (app["confidence"] == "unverified" and app["_enabled"] is False
+        # 不变量:录音机显式纳入五应用普通版,ack 只保持普通 system_app;
+        # signer 未实测时仍必须 TODO + unverified,由 C7 阻止出包。
+        ok = (app["confidence"] == "unverified" and app["_enabled"] is True
+              and app["privileged_ack"] is True and app["install_as"] == "system_app"
+              and app["name"] == "GKUIRecorder"
               and app["application_id"] == "org.lineageos.recorder.dev"
               and app["application_id"] != app["stock_package"]
               and str(app["installed_version_code"]) == "1"
-              and bool(app["_todo_fields"]))
+              and app["release_tag"] == "beta2"
+              and app["asset_name"] == "GKUIRecorder-beta2.apk"
+              and app["signer_sha256"] == "TODO"
+              and "signer_sha256" in app["_todo_fields"])
         sys.exit(0 if ok else 1)
 sys.exit(1)
 PYEOF
-then ok "recorder:实测包名与 versionCode 已回填,且仍 unverified + disabled + 留有 TODO"; else bad "recorder 条目不符合要求"; fi
+then ok "recorder:五应用普通版启用、privileged_ack=true、普通路径与未验证 signer 门禁明确"; else bad "recorder 条目不符合要求"; fi
 if grep -q '^\*.apk$' "$REPO_ROOT/.gitignore" && grep -q '^dist/$' "$REPO_ROOT/.gitignore" \
    && grep -q '^build/$' "$REPO_ROOT/.gitignore" && grep -q '^\*.keystore$' "$REPO_ROOT/.gitignore"; then
   ok ".gitignore 含 *.apk / dist/ / build/ / *.keystore"

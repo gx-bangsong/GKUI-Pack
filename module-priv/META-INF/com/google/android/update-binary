@@ -1,0 +1,119 @@
+#!/sbin/sh
+# =============================================================================
+# META-INF/com/google/android/update-binary —— 模块安装入口
+#
+# 本文件遵循 Magisk 模块的标准约定:
+#   1) 标准路径(Magisk):加载 /data/adb/magisk/util_functions.sh 后调用
+#      install_module,由 Magisk 自己负责解包并在之后执行 customize.sh。
+#   2) Magisk 版本过旧:直接报错退出,提示升级。
+#   3) 其它安装器兜底:若安装器没有提供 util_functions.sh,则走下面的通用流程
+#      (自带解包 + 执行 customize.sh,落地到 /data/adb/modules_update/<id>)。
+#
+#   ⚠️ 兜底流程**未在 KernelSU / APatch 真机验证**。KernelSU / APatch 通常由
+#      其管理器自带的安装器读取 module.prop 与 customize.sh 完成安装,不一定
+#      执行本文件;两种情况都已按"不确定就失败、绝不半成品安装"的原则处理。
+#
+# 本文件不做任何替换 / 禁用系统应用的动作(coexist 模式硬约束 C2),
+# 也不写入任何与 ROM 自带应用相关的路径。
+# =============================================================================
+
+umask 022
+
+# 加载 util_functions.sh 之前,先用最朴素的 ui_print(标准做法)
+ui_print() { echo "$1"; }
+
+require_new_magisk() {
+  ui_print "***********************************************"
+  ui_print "  需要 Magisk v20.4+ 或兼容的模块安装器"
+  ui_print "  请升级后再安装本模块"
+  ui_print "***********************************************"
+  exit 1
+}
+
+OUTFD="$2"
+ZIPFILE="$3"
+
+mount /data 2>/dev/null
+
+if [ -f /data/adb/magisk/util_functions.sh ]; then
+  # shellcheck source=/dev/null
+  . /data/adb/magisk/util_functions.sh
+  [ "${MAGISK_VER_CODE:-0}" -lt 20400 ] && require_new_magisk
+  install_module
+  exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# 通用兜底流程(非 Magisk 环境)
+# -----------------------------------------------------------------------------
+ui_print "- 未发现 /data/adb/magisk/util_functions.sh,尝试通用安装流程"
+
+find_unzip() {
+  if command -v unzip >/dev/null 2>&1; then
+    echo "unzip"
+    return 0
+  fi
+  for bb in busybox /data/adb/ksu/bin/busybox /data/adb/apatch/bin/busybox; do
+    if command -v "$bb" >/dev/null 2>&1 && "$bb" --list 2>/dev/null | grep -q '^unzip$'; then
+      echo "$bb unzip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+UNZIP_CMD="$(find_unzip)" || {
+  ui_print "!! 找不到可用的解压程序(unzip / busybox unzip)"
+  ui_print "!! 请在系统已启动时使用 Magisk / KernelSU / APatch 管理器安装本模块。"
+  exit 1
+}
+
+if [ -z "$ZIPFILE" ] || [ ! -f "$ZIPFILE" ]; then
+  ui_print "!! 未取得模块 zip 路径(第 3 个参数为空):当前安装器不受支持"
+  exit 1
+fi
+
+STAGE="/data/adb/modules_update/.gkui-pack-stage.$$"
+rm -rf "$STAGE"
+mkdir -p "$STAGE" || exit 1
+
+# shellcheck disable=SC2086
+$UNZIP_CMD -o "$ZIPFILE" -d "$STAGE" >/dev/null 2>&1 || {
+  ui_print "!! 解压模块 zip 失败"
+  rm -rf "$STAGE"
+  exit 1
+}
+
+MODULE_ID="$(sed -n 's/^id=//p' "$STAGE/module.prop" 2>/dev/null | head -1)"
+case "$MODULE_ID" in
+  '') ui_print "!! module.prop 中缺少 id"; rm -rf "$STAGE"; exit 1 ;;
+  [!A-Za-z]*) ui_print "!! module.prop 中的 id 必须以字母开头: '$MODULE_ID'"; rm -rf "$STAGE"; exit 1 ;;
+  *[!A-Za-z0-9._-]*) ui_print "!! module.prop 中的 id 含非法字符: '$MODULE_ID'"; rm -rf "$STAGE"; exit 1 ;;
+  *) : ;;
+esac
+
+DEST="/data/adb/modules_update/$MODULE_ID"
+rm -rf "$DEST"
+mv "$STAGE" "$DEST" || {
+  ui_print "!! 无法把模块移动到 $DEST"
+  rm -rf "$STAGE"
+  exit 1
+}
+
+chmod 0755 "$DEST/customize.sh" "$DEST/post-fs-data.sh" "$DEST/service.sh" "$DEST/uninstall.sh" 2>/dev/null
+chmod 0644 "$DEST/module.prop" 2>/dev/null
+
+MODPATH="$DEST"
+export MODPATH
+if [ -f "$DEST/customize.sh" ]; then
+  ( cd "$DEST" && MODPATH="$DEST" sh "$DEST/customize.sh" "${API:-0}" "$OUTFD" )
+  RC=$?
+  if [ "$RC" -ne 0 ]; then
+    ui_print "!! customize.sh 失败(退出码 $RC),已回滚本次安装"
+    rm -rf "$DEST"
+    exit 1
+  fi
+fi
+
+ui_print "- 通用安装流程完成($MODULE_ID):请重启以生效"
+exit 0
