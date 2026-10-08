@@ -135,7 +135,7 @@ while IFS=$'\t' read -r APP_ID APP_NAME APP_PKG STOCK_PKG APP_REPO _UP _LIC _SRC
       paths="$("${ADB[@]}" shell pm path "$APP_PKG" 2>/dev/null | tr -d '\r')"
       if [ -z "$paths" ]; then
         r "  installed: 否(设备上未安装该包名)"
-        r "  installed_version_code: <不适用:未安装>"
+        r "  installed_version_code: none   # 设备上未安装该包名,可直接回填(见 apps.yaml 字段说明)"
       else
         r "  installed: 是"
         printf '%s\n' "$paths" | sed 's/^package:/  path: /' | while IFS= read -r line; do r "$line"; done
@@ -229,7 +229,7 @@ if [ "$YAML_SNIPPET" = 1 ]; then
     if [ -n "$vc" ]; then
       r "      installed_version_code: $vc"
     else
-      r "      installed_version_code: <设备上未安装,无法取得>"
+      r "      installed_version_code: none   # dumpsys 未取到 → 设备上未安装该包名"
     fi
     r "      signer_sha256: <用构建时下载到的 APK 执行 apksigner verify --print-certs 取得>"
   done <<EOF
