@@ -781,10 +781,30 @@ esac
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/gkui-pack.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+PERM_DUMP=""
+PERM_MODE=""
+PRIV_IS_TEST=0
+if [ -f "$ROOT/device/framework-permissions.txt" ]; then
+  PERM_DUMP="$ROOT/device/framework-permissions.txt"
+  PERM_MODE="device"
+  PRIV_IS_TEST=0
+elif [ -f "$ROOT/device/framework-permissions.source.txt" ]; then
+  PERM_DUMP="$ROOT/device/framework-permissions.source.txt"
+  PERM_MODE="source"
+  PRIV_IS_TEST=1
+fi
+
 REPORT="$DIST_DIR/PREFLIGHT-REPORT.md"
 mkdir -p "$DIST_DIR" "$APK_DIR"
 {
   printf '# PREFLIGHT-REPORT — GKUI-Pack APK 门禁报告\n\n'
+  if [ "$PRIV_IS_TEST" = 1 ]; then
+    printf '> **⚠️ [TEST 警告] 白名单来源：源码推导，未经设备验证**\n'
+    printf '> - 来源文件: `device/framework-permissions.source.txt`（提取自 `LineageOS/android_frameworks_base` 分支 `lineage-23.2` commit `f4ed08a03b518772ba77c3c0a1b4185fa1712c9b` 的 `core/res/AndroidManifest.xml`）\n'
+    printf '> - 风险说明: 仓库当前缺少目标设备实测 `device/framework-permissions.txt`（`pm list permissions -f`），特权包标记为 `GKUI-Pack-%s-recorderpriv-TEST.zip`。若目标 ROM 对特权权限的定义与源码不一致，启动阶段可能触发 `PackageManager` 异常（模块内置二次重启自动禁用自救）。\n\n' "$VERSION"
+  elif [ -n "$PERM_DUMP" ]; then
+    printf '> **特权变体白名单来源**: `device/framework-permissions.txt`（目标设备实测严格门禁）\n\n'
+  fi
   printf -- '- 生成者: scripts/preflight-apk.sh(由 build.sh 调用)\n'
   printf -- '- 生成时间(UTC): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf -- '- 模块版本: %s (versionCode %s)\n' "$VERSION" "$VERSION_CODE"
@@ -1023,6 +1043,8 @@ render_placeholder "$STAGE/module.prop"   '__VERSION_CODE__' "$VERSION_CODE"
 render_placeholder "$STAGE/customize.sh"  '__APP_ENTRIES__'  "$ENTRY_LINES"
 render_placeholder "$STAGE/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
 render_placeholder "$STAGE/uninstall.sh"  '__STOCK_PACKAGES__' "$STOCK_LINES"
+render_placeholder "$STAGE/service.sh"    '__VERSION__'      "$VERSION"
+render_placeholder "$STAGE/service.sh"    '__VARIANT__'      "normal"
 
 leftover="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$STAGE" || true)"
 if [ -n "$leftover" ]; then
@@ -1031,14 +1053,84 @@ $leftover"
 fi
 chmod 0755 "$STAGE"/*.sh "$STAGE/META-INF/com/google/android/update-binary"
 
-# 5) 打包
+# 4b) 渲染并生成 recorder-priv 特权变体(与普通版同次构建双包输出)
+PRIV_ZIP_OUT=""
+if grep -q '^recorder|' "$WORK/included.txt" 2>/dev/null && [ -d "$ROOT/module-priv" ]; then
+  [ -n "$PERM_DUMP" ] || die "缺少框架权限清单(device/framework-permissions.txt 或 device/framework-permissions.source.txt),无法生成 recorder-priv 白名单"
+  PRIV_XML="$WORK/privapp-permissions-org.lineageos.recorder.dev.xml"
+  priv_gen_out="$(python3 "$ROOT/scripts/generate-privapp-permissions.py" \
+    --dump "$PERM_DUMP" \
+    --mode "$PERM_MODE" \
+    --app-json "$WORK/preflight-recorder.json" \
+    --out "$PRIV_XML" 2>&1)" || die "recorder-priv 白名单生成失败:
+$priv_gen_out"
+  info "recorder-priv 白名单已生成($PERM_MODE): $(basename "$PRIV_XML")"
+
+  STAGE_PRIV="$WORK/stage-priv"
+  mkdir -p "$STAGE_PRIV/apks" "$STAGE_PRIV/system/etc/permissions"
+  cp -a "$ROOT/module/." "$STAGE_PRIV/"
+  cp -a "$ROOT/module-priv/." "$STAGE_PRIV/"
+  cp -a "$STAGE/apks/." "$STAGE_PRIV/apks/"
+  cp "$PRIV_XML" "$STAGE_PRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
+
+  if [ "$PRIV_IS_TEST" = 1 ]; then
+    PRIV_NAME_SUFFIX="recorderpriv-TEST"
+    PRIV_VARIANT_ID="priv-TEST"
+    PRIV_SOURCE_NOTE="[TEST] 白名单来源：源码推导，未经设备验证"
+    PRIV_ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION-recorderpriv-TEST.zip"
+  else
+    PRIV_NAME_SUFFIX="recorderpriv"
+    PRIV_VARIANT_ID="priv"
+    PRIV_SOURCE_NOTE="白名单来源：目标设备实测权限转储"
+    PRIV_ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION-recorderpriv.zip"
+  fi
+
+  render_placeholder "$STAGE_PRIV/module.prop"   '__VERSION__'          "$VERSION"
+  render_placeholder "$STAGE_PRIV/module.prop"   '__VERSION_CODE__'     "$VERSION_CODE"
+  render_placeholder "$STAGE_PRIV/module.prop"   '__PRIV_NAME_SUFFIX__' "$PRIV_NAME_SUFFIX"
+  render_placeholder "$STAGE_PRIV/module.prop"   '__PRIV_SOURCE_NOTE__' "$PRIV_SOURCE_NOTE"
+  render_placeholder "$STAGE_PRIV/customize.sh"  '__APP_ENTRIES__'      "$ENTRY_LINES"
+  render_placeholder "$STAGE_PRIV/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
+  render_placeholder "$STAGE_PRIV/customize.sh"  '__PRIVAPP_PERMISSIONS_XML__' "$(cat "$PRIV_XML")"
+  render_placeholder "$STAGE_PRIV/uninstall.sh"  '__STOCK_PACKAGES__'   "$STOCK_LINES"
+  render_placeholder "$STAGE_PRIV/service.sh"    '__VERSION__'          "$VERSION"
+  render_placeholder "$STAGE_PRIV/service.sh"    '__VARIANT__'          "$PRIV_VARIANT_ID"
+
+  leftover_priv="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$STAGE_PRIV" || true)"
+  if [ -n "$leftover_priv" ]; then
+    die "特权变体模块内仍有未渲染的占位符,拒绝打包:
+$leftover_priv"
+  fi
+  chmod 0755 "$STAGE_PRIV"/*.sh "$STAGE_PRIV/META-INF/com/google/android/update-binary"
+fi
+
+# 5) 打包(单次构建同时产出普通版与特权变体双包,并写出指向普通版的 update.json)
 ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION.zip"
+UPDATE_JSON="$DIST_DIR/update.json"
 if [ "$NO_ZIP" = 1 ]; then
   info "--no-zip:已跳过打包,渲染结果在 $STAGE"
 else
   rm -f "$ZIP_OUT"
   ( cd "$STAGE" && zip -q -r9 "$ZIP_OUT" . )
-  info "模块包: $ZIP_OUT ($(wc -c < "$ZIP_OUT" | tr -d ' ') 字节)"
+  info "模块包(普通版): $ZIP_OUT ($(wc -c < "$ZIP_OUT" | tr -d ' ') 字节)"
+  if [ -n "$PRIV_ZIP_OUT" ]; then
+    rm -f "$PRIV_ZIP_OUT"
+    ( cd "$STAGE_PRIV" && zip -q -r9 "$PRIV_ZIP_OUT" . )
+    info "模块包(特权版): $PRIV_ZIP_OUT ($(wc -c < "$PRIV_ZIP_OUT" | tr -d ' ') 字节)"
+  fi
+  python3 - "$UPDATE_JSON" "$VERSION" "$VERSION_CODE" <<'PYU'
+import json, sys
+out_path, ver, vc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = {
+    "version": ver,
+    "versionCode": vc,
+    "zipUrl": f"https://github.com/gx-bangsong/GKUI-Pack/releases/download/{ver}/GKUI-Pack-{ver}.zip",
+    "changelog": "https://raw.githubusercontent.com/gx-bangsong/GKUI-Pack/main/docs/RELEASE-NOTES-v0.0.4.md",
+}
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+PYU
 fi
 
 # 6) 构建清单
@@ -1095,10 +1187,16 @@ if [ "$excluded_count" -gt 0 ]; then
   done < "$WORK/excluded.txt"
 fi
 printf '被跳过的条目(未参与构建):\n'
-apps_python --list 2>/dev/null | grep -E '^  \[跳过\] [a-z][a-z0-9_]*:' | sed 's/^/  /' || true
+skipped_lines="$(apps_python --list 2>/dev/null | grep -E '^  \[跳过\] [a-z][a-z0-9_]*:' | sed 's/^/  /' || true)"
+if [ -n "$skipped_lines" ]; then
+  printf '%s\n' "$skipped_lines"
+else
+  printf '  (无)\n'
+fi
 printf '报告: %s\n' "$REPORT"
 printf '清单: %s\n' "$MANIFEST"
 [ "$NO_ZIP" = 1 ] || printf '模块包: %s\n' "$ZIP_OUT"
+[ "$NO_ZIP" = 1 ] || [ -z "$PRIV_ZIP_OUT" ] || printf '特权包: %s\n' "$PRIV_ZIP_OUT"
 log ""
 printf '%s完成。%s模块为 coexist 模式:不替换、不修改任何 stock 应用。\n' "$C_GRN" "$C_RST"
 printf '提醒:模块与设备 /data 中已安装的同包名应用会冲突,刷入前请先按 README 处理(C8)。\n'
