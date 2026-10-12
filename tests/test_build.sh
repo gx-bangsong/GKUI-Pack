@@ -913,7 +913,7 @@ else
   bad "无设备处理异常(rc=$rc)"
 fi
 out="$(ADB_STUB_MODE=twodev ia 2>&1)"; rc=$?
-if [ $rc -eq 2 ] && printf '%s' "$out" | grep -q '多台设备'; then ok "多设备时要求 -s 指定"; else bad "多设备处理异常(rc=$rc)"; fi
+if [ $rc -eq 2 ] && printf '%s' "$out" | grep -q '多台设备'; then ok "多设备时要求 -s 指定"; else bad "多设备处理异常(rc=$rc)" ; fi
 mkdir -p "$WORK/noapk"
 out="$( cd "$WORK/repo" && env PATH="$WORK/bin:$PATH" APK_DIR="$WORK/noapk" bash scripts/install_all.sh 2>&1 )"; rc=$?
 if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'gh release download'; then
@@ -1228,6 +1228,9 @@ PYS
   rm -rf "$MODPRIV"
   mkdir -p "$MODPRIV"
   unzip -q "$ZIP_PRIV_TEST" -d "$MODPRIV"
+  # 模拟从普通版切到 TEST 版时目录中残留 system/app/GKUIRecorder,确认清理步骤会将其清除且不误删 priv-app 与 etc/permissions
+  mkdir -p "$MODPRIV/system/app/GKUIRecorder"
+  printf 'stale-normal\n' > "$MODPRIV/system/app/GKUIRecorder/GKUIRecorder.apk"
   out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODPRIV" FAKE_PM_PKG="__none__" \
           FAKE_PM_MODE="absent" sh "$MODPRIV/customize.sh" 2>&1 )"; rc=$?
   if [ $rc -eq 0 ] \
@@ -1238,6 +1241,21 @@ PYS
     ok "TEST 版 customize.sh 将 GKUIRecorder 装入 system/priv-app 并写入 privapp 白名单 XML"
   else
     bad "TEST 版 customize.sh 落盘结果不符(rc=$rc)"; printf '%s\n' "$out" | tail -15
+  fi
+  if [ -f "$MODPRIV/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "TEST 版 customize.sh 执行后存在 \$MODPATH/system/priv-app/GKUIRecorder/GKUIRecorder.apk"
+  else
+    bad "TEST 版 customize.sh 执行后缺少 \$MODPATH/system/priv-app/GKUIRecorder/GKUIRecorder.apk"
+  fi
+  if [ -f "$MODPRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml" ]; then
+    ok "TEST 版 customize.sh 执行后存在 \$MODPATH/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
+  else
+    bad "TEST 版 customize.sh 执行后缺少 \$MODPATH/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
+  fi
+  if [ ! -e "$MODPRIV/system/app/GKUIRecorder" ]; then
+    ok "TEST 版 customize.sh 执行后 \$MODPATH/system/app/GKUIRecorder 不存在(防止同一个包装两份)"
+  else
+    bad "TEST 版 customize.sh 执行后仍残留 \$MODPATH/system/app/GKUIRecorder"
   fi
 fi
 
