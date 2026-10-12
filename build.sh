@@ -108,7 +108,14 @@ FIELDS = [
 #                    (system/app)纳入模块;缺省 / false 一律保持原有排除行为(fail-safe)。
 #   privileged_note  仅与 privileged_ack: true 搭配:写明这些权限拿不到的具体后果
 #                    (如"通话录音不会生效,需 priv 变体"),原样进入报告 / 清单 / 摘要。
-OPTIONAL_FIELDS = ["privileged_ack", "privileged_note"]
+OPTIONAL_FIELDS = [
+    "privileged_ack",
+    "privileged_note",
+    "previous_release_tag",
+    "previous_asset_name",
+    "previous_sha256",
+    "previous_signer_sha256",
+]
 ALL_FIELDS = FIELDS + OPTIONAL_FIELDS
 REQUIRED = [
     "id", "name", "application_id", "stock_package", "repo", "upstream", "license",
@@ -445,7 +452,7 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
                 errors.append(
                     "%s: application_id 与 stock_package 相同(%s);coexist 模式要求两者不同(C2)" % (eid, aid)
                 )
-        for key in ("sha256", "signer_sha256"):
+        for key in ("sha256", "signer_sha256", "previous_sha256", "previous_signer_sha256"):
             val = entry.get(key)
             if isinstance(val, str) and not is_todo(val) and not RE_HEX64.match(norm_hex(val)):
                 errors.append("%s: %s 必须是 64 位小写 hex(当前为 %r)" % (eid, key, val))
@@ -989,22 +996,32 @@ mkdir -p "$STAGE/apks"
 cp -a "$ROOT/module/." "$STAGE/"
 
 ENTRY_LINES=""
+PREDECESSOR_LINES=""
 STOCK_LINES=""
 while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET _PRIV _NOTE; do
   [ -n "$APP_ID" ] || continue
   cp "$WORK/apks/$APP_NAME.apk" "$STAGE/apks/$APP_NAME.apk"
   ENTRY_LINES="${ENTRY_LINES}${APP_PKG}|${APP_NAME}|${APK_SHA}"$'\n'
+  prev_tag="$(entry_field "$APP_ID" previous_release_tag)"
+  prev_sha="$(entry_field "$APP_ID" previous_sha256)"
+  prev_signer="$(entry_field "$APP_ID" previous_signer_sha256)"
+  curr_tag="$(entry_field "$APP_ID" release_tag)"
+  if [ -n "$prev_tag" ] || [ -n "$prev_sha" ] || [ -n "$prev_signer" ]; then
+    PREDECESSOR_LINES="${PREDECESSOR_LINES}${APP_PKG}|${APP_NAME}|${prev_tag}|$(norm_hex "$prev_sha")|$(norm_hex "$prev_signer")|${curr_tag}"$'\n'
+  fi
   case "$(printf '%s\n' "$STOCK_LINES")" in
     *"$STOCK_PKG"*) : ;;
     *) STOCK_LINES="${STOCK_LINES}${STOCK_PKG}"$'\n' ;;
   esac
 done < "$WORK/included.txt"
 ENTRY_LINES="${ENTRY_LINES%$'\n'}"
+PREDECESSOR_LINES="${PREDECESSOR_LINES%$'\n'}"
 STOCK_LINES="${STOCK_LINES%$'\n'}"
 
 render_placeholder "$STAGE/module.prop"   '__VERSION__'      "$VERSION"
 render_placeholder "$STAGE/module.prop"   '__VERSION_CODE__' "$VERSION_CODE"
 render_placeholder "$STAGE/customize.sh"  '__APP_ENTRIES__'  "$ENTRY_LINES"
+render_placeholder "$STAGE/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
 render_placeholder "$STAGE/uninstall.sh"  '__STOCK_PACKAGES__' "$STOCK_LINES"
 
 leftover="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$STAGE" || true)"

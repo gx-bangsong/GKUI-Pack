@@ -70,6 +70,12 @@ APP_ENTRIES="
 __APP_ENTRIES__
 "
 
+# 已登记的前驱版本(用于检测跨版本签名断裂,如 GKUIRecorder beta2 → beta3)
+# 格式: <application_id>|<目录名>|<前驱标签>|<前驱 APK sha256>|<前驱签名 sha256>|<当前目标标签>
+PREDECESSOR_ENTRIES="
+__PREDECESSOR_ENTRIES__
+"
+
 if [ -z "$(printf '%s' "$APP_ENTRIES" | tr -d ' \n')" ]; then
   ui_print "!! 模块内没有应用清单:这个 zip 不是在仓库里用 build.sh 构建的。"
   ui_print "!! 请执行  bash build.sh  生成 dist/GKUI-Pack-*.zip 后重新刷入。"
@@ -129,24 +135,79 @@ if ! "$PM_BIN" list packages >/dev/null 2>&1; then
 fi
 
 # -----------------------------------------------------------------------------
-# 4) C8:与 /data 用户空间中的同包名应用冲突检查
-#    任一命中 → 中止整个安装(禁止模块自行卸载)
-#    /system 已有同包名 → 视为模块已生效,该条目跳过
+# 4) C8:与 /data 用户空间中的同包名应用冲突检查及跨版本签名断裂保护
+#    - 已安装 APK 字节与目标 sha256 一致时可正常接管;
+#    - 检测到 beta2 → beta3 签名变更时,整包中止并给出明确指引
+#      (备份 → 手动卸载或删旧模块 → 重启),严禁自动卸载或写 /data;
+#    - 其余 /data 同包名应用 → 中止整个安装(禁止模块自行卸载);
+#    - 其余 /system 已有同包名 → 视为模块已生效,该条目跳过。
 # -----------------------------------------------------------------------------
-ui_print "- 检查 /data 用户空间中的同包名应用(C8):"
+ui_print "- 检查 /data 用户空间中的同包名应用与签名一致性(C8):"
 CONFLICT=""
+SIG_CONFLICT=""
+SIG_TRANSITION=""
+SIG_PATH=""
 SKIP_LIST="|"
 while IFS='|' read -r PKG DIR APK_SHA; do
   [ -n "$PKG" ] || continue
   [ -n "$DIR" ] || continue
+
+  PRED_TAG=""
+  PRED_SHA=""
+  PRED_SIGNER=""
+  TARGET_TAG=""
+  while IFS='|' read -r P_PKG _P_DIR P_TAG P_SHA P_SIGNER P_CURR; do
+    [ -n "$P_PKG" ] || continue
+    [ "$P_PKG" = "$PKG" ] || continue
+    PRED_TAG="$P_TAG"
+    PRED_SHA="$P_SHA"
+    PRED_SIGNER="$P_SIGNER"
+    TARGET_TAG="$P_CURR"
+  done <<EOF
+$PREDECESSOR_ENTRIES
+EOF
+
   PATHS="$("$PM_BIN" path "$PKG" 2>/dev/null)"
+  if [ -z "$PATHS" ] && [ -n "${EXISTING_MODDIR:-}" ] && [ -f "$EXISTING_MODDIR/system/app/$DIR/$DIR.apk" ]; then
+    PATHS="package:$EXISTING_MODDIR/system/app/$DIR/$DIR.apk"
+  fi
   if [ -z "$PATHS" ]; then
     ui_print "    [ok] $PKG 未安装,可安全挂载"
     continue
   fi
   HIT_DATA=""
   HIT_SYSTEM=""
+  HIT_ADOPT=""
+  HIT_SIG=""
   while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    clean_p="${p#package:}"
+    INST_SHA=""
+    if [ -n "${FAKE_PM_SHA256:-}" ] && [ "$PKG" = "${FAKE_PM_PKG:-}" ]; then
+      INST_SHA="$FAKE_PM_SHA256"
+    elif [ -f "$clean_p" ] && command -v sha256sum >/dev/null 2>&1; then
+      INST_SHA="$(sha256sum "$clean_p")"
+      INST_SHA="${INST_SHA%% *}"
+    fi
+    INST_SIGNER=""
+    if [ -n "${FAKE_PM_SIGNER:-}" ] && [ "$PKG" = "${FAKE_PM_PKG:-}" ]; then
+      INST_SIGNER="$FAKE_PM_SIGNER"
+    fi
+
+    # 1) 检查是否命中已登记前驱(如 beta2 → beta3 签名断裂)
+    if { [ -n "$PRED_SHA" ] && [ -n "$INST_SHA" ] && [ "$INST_SHA" = "$PRED_SHA" ]; } || \
+       { [ -n "$PRED_SIGNER" ] && [ -n "$INST_SIGNER" ] && [ "$INST_SIGNER" = "$PRED_SIGNER" ]; } || \
+       { [ -n "$PRED_SHA" ] && [ -n "$INST_SHA" ] && [ "$INST_SHA" != "$APK_SHA" ]; }; then
+      HIT_SIG="$clean_p"
+      break
+    fi
+
+    # 2) 已安装 APK 字节与目标 sha256 一致时可正常接管
+    if [ -n "$INST_SHA" ] && [ "$INST_SHA" = "$APK_SHA" ]; then
+      HIT_ADOPT="$clean_p"
+      continue
+    fi
+
     case "$p" in
       package:/data/*|/data/*) HIT_DATA="$p" ;;
       package:/system/*|/system/*) HIT_SYSTEM="$p" ;;
@@ -155,9 +216,23 @@ while IFS='|' read -r PKG DIR APK_SHA; do
   done <<EOF
 $PATHS
 EOF
+  if [ -n "$HIT_SIG" ]; then
+    trans="${PRED_TAG:-旧版} → ${TARGET_TAG:-新版}"
+    ui_print "    [签名变更] $PKG ($DIR) 检测到 $trans 签名不一致: $HIT_SIG"
+    if [ -z "$SIG_CONFLICT" ]; then
+      SIG_CONFLICT="$PKG"
+      SIG_TRANSITION="$trans"
+      SIG_PATH="$HIT_SIG"
+    fi
+    continue
+  fi
   if [ -n "$HIT_DATA" ]; then
     ui_print "    [冲突] $PKG 已安装于用户空间: $HIT_DATA"
     [ -n "$CONFLICT" ] || CONFLICT="$PKG"
+    continue
+  fi
+  if [ -n "$HIT_ADOPT" ]; then
+    ui_print "    [接管] $PKG 已安装 APK 字节与目标 sha256 一致($HIT_ADOPT),可正常接管"
     continue
   fi
   if [ -n "$HIT_SYSTEM" ]; then
@@ -170,7 +245,25 @@ done <<EOF
 $APP_ENTRIES
 EOF
 
+if [ -n "$SIG_CONFLICT" ]; then
+  rm -rf "$MODPATH/system" "$MODPATH/apks" 2>/dev/null
+  ui_print ""
+  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  ui_print "检测到 $SIG_CONFLICT 存在跨版本签名变更($SIG_TRANSITION)!"
+  ui_print "已安装路径: $SIG_PATH"
+  ui_print "直接覆盖会导致系统因签名不一致(INSTALL_FAILED_UPDATE_INCOMPATIBLE)拒绝加载该应用。"
+  ui_print "请按以下步骤手动处理后再刷入:"
+  ui_print "  1. 备份:先备份该应用内的重要数据(如录音机已录制的音频文件);"
+  ui_print "  2. 手动卸载或删旧模块:在「设置 → 应用」中手动卸载(或执行 \`pm uninstall $SIG_CONFLICT\`),"
+  ui_print "     若来自旧版模块则在管理器中删除旧模块;"
+  ui_print "  3. 重启:重启手机后,再重新刷入本模块。"
+  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  ui_print "本模块严禁自动卸载或写 /data:所有卸载与清理必须由你手动完成。"
+  abort "安装中止:检测到 $SIG_TRANSITION 签名变更(C8)"
+fi
+
 if [ -n "$CONFLICT" ]; then
+  rm -rf "$MODPATH/system" "$MODPATH/apks" 2>/dev/null
   ui_print ""
   ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
   ui_print "检测到 $CONFLICT 已安装于用户空间。请先 \`pm uninstall $CONFLICT\`"

@@ -347,7 +347,8 @@ say ""
 say "### G3 权限清单"
 REQUESTED="$(printf '%s\n' "$BADGING" \
   | grep -E "^uses-permission(-sdk-[0-9]+)?: name=" \
-  | sed -n "s/.*name='\([^']*\)'.*/\1/p" || true)"
+  | sed -n "s/.*name='\([^']*\)'.*/\1/p" \
+  | awk 'NF && !seen[$0]++' || true)"
 REQ_COUNT="$(printf '%s' "$REQUESTED" | grep -c . || true)"
 say "  申请权限共 $REQ_COUNT 项"
 # 资产级 sha256(仅当输入文件正是 Release 资产本身时可比对;
@@ -437,14 +438,41 @@ else
   say_ok "申请清单未命中平台签名/特权权限(ADVISORY_LIST $(printf '%s\n' "$ADVISORY_LIST" | grep -c .) 条)"
 fi
 
+# 提取本 APK 在 AndroidManifest.xml 中自声明的 <permission android:name="..."> 名称列表
+# (供 privapp 白名单生成器判别"APK 自声明且在自身包名命名空间内"与"跨命名空间自声明 fail-closed")
+DECLARED_PERM_NAMES="$(printf '%s\n' "$XMLTREE" | awk '
+  /^[[:space:]]*E:[[:space:]]*permission([[:space:]]|\()/ {
+    in_perm = 1
+    next
+  }
+  /^[[:space:]]*E:[[:space:]]/ {
+    in_perm = 0
+  }
+  in_perm && /android:name\(/ {
+    if (match($0, /"[^"]+"/)) {
+      name = substr($0, RSTART + 1, RLENGTH - 2)
+      if (name != "" && !seen[name]++) print name
+    }
+  }
+' || true)"
+
 # 仅报告:本 APK 声明的自定义权限的 protectionLevel(原始值 + 解码)
 DECLARED_PERMS="$(printf '%s\n' "$XMLTREE" | grep -i 'protectionLevel' | sed 's/^[[:space:]]*//' || true)"
-if [ -n "$DECLARED_PERMS" ]; then
-  say "  本 APK 声明的自定义权限 protectionLevel(原始值 + 解码,仅参考,不影响退出码):"
-  while IFS= read -r pline; do
-    [ -n "$pline" ] || continue
-    say "      $pline  → $(describe_protection_level "$pline")"
-  done <<< "$DECLARED_PERMS"
+if [ -n "$DECLARED_PERMS" ] || [ -n "$DECLARED_PERM_NAMES" ]; then
+  if [ -n "$DECLARED_PERM_NAMES" ]; then
+    say "  本 APK 声明的自定义 <permission> 名称:"
+    while IFS= read -r dname; do
+      [ -n "$dname" ] || continue
+      say "      - $dname"
+    done <<< "$DECLARED_PERM_NAMES"
+  fi
+  if [ -n "$DECLARED_PERMS" ]; then
+    say "  本 APK 声明的自定义权限 protectionLevel(原始值 + 解码,仅参考,不影响退出码):"
+    while IFS= read -r pline; do
+      [ -n "$pline" ] || continue
+      say "      $pline  → $(describe_protection_level "$pline")"
+    done <<< "$DECLARED_PERMS"
+  fi
 else
   say "  未声明自定义 <permission>(无 protectionLevel 条目)"
 fi
@@ -632,6 +660,8 @@ data = {
     "signer_count": "$SIGNER_COUNT",
     "shared_user_id_detected": $(printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && echo True || echo False),
     "privileged_request_detected": $([ -n "$ADVISORY_HITS" ] && echo True || echo False),
+    "requested_permissions": [$(printf '%s\n' "$REQUESTED" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
+    "declared_permissions": [$(printf '%s\n' "$DECLARED_PERM_NAMES" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
     "privileged_permissions": [$(printf '%s\n' "$ADVISORY_HITS" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
     "privileged_ack": $([ "$E_ACK" = "true" ] && echo True || echo False),
     "privileged_note": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$E_ACK_NOTE"),
