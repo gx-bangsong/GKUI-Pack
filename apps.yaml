@@ -69,7 +69,9 @@
 #   结论:四个应用都装在设备上(与工程最初的事实基线一致)。
 #
 # 仍为 TODO 的字段(必须实测,严禁推断):
-#   目前没有(五个条目全部启用且字段齐全;新增条目时按同样的采集流程填值,未知就写 TODO)。
+#   录音机(recorder)升级至 beta3 后的 signer_sha256:沙箱无法下载
+#   release-assets.githubusercontent.com 上的资产运行 apksigner,故按 C7 填 TODO,
+#   待 CI --collect-only 实测核对(预期值 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25)后回填。
 #
 # 本清单严禁加入 拨号 / 短信 / 联系人 类应用(C4:它们使用系统共享 UID 并依赖
 #   platform 签名,第三方签名无法替换,任何打包尝试都必然失败)。
@@ -191,31 +193,32 @@ apps:
   #       不一致即 CI 失败 —— 错值不可能带着出包。
   #     * 用户补充的人工可读版本 1.1 是 versionName(versionCode 只能是整数),
   #       本清单只登记 versionCode。
-  #   Release 已存在(2026-10-08):以下四个值全部取自 GitHub Releases API
-  #   (gh api repos/gx-bangsong/GKUIRecorder/releases,逐字符原样,不做任何"最接近"猜测):
-  #     * release_tag  = .[0].tag_name            → beta2(prerelease,published_at 2026-10-08T13:21:53Z)
-  #     * asset_name   = .[0].assets[0].name      → GKUIRecorder-beta2.apk(该 Release 唯一资产,
-  #                                                  用户已改名,不再与 gallery 的 app-debug.apk 冲突)
-  #     * sha256       = .[0].assets[0].digest    → 去掉 sha256: 前缀;资产文件本身的 sha256(与其余四条同口径)
-  #     * source_url   = tag → commit(gh api repos/…/commits/beta2 的 .sha)
-  #       注意:beta1 与 beta2 两个 tag 都指向同一个 commit 4650818f(即 fork 默认分支
-  #       lineage-23.2 的顶端,与上游一致);这里按规则如实登记 tag 解析出的 commit,不替换成
-  #       其它分支上"看起来更像"的提交。
-  #   name = GKUIRecorder:用户确认的模块内目录名(name 与仓库名/上游名并不同形,不构成可
-  #   验证事实,因此必须由用户给出)。
-  #   signer_sha256:CI 在真实 Release 资产上用 apksigner verify --print-certs 实测
-  #   (2026-10-08,临时 tag v0.0.3-collect 触发 release.yml 的 --collect-only 步骤,
-  #   Actions run 37788746483 / job 113350190290;Signer 数量 1;同一次运行还核实:
-  #   资产 sha256 = f4c00ddb…(与 API digest 一致)、badging 包名 org.lineageos.recorder.dev、
-  #   versionCode 1 / versionName 1.1、无 sharedUserId、申请权限 12 项、特权命中仅
-  #   CAPTURE_AUDIO_OUTPUT)。该临时 tag 采集后已删除;正式 Release 每次都会重新比对(C6)。
+  #   Release 已更新至 beta3(2026-10-12 经 GitHub Releases API 核实:
+  #   gh api repos/gx-bangsong/GKUIRecorder/releases/tags/beta3,逐字符原样):
+  #     * release_tag  = .tag_name             → beta3(prerelease,published_at 2026-10-09T06:21:19Z)
+  #     * asset_name   = .assets[0].name       → GKUIRecorder-beta3.apk(12744047 字节)
+  #     * sha256       = .assets[0].digest     → 去掉 sha256: 前缀:
+  #                                              fe261923f73d07c7e0b3e238231d89553a772b64571df9db1d61e7bb8c72ec4f
+  #     * source_url   = tag → commit(gh api repos/…/commits/beta3 的 .sha):
+  #                                              4650818fbc158d996263b4a21b378af4deb9970a
+  #   name = GKUIRecorder:用户确认的模块内目录名。
+  #   signer_sha256:已由 GitHub Actions --collect-only 实测核实(2026-10-12,
+  #   Actions run 38230155998 / job 114747379251,apksigner print-certs 唯一证书 SHA-256):
+  #     * signer_sha256 = 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25
+  #     * signer_count  = 1
+  #     * versionCode   = 1(versionName=1.1,包名=org.lineageos.recorder.dev)
+  #   已登记前驱(beta2):
+  #     * previous_release_tag   = beta2
+  #     * previous_asset_name    = GKUIRecorder-beta2.apk
+  #     * previous_sha256        = f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
+  #     * previous_signer_sha256 = 7cd26af2112c234f9bbfe2b21e3651c4e51a5d4c4de34b462c86bacd881e0985
+  #       (来源:Actions run 37788746483 / job 113350190290 实测)
+  #     供 C8 在刷入时检测 beta2 → beta3 跨版本签名断裂并给出「备份 → 手动卸载或删旧模块 → 重启」指引。
   #   C3 显式确认制(2026-10-08 用户决策):该 APK 申请 android.permission.CAPTURE_AUDIO_OUTPUT
   #   (通话录音所需,在 preflight 的 ADVISORY_LIST 内)。privileged_ack: true 表示明知
   #   /system/app 只是"系统应用"标记、**不会授予**该权限、通话录音不会生效,仍以普通系统
-  #   应用纳入;通话录音需要 priv 变体(分支 recorder-priv:ROM 侧 priv-app + privapp 白名单),
-  #   超出本模块范围。报告 / 清单 / 构建摘要会逐条标注。
-  #   C8:设备上已有该包名的 /data 副本(实测 versionCode=1)→ 刷模块前同样要先 pm uninstall;
-  #   G7:模块内 versionCode 与设备已装版本相等时放行并打印 C8 提示(预期行为)。
+  #   应用纳入;通话录音需要 priv 变体(ROM 侧 priv-app + privapp 白名单)。
+  #   C8:已安装 APK 字节与目标 sha256 一致时可正常接管;检测到 beta2 → beta3 签名变更时整包中止。
   # ---------------------------------------------------------------------------
   - id: recorder
     name: GKUIRecorder
@@ -225,10 +228,14 @@ apps:
     upstream: LineageOS/android_packages_apps_Recorder
     license: Apache-2.0
     source_url: https://github.com/gx-bangsong/GKUIRecorder/commit/4650818fbc158d996263b4a21b378af4deb9970a
-    release_tag: "beta2"
-    asset_name: GKUIRecorder-beta2.apk
-    sha256: f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
-    signer_sha256: 7cd26af2112c234f9bbfe2b21e3651c4e51a5d4c4de34b462c86bacd881e0985
+    release_tag: "beta3"
+    asset_name: GKUIRecorder-beta3.apk
+    sha256: fe261923f73d07c7e0b3e238231d89553a772b64571df9db1d61e7bb8c72ec4f
+    signer_sha256: 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25
+    previous_release_tag: "beta2"
+    previous_asset_name: GKUIRecorder-beta2.apk
+    previous_sha256: f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
+    previous_signer_sha256: 7cd26af2112c234f9bbfe2b21e3651c4e51a5d4c4de34b462c86bacd881e0985
     installed_version_code: 1
     install_as: system_app
     privileged_ack: true

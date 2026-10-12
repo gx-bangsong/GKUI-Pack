@@ -53,7 +53,9 @@ cp "$REPO_ROOT/build.sh" "$WORK/repo/build.sh"
 cp "$REPO_ROOT/apps.yaml" "$WORK/repo/apps.yaml"
 cp -a "$REPO_ROOT/scripts" "$WORK/repo/scripts"
 cp -a "$REPO_ROOT/module" "$WORK/repo/module"
-chmod +x "$WORK/repo/scripts/"*.sh "$WORK/repo/build.sh"
+cp -a "$REPO_ROOT/module-priv" "$WORK/repo/module-priv"
+cp -a "$REPO_ROOT/device" "$WORK/repo/device"
+chmod +x "$WORK/repo/scripts/"*.sh "$WORK/repo/scripts/"*.py "$WORK/repo/build.sh"
 
 # -----------------------------------------------------------------------------
 # 1) 桩工具:aapt / apksigner / pm
@@ -95,9 +97,15 @@ case "${1:-}" in
       # 标记 #decl → 自声明一项 signature 级权限(真实 aapt 是数值形式!
       # 早期用关键字匹配的实现在这里永远命中不了,故专门覆盖)
       if grep -q '^#decl$' "$apk"; then
+        pkg="$(sed -n '1p' "$apk")"
         echo "  E: permission (line=1)"
-        echo "    A: android:name(0x01010003)=\"com.example.stub.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\" (Raw: \"com.example.stub.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\")"
+        echo "    A: android:name(0x01010003)=\"${pkg}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\" (Raw: \"${pkg}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\")"
         echo "    A: android:protectionLevel(0x01010009)=(type 0x11)0x12"
+      fi
+      if grep -q '^#decl-foreign$' "$apk"; then
+        echo "  E: permission (line=2)"
+        echo "    A: android:name(0x01010003)=\"com.other.foreign.EVIL_PERMISSION\" (Raw: \"com.other.foreign.EVIL_PERMISSION\")"
+        echo "    A: android:protectionLevel(0x01010009)=(type 0x11)0x2"
       fi
       # 标记 #auth → provider authorities(类型化值 + (Raw: ...) 会各出现一次,
       # 报告必须去重,否则每条 authority 都打印两遍)
@@ -189,8 +197,13 @@ build_assets() { # $1=APK_DIR $2=是否让 clock 申请 privileged 权限 $3=cal
   make_fake_apk "$tmp/ExactCalculator-debug.apk" "com.android.calculator2.dev" "70000" "$SIGNER_CALC" "" "0"
   ( cd "$tmp" && zip -q "$d/ExactCalculator-debug.apk.zip" "ExactCalculator-debug.apk" )
   make_fake_apk "$d/DeskClock-debug.apk" "com.android.deskclock.dev" "80000" "$SIGNER_CLOCK" "" "$priv"
-  # 录音机:模块内 versionCode 90000 > 夹具安装值 89999 → G7 放行
-  make_fake_apk "$d/$ASSET_REC" "org.lineageos.recorder.dev" "90000" "$SIGNER_REC" "" "0"
+  # 录音机:模块内 versionCode 90000 > 夹具安装值 89999 → G7 放行;
+  # 模拟真实 GKUIRecorder-beta3 的权限结构(含 CAPTURE_AUDIO_OUTPUT、REQUEST_INSTALL_PACKAGES 与包内自声明权限)
+  make_fake_apk "$d/$ASSET_REC" "org.lineageos.recorder.dev" "90000" "$SIGNER_REC" \
+"uses-permission: name='android.permission.CAPTURE_AUDIO_OUTPUT'
+uses-permission: name='android.permission.REQUEST_INSTALL_PACKAGES'
+uses-permission: name='org.lineageos.recorder.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+#decl" "0"
 }
 
 # 把 workspace 里的 apps.yaml 补齐(sha256 按真实假 APK 计算,签名/版本按夹具)
@@ -217,6 +230,7 @@ for blk in blocks[1:]:
         # 刻意**不改写** application_id:让 preflight 的 G1 拿假 APK 里的包名与
         # apps.yaml 的真实值比对,从而顺带验证 G1 本身是否生效
         lines = [re.sub(r"^    signer_sha256: .*", "    signer_sha256: " + signer, ln) if ln.startswith("    signer_sha256: ") else ln for ln in lines]
+        lines = [re.sub(r"^    confidence: .*", "    confidence: confirmed", ln) if ln.startswith("    confidence: ") else ln for ln in lines]
         lines = [re.sub(r"^    installed_version_code: .*", "    installed_version_code: " + str(int(vc) - 1), ln) if ln.startswith("    installed_version_code: ") else ln for ln in lines]
         asset = ""
         for ln in lines:
@@ -240,15 +254,39 @@ run_build() { # $1=工作区repo $2=APK_DIR $3=dist $4...=额外参数与环境(
 }
 
 # -----------------------------------------------------------------------------
-head1 "1) 真实仓库状态:五个应用字段已齐全(recorder 已启用)"
+head1 "1) 真实仓库状态:五个应用(recorder 已切至 beta3)"
 # -----------------------------------------------------------------------------
+pending_todos="$(python3 - "$REPO_ROOT" <<'PYP'
+import json, subprocess, sys
+out = subprocess.run(["bash", "build.sh", "--dump-apps-json"], cwd=sys.argv[1],
+                     capture_output=True, text=True).stdout
+apps = json.loads(out)["apps"]
+print(sum(1 for a in apps if a.get("_enabled") and a.get("_todo_fields")))
+PYP
+)"
 out="$(cd "$REPO_ROOT" && bash build.sh --check 2>&1)"; rc=$?
-if [ $rc -eq 0 ]; then ok "bash build.sh --check 通过(rc=0):启用条目已无 TODO"; else bad "字段已齐全却未通过校验(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
-if printf '%s' "$out" | grep -qE '(\[纳入构建\]|\[跳过\]).*recorder'; then ok "报告里 recorder 状态被显式打印"; else bad "未打印 recorder 状态"; fi
-if (cd "$REPO_ROOT" && bash build.sh --check --strict >/dev/null 2>&1); then
-  ok "--strict 下真实清单通过(五个应用已无 TODO)"
+if [ "$pending_todos" -gt 0 ]; then
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'signer_sha256 为 TODO'; then
+    ok "真实清单处于 beta3 signer 待采集态(C7 按预期拦截 TODO,rc=$rc)"
+  else
+    bad "真实清单含 TODO 却未按 C7 拦截(rc=$rc)"; printf '%s\n' "$out" | tail -20
+  fi
 else
-  bad "真实清单 --strict 应通过(已无 TODO)"
+  if [ $rc -eq 0 ]; then ok "bash build.sh --check 通过(rc=0):启用条目已无 TODO"; else bad "字段已齐全却未通过校验(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
+fi
+if printf '%s' "$out" | grep -qE '(\[纳入构建\]|\[跳过\]|recorder).*'; then ok "报告里 recorder 状态被显式打印"; else bad "未打印 recorder 状态"; fi
+if [ "$pending_todos" -gt 0 ]; then
+  if (cd "$REPO_ROOT" && bash build.sh --check --strict >/dev/null 2>&1); then
+    bad "--strict 下含 TODO 的真实清单竟通过(违反 C7)"
+  else
+    ok "--strict 下含 TODO 的真实清单按预期失败(C7)"
+  fi
+else
+  if (cd "$REPO_ROOT" && bash build.sh --check --strict >/dev/null 2>&1); then
+    ok "--strict 下真实清单通过(五个应用已无 TODO)"
+  else
+    bad "真实清单 --strict 应通过(已无 TODO)"
+  fi
 fi
 # C7 的反向验证:启用条目里注入一个 TODO 后必须失败
 # (真实仓库已填齐,所以这里显式造出 C7 场景,避免该规则失去覆盖)
@@ -347,7 +385,18 @@ head1 "4) 完整构建:生成模块 zip 并检查其内容"
 # -----------------------------------------------------------------------------
 out="$(run_build "$WORK/repo" "$WORK/apks" "$WORK/dist" 2>&1)"; rc=$?
 ZIP="$WORK/dist/GKUI-Pack-test-1.zip"
+ZIP_PRIV_TEST="$WORK/dist/GKUI-Pack-test-1-recorderpriv-TEST.zip"
 if [ $rc -eq 0 ] && [ -f "$ZIP" ]; then ok "构建成功并生成 $(basename "$ZIP")"; else bad "构建失败(rc=$rc)"; printf '%s\n' "$out" | tail -30; fi
+if [ -f "$ZIP_PRIV_TEST" ]; then
+  ok "单次构建同时生成特权测试包 GKUI-Pack-test-1-recorderpriv-TEST.zip"
+else
+  bad "未生成 GKUI-Pack-test-1-recorderpriv-TEST.zip"
+fi
+if printf '%s' "$out" | grep -A1 '被跳过的条目(未参与构建):' | grep -q '  (无)'; then
+  ok "无跳过条目时打印 '  (无)'"
+else
+  bad "无跳过条目时未打印 '  (无)'"
+fi
 if [ -f "$ZIP" ]; then
   listing="$(unzip -l "$ZIP" | awk '{print $4}')"
   for need in module.prop customize.sh post-fs-data.sh service.sh uninstall.sh \
@@ -658,6 +707,52 @@ if [ -f "$ZIP" ]; then
   else
     bad "未渲染的模块未拒绝安装(rc=$rc)"
   fi
+
+  # 8.7 C8:已安装 APK 字节与目标 sha256 一致时可正常接管
+  MODADOPT="$WORK/modadopt"
+  stage_module "$MODADOPT"
+  REC_TARGET_SHA="$(sha256sum "$MODADOPT/apks/GKUIRecorder.apk" | awk '{print $1}')"
+  out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODADOPT" \
+          FAKE_PM_PKG="org.lineageos.recorder.dev" FAKE_PM_MODE="data" \
+          FAKE_PM_SHA256="$REC_TARGET_SHA" sh "$MODADOPT/customize.sh" 2>&1 )"; rc=$?
+  if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q '\[接管\].*org.lineageos.recorder.dev'; then
+    ok "C8:已安装 APK 字节与目标 sha256 一致时正常接管(rc=0)"
+  else
+    bad "C8:字节与目标 sha256 一致却未能正常接管(rc=$rc)"; printf '%s\n' "$out" | tail -15
+  fi
+  if [ -f "$MODADOPT/system/app/GKUIRecorder/GKUIRecorder.apk" ]; then
+    ok "C8:接管后 GKUIRecorder.apk 正常落盘"
+  else
+    bad "C8:接管后缺少 GKUIRecorder.apk"
+  fi
+
+  # 8.8 C8:检测到 beta2 → beta3 签名变更时整包中止并给出三步指引(备份 → 手动卸载或删旧模块 → 重启)
+  MODSIG="$WORK/modsig"
+  stage_module "$MODSIG"
+  out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODSIG" \
+          FAKE_PM_PKG="org.lineageos.recorder.dev" FAKE_PM_MODE="data" \
+          FAKE_PM_SHA256="f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f" \
+          sh "$MODSIG/customize.sh" 2>&1 )"; rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'beta2 → beta3'; then
+    ok "C8:检测到 beta2 → beta3 签名变更时整包中止(rc=$rc)"
+  else
+    bad "C8:beta2 → beta3 签名变更未中止或缺少版本标记(rc=$rc)"; printf '%s\n' "$out" | tail -15
+  fi
+  if printf '%s' "$out" | grep -q '备份' && printf '%s' "$out" | grep -q '手动卸载或删旧模块' && printf '%s' "$out" | grep -q '重启'; then
+    ok "C8:签名断裂提示含完整三步指引(备份 → 手动卸载或删旧模块 → 重启)"
+  else
+    bad "C8:签名断裂提示缺少三步指引"
+  fi
+  if printf '%s' "$out" | grep -q '严禁自动卸载或写 /data'; then
+    ok "C8:明确声明严禁自动卸载或写 /data"
+  else
+    bad "C8:未声明严禁自动卸载或写 /data"
+  fi
+  if [ ! -d "$MODSIG/system" ]; then
+    ok "C8:签名变更中止后未留下任何 system/ 挂载内容"
+  else
+    bad "C8:签名变更中止后仍残留 system/ 目录"
+  fi
 else
   bad "第 4 步未产出 zip,跳过 C8 测试"
 fi
@@ -904,16 +999,25 @@ for app in data["apps"]:
         # 设计要点:断言写成**不变量**(未证实 → 必须 unverified/禁用/不得指向官方包名/
         # 仍留 TODO),而不是"application_id 必须以 TODO 开头"。后者每回填一个实测字段
         # 就要连 CI 工作流一起改,而工作流只能由用户经网页编辑器落地 —— 徒增耦合。
+        signer_ok = (
+            app["signer_sha256"] == "10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25"
+            and app["confidence"] == "confirmed"
+        )
         ok = (app["application_id"] == "org.lineageos.recorder.dev"
               and app["application_id"] != app["stock_package"]
               and str(app["installed_version_code"]) == "1"
-              and app["confidence"] == "confirmed"
+              and app["release_tag"] == "beta3"
+              and app["asset_name"] == "GKUIRecorder-beta3.apk"
+              and app["sha256"] == "fe261923f73d07c7e0b3e238231d89553a772b64571df9db1d61e7bb8c72ec4f"
+              and app["previous_release_tag"] == "beta2"
+              and app["previous_sha256"] == "f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f"
+              and app["previous_signer_sha256"] == "7cd26af2112c234f9bbfe2b21e3651c4e51a5d4c4de34b462c86bacd881e0985"
               and app["_enabled"] is True
-              and not app["_todo_fields"])
+              and signer_ok)
         sys.exit(0 if ok else 1)
 sys.exit(1)
 PYEOF
-then ok "recorder:已启用且字段齐全(包名/versionCode 为设备实测值)"; else bad "recorder 条目不符合要求"; fi
+then ok "recorder:已切到 beta3 并保留 beta2 前驱(包名/versionCode/哈希/signer 已核实)"; else bad "recorder 条目不符合要求"; fi
 if grep -q '^\*.apk$' "$REPO_ROOT/.gitignore" && grep -q '^dist/$' "$REPO_ROOT/.gitignore" \
    && grep -q '^build/$' "$REPO_ROOT/.gitignore" && grep -q '^\*.keystore$' "$REPO_ROOT/.gitignore"; then
   ok ".gitignore 含 *.apk / dist/ / build/ / *.keystore"
@@ -958,6 +1062,345 @@ out="$(run_build "$WORK/repo" "$WORK/apks-nover" "$WORK/dist-nover2" 2>&1)"; rc=
 if [ $rc -eq 0 ]; then ok "设备上无副本 + APK 未声明 versionCode → 放行(无压制风险)"; else bad "该情形仍失败(rc=$rc)"; printf '%s\n' "$out" | tail -12; fi
 if printf '%s' "$out" | grep -q '不会被压制'; then ok "说明了为何放行(不会被压制)"; else bad "缺少放行理由"; fi
 mv "$WORK/repo/apps.yaml.bak" "$WORK/repo/apps.yaml"
+
+# -----------------------------------------------------------------------------
+head1 "12b) 路线 B:源码框架权限表与 privapp 白名单生成(generate-privapp-permissions.py)"
+# -----------------------------------------------------------------------------
+SRC_DUMP="$REPO_ROOT/device/framework-permissions.source.txt"
+if [ -f "$SRC_DUMP" ]; then
+  ok "device/framework-permissions.source.txt 存在"
+else
+  bad "缺少 device/framework-permissions.source.txt"
+fi
+if grep -q '^# Source-Repo: LineageOS/android_frameworks_base$' "$SRC_DUMP" \
+   && grep -q '^# Source-Branch-Or-Tag: lineage-23.2$' "$SRC_DUMP" \
+   && grep -q '^# Source-Commit: f4ed08a03b518772ba77c3c0a1b4185fa1712c9b$' "$SRC_DUMP"; then
+  ok "framework-permissions.source.txt 含完整源码可追溯头信息"
+else
+  bad "framework-permissions.source.txt 缺少源码可追溯头信息"
+fi
+decl_count="$(grep -c '^+ permission:' "$SRC_DUMP" || true)"
+uniq_count="$(grep '^+ permission:' "$SRC_DUMP" | sort -u | wc -l | tr -d ' ')"
+if [ "$decl_count" -eq 1079 ] && [ "$uniq_count" -eq 1059 ]; then
+  ok "framework-permissions.source.txt 含 1079 条声明与 1059 个唯一权限名"
+else
+  bad "framework-permissions.source.txt 声明/唯一权限数不符(实际=$decl_count/$uniq_count,期望=1079/1059)"
+fi
+if awk '/^\+ permission:android\.permission\.CAPTURE_AUDIO_OUTPUT$/{getline; if ($0 ~ /protectionLevel:signature\|privileged\|role/) ok=1} END{exit(ok?0:1)}' "$SRC_DUMP"; then
+  ok "CAPTURE_AUDIO_OUTPUT 的 protectionLevel 为 signature|privileged|role"
+else
+  bad "CAPTURE_AUDIO_OUTPUT 的 protectionLevel 不符合预期"
+fi
+
+# 构造 Recorder 真实权限形态的 preflight JSON:
+# - CAPTURE_AUDIO_OUTPUT (signature|privileged|role) → 应写入 XML
+# - REQUEST_INSTALL_PACKAGES (signature|appop) → 复合级别不含 privileged,不误判为纯 signature,不写入
+# - RECORD_AUDIO (dangerous|instant) → 不写入
+# - org.lineageos.recorder.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION (APK 自声明且在自身包名命名空间内) → 自动排除,不要求出现在框架权限表中
+cat > "$WORK/rec-pf-ok.json" <<'EOF'
+{
+  "app_id": "recorder",
+  "application_id": "org.lineageos.recorder.dev",
+  "requested_permissions": [
+    "android.permission.CAPTURE_AUDIO_OUTPUT",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
+    "org.lineageos.recorder.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+  ],
+  "declared_permissions": [
+    "org.lineageos.recorder.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+  ]
+}
+EOF
+out="$(python3 "$REPO_ROOT/scripts/generate-privapp-permissions.py" \
+  --dump "$SRC_DUMP" --app-json "$WORK/rec-pf-ok.json" --out "$WORK/privapp-ok.xml" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -f "$WORK/privapp-ok.xml" ]; then
+  ok "generate-privapp-permissions.py:自声明包内权限 + signature|appop + CAPTURE_AUDIO_OUTPUT 成功生成 XML"
+else
+  bad "generate-privapp-permissions.py 正常用例失败(rc=$rc)"; printf '%s\n' "$out"
+fi
+if grep -q '<permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />' "$WORK/privapp-ok.xml" \
+   && ! grep -q 'REQUEST_INSTALL_PACKAGES' "$WORK/privapp-ok.xml" \
+   && ! grep -q 'DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION' "$WORK/privapp-ok.xml" \
+   && ! grep -q 'RECORD_AUDIO' "$WORK/privapp-ok.xml"; then
+  ok "生成的白名单 XML 仅含含 privileged 的 CAPTURE_AUDIO_OUTPUT(排除自声明权限与 signature|appop)"
+else
+  bad "生成的白名单 XML 内容不符合预期"; cat "$WORK/privapp-ok.xml"
+fi
+
+# 包名命名空间外的自声明权限必须 fail-closed
+cat > "$WORK/rec-pf-foreign.json" <<'EOF'
+{
+  "app_id": "recorder",
+  "application_id": "org.lineageos.recorder.dev",
+  "requested_permissions": [
+    "android.permission.CAPTURE_AUDIO_OUTPUT",
+    "com.other.pkg.CUSTOM_PERM"
+  ],
+  "declared_permissions": [
+    "com.other.pkg.CUSTOM_PERM"
+  ]
+}
+EOF
+out="$(python3 "$REPO_ROOT/scripts/generate-privapp-permissions.py" \
+  --dump "$SRC_DUMP" --app-json "$WORK/rec-pf-foreign.json" --out "$WORK/privapp-foreign.xml" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && [ ! -f "$WORK/privapp-foreign.xml" ] && printf '%s' "$out" | grep -q 'fail-closed'; then
+  ok "包名命名空间外的自声明权限触发 fail-closed 且不产出 XML"
+else
+  bad "跨包名自声明权限未被 fail-closed 拦截(rc=$rc)"; printf '%s\n' "$out"
+fi
+
+# 纯 signature 权限必须 fail-closed
+cat > "$WORK/rec-pf-puresig.json" <<'EOF'
+{
+  "app_id": "recorder",
+  "application_id": "org.lineageos.recorder.dev",
+  "requested_permissions": [
+    "android.permission.CAPTURE_AUDIO_OUTPUT",
+    "android.permission.CONFIRM_FULL_BACKUP"
+  ],
+  "declared_permissions": []
+}
+EOF
+out="$(python3 "$REPO_ROOT/scripts/generate-privapp-permissions.py" \
+  --dump "$SRC_DUMP" --app-json "$WORK/rec-pf-puresig.json" --out "$WORK/privapp-puresig.xml" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && [ ! -f "$WORK/privapp-puresig.xml" ] && printf '%s' "$out" | grep -q '纯 signature 权限'; then
+  ok "纯 signature 权限仍触发 fail-closed"
+else
+  bad "纯 signature 权限未被拦截(rc=$rc)"; printf '%s\n' "$out"
+fi
+
+# -----------------------------------------------------------------------------
+head1 "12c) v0.0.4:双包输出、TEST 标记、update.json 排序、service.sh 诊断与文档检查"
+# -----------------------------------------------------------------------------
+if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
+  # 两个包的 module.prop 均在根目录且 id 均为 gkui-pack
+  id_norm="$(unzip -p "$ZIP" module.prop | grep '^id=' | head -1)"
+  id_priv="$(unzip -p "$ZIP_PRIV_TEST" module.prop | grep '^id=' | head -1)"
+  if [ "$id_norm" = "id=gkui-pack" ] && [ "$id_priv" = "id=gkui-pack" ]; then
+    ok "普通版与 TEST 版 module.prop 均位于根目录且 id=gkui-pack 一致"
+  else
+    bad "module.prop id 不一致(norm=$id_norm, priv=$id_priv)"
+  fi
+  # TEST 标记检查:1) 文件名含 -recorderpriv-TEST.zip; 2) module.prop description; 3) PREFLIGHT-REPORT.md 开头; 4) RELEASE-NOTES-v0.0.4.md
+  if unzip -p "$ZIP_PRIV_TEST" module.prop | grep -q '^description=.*白名单来源：源码推导，未经设备验证'; then
+    ok "TEST 版 module.prop description 注明『白名单来源：源码推导，未经设备验证』"
+  else
+    bad "TEST 版 module.prop 缺少源码推导说明"
+  fi
+  if head -n 10 "$WORK/dist/PREFLIGHT-REPORT.md" | grep -q '白名单来源：源码推导，未经设备验证'; then
+    ok "PREFLIGHT-REPORT.md 开头注明源码推导来源与风险"
+  else
+    bad "PREFLIGHT-REPORT.md 开头缺少 TEST 警告"
+  fi
+  if [ -f "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md" ] \
+     && grep -q '白名单来源：源码推导，未经设备验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md" \
+     && grep -q '切回普通版' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md"; then
+    ok "docs/RELEASE-NOTES-v0.0.4.md 含醒目 TEST 警告与管理器点击更新切回普通版说明"
+  else
+    bad "docs/RELEASE-NOTES-v0.0.4.md 缺失或缺少 TEST 警告/更新切回说明"
+  fi
+  if grep -q 'BOOT_MAX="\${DIAG_BOOT_MAX_WAIT:-120}"' "$REPO_ROOT/module/service.sh"; then
+    ok "module/service.sh 的 boot_completed 等待上限为 120 秒"
+  else
+    bad "module/service.sh 的 boot_completed 等待上限不为 120 秒"
+  fi
+  # update.json 与 release.yml 的 sorted(glob.glob("dist/GKUI-Pack-*.zip"))[-1] 必须指向普通版
+  if [ -f "$WORK/dist/update.json" ] && grep -q '"zipUrl": ".*/GKUI-Pack-test-1\.zip"' "$WORK/dist/update.json"; then
+    ok "dist/update.json 的 zipUrl 指向普通版 GKUI-Pack-test-1.zip"
+  else
+    bad "dist/update.json 缺失或未指向普通版"
+  fi
+   picked_zip="$(python3 - "$WORK/dist" <<'PYS'
+import glob, os, sys
+zips = sorted(glob.glob(os.path.join(sys.argv[1], "GKUI-Pack-*.zip")))
+print(os.path.basename(zips[-1]) if zips else "")
+PYS
+)"
+  if [ "$picked_zip" = "GKUI-Pack-test-1.zip" ]; then
+    ok "release.yml sorted(glob.glob('dist/GKUI-Pack-*.zip'))[-1] 选中普通版而非 -TEST.zip"
+  else
+    bad "sorted(...)[-1] 选中了错误的包: $picked_zip"
+  fi
+
+  # 执行 TEST 版的 customize.sh:Recorder 进 system/priv-app/GKUIRecorder,其余进 system/app,并写入白名单 XML
+  MODPRIV="$WORK/modpriv"
+  rm -rf "$MODPRIV"
+  mkdir -p "$MODPRIV"
+  unzip -q "$ZIP_PRIV_TEST" -d "$MODPRIV"
+  out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODPRIV" FAKE_PM_PKG="__none__" \
+          FAKE_PM_MODE="absent" sh "$MODPRIV/customize.sh" 2>&1 )"; rc=$?
+  if [ $rc -eq 0 ] \
+     && [ -f "$MODPRIV/system/priv-app/GKUIRecorder/GKUIRecorder.apk" ] \
+     && [ ! -e "$MODPRIV/system/app/GKUIRecorder" ] \
+     && [ -f "$MODPRIV/system/app/GKUICalendar/GKUICalendar.apk" ] \
+     && [ -f "$MODPRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml" ]; then
+    ok "TEST 版 customize.sh 将 GKUIRecorder 装入 system/priv-app 并写入 privapp 白名单 XML"
+  else
+    bad "TEST 版 customize.sh 落盘结果不符(rc=$rc)"; printf '%s\n' "$out" | tail -15
+  fi
+fi
+
+# 当存在 device/framework-permissions.txt 时,保持非 TEST 严格门禁(产出 -recorderpriv.zip)
+patch_yaml "$WORK/repo" "$WORK/apks"
+cp "$REPO_ROOT/device/framework-permissions.source.txt" "$WORK/repo/device/framework-permissions.txt"
+out="$(run_build "$WORK/repo" "$WORK/apks" "$WORK/dist-strictpriv" 2>&1)"; rc=$?
+rm -f "$WORK/repo/device/framework-permissions.txt"
+if [ $rc -ne 0 ]; then
+  ok "存在 device/framework-permissions.txt 时启用严格门禁(重复冲突记录按预期 fail-closed)"
+else
+  bad "存在 device/framework-permissions.txt 时未启用严格门禁"
+fi
+# 放入无重复冲突的设备实测转储 → 产出非 TEST 的 GKUI-Pack-test-1-recorderpriv.zip
+python3 - "$REPO_ROOT/device/framework-permissions.source.txt" "$WORK/repo/device/framework-permissions.txt" <<'PYDEDUP'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src, encoding="utf-8").read().splitlines()
+out = ["# Device: StubDevice", "# SDK: 36", "# Captured: 2026-10-12", "All Permissions:"]
+seen = set()
+i = 0
+while i < len(lines):
+    if lines[i].startswith("+ permission:"):
+        perm = lines[i].split(":", 1)[1].strip()
+        lvl = lines[i + 1] if i + 1 < len(lines) else "  protectionLevel:normal"
+        if perm not in seen:
+            seen.add(perm)
+            out.append(lines[i])
+            out.append(lvl)
+        i += 2
+    else:
+        i += 1
+open(dst, "w", encoding="utf-8").write("\n".join(out) + "\n")
+PYDEDUP
+out="$(run_build "$WORK/repo" "$WORK/apks" "$WORK/dist-strict-ok" 2>&1)"; rc=$?
+rm -f "$WORK/repo/device/framework-permissions.txt"
+if [ $rc -eq 0 ] && [ -f "$WORK/dist-strict-ok/GKUI-Pack-test-1-recorderpriv.zip" ] \
+   && [ ! -f "$WORK/dist-strict-ok/GKUI-Pack-test-1-recorderpriv-TEST.zip" ]; then
+  ok "存在合法 device/framework-permissions.txt 时产出正式名 GKUI-Pack-test-1-recorderpriv.zip(无 -TEST)"
+else
+  bad "存在合法 device/framework-permissions.txt 时产物异常(rc=$rc)"
+fi
+
+# service.sh 后台诊断测试(桩 getprop / dumpsys / logcat / pm)
+DIAG_TEST="$WORK/diag-test"
+mkdir -p "$DIAG_TEST/mod" "$DIAG_TEST/bin" "$DIAG_TEST/sdcard-dl"
+cp "$WORK/dist/GKUI-Pack-test-1-recorderpriv-TEST.zip" "$DIAG_TEST/" 2>/dev/null || true
+unzip -p "$ZIP_PRIV_TEST" service.sh > "$DIAG_TEST/mod/service.sh"
+chmod +x "$DIAG_TEST/mod/service.sh"
+touch "$DIAG_TEST/mod/.boot_flag"
+cat > "$DIAG_TEST/bin/getprop" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  "") echo "[ro.serialno]: [LEAKED_SERIAL_12345]"; echo "[ril.gsm.imei]: [LEAKED_IMEI_99999]" ;;
+  sys.boot_completed) echo "1" ;;
+  ro.product.model) echo "PixelStub" ;;
+  ro.build.version.release) echo "16" ;;
+  ro.build.version.sdk) echo "36" ;;
+  ro.build.display.id) echo "lineage_stub-userdebug 16" ;;
+  ro.build.type) echo "userdebug" ;;
+  ro.build.tags) echo "test-keys" ;;
+  ro.Boot.verifiedbootstate|ro.boot.verifiedbootstate) echo "orange" ;;
+  *) echo "" ;;
+esac
+STUB
+cat > "$DIAG_TEST/bin/pm" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list)
+    printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel:signature|privileged|role\n'
+    ;;
+  path)
+    echo "package:/system/priv-app/GKUIRecorder/GKUIRecorder.apk"
+    ;;
+esac
+STUB
+cat > "$DIAG_TEST/bin/dumpsys" <<'STUB'
+#!/usr/bin/env bash
+cat <<'EOF'
+Packages:
+  Package [org.lineageos.recorder.dev] (12345):
+    requested permissions:
+      android.permission.CAPTURE_AUDIO_OUTPUT
+      android.permission.RECORD_AUDIO
+    install permissions:
+      android.permission.CAPTURE_AUDIO_OUTPUT: granted=true
+    runtime permissions:
+      android.permission.RECORD_AUDIO: granted=true, flags=[ USER_SENSITIVE_WHEN_GRANTED ]
+    other section:
+      should_not_appear
+EOF
+STUB
+cat > "$DIAG_TEST/bin/logcat" <<'STUB'
+#!/usr/bin/env bash
+echo "10-12 08:00:00.000  1000  1000 I PackageManager: privapp permissions ok for org.lineageos.recorder.dev"
+echo "10-12 08:00:01.000  1000  1000 D UnrelatedTag: should be filtered out"
+STUB
+chmod +x "$DIAG_TEST/bin/getprop" "$DIAG_TEST/bin/pm" "$DIAG_TEST/bin/dumpsys" "$DIAG_TEST/bin/logcat"
+
+env PATH="$DIAG_TEST/bin:$PATH" \
+    DIAG_SDCARD_DIR="$DIAG_TEST/sdcard-dl" \
+    DIAG_BOOT_MAX_WAIT=2 DIAG_BOOT_SLEEP=1 \
+    DIAG_SDCARD_MAX_WAIT=2 DIAG_SDCARD_SLEEP=1 \
+    sh "$DIAG_TEST/mod/service.sh"
+if [ ! -f "$DIAG_TEST/mod/.boot_flag" ]; then
+  ok "service.sh 立即清除 .boot_flag(不阻塞启动)"
+else
+  bad "service.sh 未清除 .boot_flag"
+fi
+# 等待后台诊断子进程完成(最多 3 秒)
+for _i in 1 2 3 4 5 6; do
+  [ -s "$DIAG_TEST/sdcard-dl/GKUI-diag.txt" ] && break
+  sleep 0.5
+done
+if [ -s "$DIAG_TEST/mod/GKUI-diag.txt" ] && [ -s "$DIAG_TEST/sdcard-dl/GKUI-diag.txt" ]; then
+  ok "service.sh 后台生成 \$MODDIR/GKUI-diag.txt 并复制到 /sdcard/Download/GKUI-diag.txt"
+else
+  bad "service.sh 未生成或未复制 GKUI-diag.txt"
+fi
+if grep -q '^variant: priv-TEST$' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'ro.product.model: PixelStub' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'android.permission.CAPTURE_AUDIO_OUTPUT: granted=true' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'PackageManager: privapp permissions ok' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && ! grep -q 'LEAKED_SERIAL_12345\|LEAKED_IMEI_99999\|should_not_appear\|UnrelatedTag' "$DIAG_TEST/mod/GKUI-diag.txt"; then
+  ok "GKUI-diag.txt 含变体标识/7 项只读属性/权限转储/dumpsys 权限段/过滤后 logcat,且未全量泄露 getprop"
+else
+  bad "GKUI-diag.txt 内容不符合预期"; cat "$DIAG_TEST/mod/GKUI-diag.txt"
+fi
+
+# 当 /sdcard/Download 不可写(模拟 FBE 超时未解锁)时,在 $MODDIR/GKUI-diag.txt 末尾记录原因并退出
+DIAG_TIMEOUT="$WORK/diag-timeout"
+mkdir -p "$DIAG_TIMEOUT/mod"
+unzip -p "$ZIP" service.sh > "$DIAG_TIMEOUT/mod/service.sh"
+chmod +x "$DIAG_TIMEOUT/mod/service.sh"
+env PATH="$DIAG_TEST/bin:$PATH" \
+    DIAG_SDCARD_DIR="$DIAG_TIMEOUT/nonexistent-sdcard-dl" \
+    DIAG_BOOT_MAX_WAIT=1 DIAG_BOOT_SLEEP=1 \
+    DIAG_SDCARD_MAX_WAIT=1 DIAG_SDCARD_SLEEP=1 \
+    sh "$DIAG_TIMEOUT/mod/service.sh"
+for _i in 1 2 3 4 5 6; do
+  grep -q 'sdcard_copy: timeout_or_unwritable' "$DIAG_TIMEOUT/mod/GKUI-diag.txt" 2>/dev/null && break
+  sleep 0.5
+done
+if grep -q '^variant: normal$' "$DIAG_TIMEOUT/mod/GKUI-diag.txt" 2>/dev/null \
+   && grep -q 'sdcard_copy: timeout_or_unwritable' "$DIAG_TIMEOUT/mod/GKUI-diag.txt" 2>/dev/null; then
+  ok "service.sh 在 /sdcard/Download 超时未解锁时在 \$MODDIR/GKUI-diag.txt 末尾记录原因并退出"
+else
+  bad "service.sh 超时未解锁分支行为异常"
+fi
+
+# docs/TESTER.md 行数 <= 15 且不含任何命令,并含刷前卸载提醒
+if [ -f "$REPO_ROOT/docs/TESTER.md" ]; then
+  tester_lines="$(wc -l < "$REPO_ROOT/docs/TESTER.md" | tr -d ' ')"
+  if [ "$tester_lines" -le 15 ] \
+     && grep -q '设置 → 应用' "$REPO_ROOT/docs/TESTER.md" \
+     && ! grep -qE 'adb |pm uninstall|sh |bash ' "$REPO_ROOT/docs/TESTER.md"; then
+    ok "docs/TESTER.md 行数 <= 15(实际=${tester_lines}行)、0 条命令且含『设置 → 应用』刷前卸载提醒"
+  else
+    bad "docs/TESTER.md 不符合行数/0命令/卸载提醒要求(lines=$tester_lines)"
+  fi
+else
+  bad "缺少 docs/TESTER.md"
+fi
 
 # -----------------------------------------------------------------------------
 head1 "13) 测试没有写脏工作区"
