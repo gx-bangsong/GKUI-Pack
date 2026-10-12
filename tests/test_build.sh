@@ -1000,9 +1000,8 @@ for app in data["apps"]:
         # 仍留 TODO),而不是"application_id 必须以 TODO 开头"。后者每回填一个实测字段
         # 就要连 CI 工作流一起改,而工作流只能由用户经网页编辑器落地 —— 徒增耦合。
         signer_ok = (
-            (app["signer_sha256"] == "TODO" and app["confidence"] == "unverified")
-            or (app["signer_sha256"] == "10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25"
-                and app["confidence"] == "confirmed")
+            app["signer_sha256"] == "10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25"
+            and app["confidence"] == "confirmed"
         )
         ok = (app["application_id"] == "org.lineageos.recorder.dev"
               and app["application_id"] != app["stock_package"]
@@ -1018,7 +1017,7 @@ for app in data["apps"]:
         sys.exit(0 if ok else 1)
 sys.exit(1)
 PYEOF
-then ok "recorder:已切到 beta3 并保留 beta2 前驱(包名/versionCode/哈希已核实)"; else bad "recorder 条目不符合要求"; fi
+then ok "recorder:已切到 beta3 并保留 beta2 前驱(包名/versionCode/哈希/signer 已核实)"; else bad "recorder 条目不符合要求"; fi
 if grep -q '^\*.apk$' "$REPO_ROOT/.gitignore" && grep -q '^dist/$' "$REPO_ROOT/.gitignore" \
    && grep -q '^build/$' "$REPO_ROOT/.gitignore" && grep -q '^\*.keystore$' "$REPO_ROOT/.gitignore"; then
   ok ".gitignore 含 *.apk / dist/ / build/ / *.keystore"
@@ -1194,10 +1193,17 @@ if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
   else
     bad "PREFLIGHT-REPORT.md 开头缺少 TEST 警告"
   fi
-  if [ -f "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md" ] && grep -q '白名单来源：源码推导，未经设备验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md"; then
-    ok "docs/RELEASE-NOTES-v0.0.4.md 含醒目 TEST 警告"
+  if [ -f "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md" ] \
+     && grep -q '白名单来源：源码推导，未经设备验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md" \
+     && grep -q '切回普通版' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.4.md"; then
+    ok "docs/RELEASE-NOTES-v0.0.4.md 含醒目 TEST 警告与管理器点击更新切回普通版说明"
   else
-    bad "docs/RELEASE-NOTES-v0.0.4.md 缺失或缺少 TEST 警告"
+    bad "docs/RELEASE-NOTES-v0.0.4.md 缺失或缺少 TEST 警告/更新切回说明"
+  fi
+  if grep -q 'BOOT_MAX="\${DIAG_BOOT_MAX_WAIT:-120}"' "$REPO_ROOT/module/service.sh"; then
+    ok "module/service.sh 的 boot_completed 等待上限为 120 秒"
+  else
+    bad "module/service.sh 的 boot_completed 等待上限不为 120 秒"
   fi
   # update.json 与 release.yml 的 sorted(glob.glob("dist/GKUI-Pack-*.zip"))[-1] 必须指向普通版
   if [ -f "$WORK/dist/update.json" ] && grep -q '"zipUrl": ".*/GKUI-Pack-test-1\.zip"' "$WORK/dist/update.json"; then

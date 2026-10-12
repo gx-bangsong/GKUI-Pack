@@ -202,10 +202,11 @@ apps:
   #     * source_url   = tag → commit(gh api repos/…/commits/beta3 的 .sha):
   #                                              4650818fbc158d996263b4a21b378af4deb9970a
   #   name = GKUIRecorder:用户确认的模块内目录名。
-  #   signer_sha256:当前沙箱无法访问 release-assets.githubusercontent.com 下载资产核实签名,
-  #   按仓库 C6/C7 规范填 TODO 并将 confidence 设为 unverified,待 CI --collect-only 实测核实
-  #   (用户总结提供的预期值为 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25,
-  #   严禁在未核实前当成已验证值写死)。
+  #   signer_sha256:已由 GitHub Actions --collect-only 实测核实(2026-10-12,
+  #   Actions run 38230155998 / job 114747379251,apksigner print-certs 唯一证书 SHA-256):
+  #     * signer_sha256 = 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25
+  #     * signer_count  = 1
+  #     * versionCode   = 1(versionName=1.1,包名=org.lineageos.recorder.dev)
   #   已登记前驱(beta2):
   #     * previous_release_tag   = beta2
   #     * previous_asset_name    = GKUIRecorder-beta2.apk
@@ -230,9 +231,7 @@ apps:
     release_tag: "beta3"
     asset_name: GKUIRecorder-beta3.apk
     sha256: fe261923f73d07c7e0b3e238231d89553a772b64571df9db1d61e7bb8c72ec4f
-    # TODO(待 CI --collect-only 核实):沙箱无法下载 Release 资产核实签名;
-    # 预期值 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25,核实后回填并改 confirmed
-    signer_sha256: TODO
+    signer_sha256: 10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25
     previous_release_tag: "beta2"
     previous_asset_name: GKUIRecorder-beta2.apk
     previous_sha256: f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f
@@ -242,5 +241,5 @@ apps:
     privileged_ack: true
     privileged_note: "通话录音不会生效,需 priv 变体(分支 recorder-priv)"
     mode: coexist
-    confidence: unverified
+    confidence: confirmed
     enabled: true

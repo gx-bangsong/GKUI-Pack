@@ -17,7 +17,7 @@
 | **`GKUI-Pack-v0.0.4.zip`（普通版，默认推荐）** | `/system/app/GKUIRecorder` | 不含任何白名单 XML | 不生效 | 日常稳定使用日历、图库、计算器、时钟、普通录音的用户 |
 | **`GKUI-Pack-v0.0.4-recorderpriv-TEST.zip`（TEST 特权版）** | `/system/priv-app/GKUIRecorder` | 含 `CAPTURE_AUDIO_OUTPUT` 白名单（源码推导，未经设备验证） | 待真机验证 | 愿意协助测试录音机特权挂载与通话录音、并把 `GKUI-diag.txt` 发回的测试者 |
 
-> **提示（关于管理器内“更新”）**：两个包的模块 `id` 均为 `gkui-pack`，且 `update.json` 的更新地址指向普通版。**装了 TEST 版的人，以后在 Magisk / KernelSU / APatch 管理器里直接点“更新”会自动换回普通版**（如需继续使用特权版，请手动下载对应特权包刷入）。
+> **提示（关于管理器内“更新”）**：两个包的模块 `id` 均为 `gkui-pack`，且 `update.json` 的更新地址指向普通版。**刷了 TEST 版的测试者如果之后在 Magisk / KernelSU / APatch 管理器里点“更新”，会被切回普通版**（如需继续使用特权版，请手动下载对应特权包刷入）。
 
 ### 本次主要更新（v0.0.4）
 - **GKUIRecorder 默认版本升至 `beta3`**：保留 `beta2` 作为已登记前驱；由于 `beta2 → beta3` 签名证书变更，模块刷入时（C8）若检测到旧签名副本会中止安装并提示先备份录音、手动卸载或删旧模块并重启。若已安装 APK 字节与目标 `sha256` 一致，则支持直接接管。
