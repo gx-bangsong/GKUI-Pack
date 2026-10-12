@@ -907,6 +907,7 @@ $(printf '%s\n' "$found")"
     printf '%s\t%s\t%s\t%s\t%s\n' \
       "$APP_ID" "$actual_asset_sha" "$staged_sha" \
       "$(json_get "$pf_json" signer_sha256)" "$(json_get "$pf_json" version_code)" >> "$COLLECT_TSV"
+    printf '%s|%s|%s|%s|%s\n' "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$staged_sha" >> "$WORK/collect-included.txt"
     printf '%s[采集] %s:%s\n' "$C_YEL" "$APP_ID" "$C_RST"
     while IFS=$'\t' read -r k v; do
       [ -n "$k" ] && printf '        %-24s %s\n' "$k" "$v"
@@ -924,7 +925,6 @@ for k in ("application_id", "version_code", "version_name", "signer_sha256", "mo
         print("%s\t%s" % (k, v))
 PYC
 )
-    rm -f "$staged"
     continue
   fi
 
@@ -1003,6 +1003,103 @@ PYEOF
   printf '%s重要:%s本模式**不产出任何模块 zip**,且退出码为 1(C7:apps.yaml 仍有 TODO 时不许假装构建成功)。\n' "$C_YEL" "$C_RST"
   printf '请把上面的值填入 apps.yaml(并删除对应的 TODO 注释),然后执行:\n'
   printf '    bash build.sh --check\n'
+  if [ -f "$WORK/preflight-recorder.json" ] && [ -n "$PERM_DUMP" ] && [ -d "$ROOT/module-priv" ]; then
+    PRIV_XML_PREVIEW="$WORK/privapp-permissions-org.lineageos.recorder.dev.xml"
+    if priv_preview_out="$(python3 "$ROOT/scripts/generate-privapp-permissions.py" \
+      --dump "$PERM_DUMP" \
+      --mode "$PERM_MODE" \
+      --app-json "$WORK/preflight-recorder.json" \
+      --out "$PRIV_XML_PREVIEW" 2>&1)"; then
+      printf '\n=== [采集预览] recorder-priv 权限判定明细 ===\n%s\n' "$priv_preview_out"
+      printf '\n=== [采集预览] privapp-permissions-org.lineageos.recorder.dev.xml 全文 ===\n'
+      cat "$PRIV_XML_PREVIEW"
+      # 在 $WORK/preview-zips 下试构建普通版与 TEST 版两个 zip 并输出各自的 unzip -l(不写入 $DIST_DIR)
+      P_STAGE="$WORK/preview-stage"
+      P_STAGE_PRIV="$WORK/preview-stage-priv"
+      P_ZIPS="$WORK/preview-zips"
+      mkdir -p "$P_STAGE/apks" "$P_STAGE_PRIV/apks" "$P_STAGE_PRIV/system/etc/permissions" "$P_ZIPS"
+      cp -a "$ROOT/module/." "$P_STAGE/"
+      cp -a "$ROOT/module/." "$P_STAGE_PRIV/"
+      cp -a "$ROOT/module-priv/." "$P_STAGE_PRIV/"
+      cp "$PRIV_XML_PREVIEW" "$P_STAGE_PRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
+      P_ENTRIES=""
+      P_PREDS=""
+      P_STOCKS=""
+      while IFS='|' read -r C_ID C_NAME C_PKG C_STOCK C_SHA; do
+        [ -n "$C_ID" ] || continue
+        cp "$WORK/apks/$C_NAME.apk" "$P_STAGE/apks/$C_NAME.apk"
+        cp "$WORK/apks/$C_NAME.apk" "$P_STAGE_PRIV/apks/$C_NAME.apk"
+        P_ENTRIES="${P_ENTRIES}${C_PKG}|${C_NAME}|${C_SHA}"$'\n'
+        p_tag="$(entry_field "$C_ID" previous_release_tag)"
+        p_sha="$(entry_field "$C_ID" previous_sha256)"
+        p_sig="$(entry_field "$C_ID" previous_signer_sha256)"
+        c_tag="$(entry_field "$C_ID" release_tag)"
+        if [ -n "$p_tag" ] || [ -n "$p_sha" ] || [ -n "$p_sig" ]; then
+          P_PREDS="${P_PREDS}${C_PKG}|${C_NAME}|${p_tag}|$(norm_hex "$p_sha")|$(norm_hex "$p_sig")|${c_tag}"$'\n'
+        fi
+        case "$(printf '%s\n' "$P_STOCKS")" in
+          *"$C_STOCK"*) : ;;
+          *) P_STOCKS="${P_STOCKS}${C_STOCK}"$'\n' ;;
+        esac
+      done < "$WORK/collect-included.txt"
+      P_ENTRIES="${P_ENTRIES%$'\n'}"
+      P_PREDS="${P_PREDS%$'\n'}"
+      P_STOCKS="${P_STOCKS%$'\n'}"
+      render_placeholder "$P_STAGE/module.prop"  '__VERSION__' "$VERSION"
+      render_placeholder "$P_STAGE/module.prop"  '__VERSION_CODE__' "$VERSION_CODE"
+      render_placeholder "$P_STAGE/customize.sh" '__APP_ENTRIES__' "$P_ENTRIES"
+      render_placeholder "$P_STAGE/customize.sh" '__PREDECESSOR_ENTRIES__' "$P_PREDS"
+      render_placeholder "$P_STAGE/uninstall.sh" '__STOCK_PACKAGES__' "$P_STOCKS"
+      render_placeholder "$P_STAGE/service.sh"   '__VERSION__' "$VERSION"
+      render_placeholder "$P_STAGE/service.sh"   '__VARIANT__' "normal"
+      render_placeholder "$P_STAGE_PRIV/module.prop"  '__VERSION__' "$VERSION"
+      render_placeholder "$P_STAGE_PRIV/module.prop"  '__VERSION_CODE__' "$VERSION_CODE"
+      render_placeholder "$P_STAGE_PRIV/module.prop"  '__PRIV_NAME_SUFFIX__' "recorderpriv-TEST"
+      render_placeholder "$P_STAGE_PRIV/module.prop"  '__PRIV_SOURCE_NOTE__' "[TEST] 白名单来源：源码推导，未经设备验证"
+      render_placeholder "$P_STAGE_PRIV/customize.sh" '__APP_ENTRIES__' "$P_ENTRIES"
+      render_placeholder "$P_STAGE_PRIV/customize.sh" '__PREDECESSOR_ENTRIES__' "$P_PREDS"
+      render_placeholder "$P_STAGE_PRIV/customize.sh" '__PRIVAPP_PERMISSIONS_XML__' "$(cat "$PRIV_XML_PREVIEW")"
+      render_placeholder "$P_STAGE_PRIV/uninstall.sh" '__STOCK_PACKAGES__' "$P_STOCKS"
+      render_placeholder "$P_STAGE_PRIV/service.sh"   '__VERSION__' "$VERSION"
+      render_placeholder "$P_STAGE_PRIV/service.sh"   '__VARIANT__' "priv-TEST"
+      chmod 0755 "$P_STAGE"/*.sh "$P_STAGE/META-INF/com/google/android/update-binary"
+      chmod 0755 "$P_STAGE_PRIV"/*.sh "$P_STAGE_PRIV/META-INF/com/google/android/update-binary"
+      P_ZIP_NORM="$P_ZIPS/GKUI-Pack-$VERSION.zip"
+      P_ZIP_TEST="$P_ZIPS/GKUI-Pack-$VERSION-recorderpriv-TEST.zip"
+      ( cd "$P_STAGE" && zip -q -r9 "$P_ZIP_NORM" . )
+      ( cd "$P_STAGE_PRIV" && zip -q -r9 "$P_ZIP_TEST" . )
+      printf '\n=== [采集预览] 普通版 zip (unzip -l %s) ===\n' "$(basename "$P_ZIP_NORM")"
+      unzip -l "$P_ZIP_NORM"
+      printf '\n=== [采集预览] TEST 版 zip (unzip -l %s) ===\n' "$(basename "$P_ZIP_TEST")"
+      unzip -l "$P_ZIP_TEST"
+      if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+        python3 - "$WORK/preflight-recorder.json" "$PRIV_XML_PREVIEW" "$priv_preview_out" "$P_ZIP_NORM" "$P_ZIP_TEST" <<'PYEOF'
+# -*- coding: utf-8 -*-
+import os, subprocess, sys
+
+pf_path, xml_path, priv_out, zip_norm, zip_test = sys.argv[1:6]
+
+def emit_notice(title, text):
+    escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    sys.stdout.write("::notice title=%s::%s\n" % (title, escaped))
+
+with open(pf_path, "r", encoding="utf-8") as fh:
+    emit_notice("collect-preflight-recorder", fh.read())
+
+emit_notice("collect-privapp-judgment", priv_out)
+
+with open(xml_path, "r", encoding="utf-8") as fh:
+    emit_notice("collect-privapp-xml", fh.read())
+
+u_norm = subprocess.check_output(["unzip", "-l", zip_norm]).decode("utf-8", "replace")
+u_test = subprocess.check_output(["unzip", "-l", zip_test]).decode("utf-8", "replace")
+emit_notice("collect-unzip-list", "=== %s ===\n%s\n=== %s ===\n%s" % (
+    os.path.basename(zip_norm), u_norm, os.path.basename(zip_test), u_test
+))
+PYEOF
+      fi
+    fi
+  fi
   exit 1
 fi
 
@@ -1065,6 +1162,8 @@ if grep -q '^recorder|' "$WORK/included.txt" 2>/dev/null && [ -d "$ROOT/module-p
     --out "$PRIV_XML" 2>&1)" || die "recorder-priv 白名单生成失败:
 $priv_gen_out"
   info "recorder-priv 白名单已生成($PERM_MODE): $(basename "$PRIV_XML")"
+  printf '%s\n' "$priv_gen_out"
+  cat "$PRIV_XML"
 
   STAGE_PRIV="$WORK/stage-priv"
   mkdir -p "$STAGE_PRIV/apks" "$STAGE_PRIV/system/etc/permissions"
@@ -1113,10 +1212,12 @@ else
   rm -f "$ZIP_OUT"
   ( cd "$STAGE" && zip -q -r9 "$ZIP_OUT" . )
   info "模块包(普通版): $ZIP_OUT ($(wc -c < "$ZIP_OUT" | tr -d ' ') 字节)"
+  unzip -l "$ZIP_OUT"
   if [ -n "$PRIV_ZIP_OUT" ]; then
     rm -f "$PRIV_ZIP_OUT"
     ( cd "$STAGE_PRIV" && zip -q -r9 "$PRIV_ZIP_OUT" . )
     info "模块包(特权版): $PRIV_ZIP_OUT ($(wc -c < "$PRIV_ZIP_OUT" | tr -d ' ') 字节)"
+    unzip -l "$PRIV_ZIP_OUT"
   fi
   python3 - "$UPDATE_JSON" "$VERSION" "$VERSION_CODE" <<'PYU'
 import json, sys

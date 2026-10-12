@@ -32,12 +32,12 @@ rm -f "$MODDIR/.boot_flag"
   DIAG_FILE="$MODDIR/GKUI-diag.txt"
   SDCARD_DIR="${DIAG_SDCARD_DIR:-/sdcard/Download}"
   SDCARD_FILE="$SDCARD_DIR/GKUI-diag.txt"
-  BOOT_MAX="${DIAG_BOOT_MAX_WAIT:-100}"
+  BOOT_MAX="${DIAG_BOOT_MAX_WAIT:-120}"
   BOOT_INT="${DIAG_BOOT_SLEEP:-1}"
   SD_MAX="${DIAG_SDCARD_MAX_WAIT:-600}"
   SD_INT="${DIAG_SDCARD_SLEEP:-5}"
 
-  # 1) 等待 getprop sys.boot_completed 为 1(最多 100 秒)
+  # 1) 等待 getprop sys.boot_completed 为 1(最多 120 秒)
   boot_waited=0
   boot_ok=0
   if command -v getprop >/dev/null 2>&1; then
