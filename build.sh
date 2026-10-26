@@ -803,7 +803,10 @@ mkdir -p "$DIST_DIR" "$APK_DIR"
     printf '> - 来源文件: `device/framework-permissions.source.txt`（提取自 `LineageOS/android_frameworks_base` 分支 `lineage-23.2` commit `f4ed08a03b518772ba77c3c0a1b4185fa1712c9b` 的 `core/res/AndroidManifest.xml`）\n'
     printf '> - 风险说明: 仓库当前缺少目标设备实测 `device/framework-permissions.txt`（`pm list permissions -f`），特权包标记为 `GKUI-Pack-%s-recorderpriv-TEST.zip`。若目标 ROM 对特权权限的定义与源码不一致，启动阶段可能触发 `PackageManager` 异常（模块内置二次重启自动禁用自救）。\n\n' "$VERSION"
   elif [ -n "$PERM_DUMP" ]; then
-    printf '> **特权变体白名单来源**: `device/framework-permissions.txt`（目标设备实测严格门禁）\n\n'
+    printf '> **特权变体白名单来源：设备权限表（Pixel 5 / Android 16 实测严格门禁）**\n'
+    printf '> - 来源文件: `device/framework-permissions.txt`（Pixel 5 / LineageOS / Android 16 / SDK 36 / build `BP4A.251205.006`，epoch 1793032493 由 v0.0.4 priv-TEST 模块 service.sh 诊断采集，原样保存）\n'
+    printf '> - 验证状态: 已在 Pixel 5 / Android 16 验证开机与 CAPTURE_AUDIO_OUTPUT 授予；通话录音功能本身尚未验证；白名单 enforce 校验状态待 v0.0.5 诊断确认（ro.control_privapp_permissions 未采集）。\n'
+    printf '> - 换设备或换 Android 大版本时必须重新采集权限表，不得跨设备复用。\n\n'
   fi
   printf -- '- 生成者: scripts/preflight-apk.sh(由 build.sh 调用)\n'
   printf -- '- 生成时间(UTC): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1161,9 +1164,39 @@ if grep -q '^recorder|' "$WORK/included.txt" 2>/dev/null && [ -d "$ROOT/module-p
     --app-json "$WORK/preflight-recorder.json" \
     --out "$PRIV_XML" 2>&1)" || die "recorder-priv 白名单生成失败:
 $priv_gen_out"
+  if [ "$PERM_MODE" = device ]; then
+    info "recorder-priv 白名单来源：设备权限表（Pixel 5 / Android 16 实测，严格门禁）"
+  else
+    info "recorder-priv 白名单来源：源码推导（未经设备验证，产物带 TEST 标记）"
+  fi
   info "recorder-priv 白名单已生成($PERM_MODE): $(basename "$PRIV_XML")"
   printf '%s\n' "$priv_gen_out"
   cat "$PRIV_XML"
+
+  # 设备权限表模式:用同一份 preflight 结果从源码回退表再生成一份参考 XML,
+  # 与设备表产物逐字节比对。v0.0.4 priv-TEST 包内 XML 即由源码表确定性生成,
+  # 因此二者一致等价于"正式版 XML 与 v0.0.4 TEST 版逐字节相同"。
+  # 任何差异都必须停下来报告,绝不带着差异继续出包。
+  if [ "$PERM_MODE" = device ] && [ -f "$ROOT/device/framework-permissions.source.txt" ]; then
+    PRIV_XML_REF="$WORK/privapp-permissions-reference-source.xml"
+    priv_ref_out="$(python3 "$ROOT/scripts/generate-privapp-permissions.py" \
+      --dump "$ROOT/device/framework-permissions.source.txt" \
+      --mode source \
+      --app-json "$WORK/preflight-recorder.json" \
+      --out "$PRIV_XML_REF" 2>&1)" || die "源码参考白名单生成失败(无法完成逐字节比对):
+$priv_ref_out"
+    if ! cmp -s "$PRIV_XML" "$PRIV_XML_REF"; then
+      diff_out="$(diff -u "$PRIV_XML_REF" "$PRIV_XML" || true)"
+      die "设备权限表 XML 与 v0.0.4 TEST 版(源码表生成)不一致,拒绝继续:
+--- 源码表参考 XML ---
+$(cat "$PRIV_XML_REF")
+--- 设备表 XML ---
+$(cat "$PRIV_XML")
+--- 差异 ---
+$diff_out"
+    fi
+    info "设备表 XML 与 v0.0.4 TEST 版逐字节一致（仅 CAPTURE_AUDIO_OUTPUT 一项）"
+  fi
 
   STAGE_PRIV="$WORK/stage-priv"
   mkdir -p "$STAGE_PRIV/apks" "$STAGE_PRIV/system/etc/permissions"
@@ -1180,7 +1213,7 @@ $priv_gen_out"
   else
     PRIV_NAME_SUFFIX="recorderpriv"
     PRIV_VARIANT_ID="priv"
-    PRIV_SOURCE_NOTE="白名单来源：目标设备实测权限转储"
+    PRIV_SOURCE_NOTE="白名单来源：Pixel 5 / Android 16 设备权限表"
     PRIV_ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION-recorderpriv.zip"
   fi
 
@@ -1225,8 +1258,9 @@ out_path, ver, vc = sys.argv[1], sys.argv[2], int(sys.argv[3])
 data = {
     "version": ver,
     "versionCode": vc,
+    # zipUrl 恒指向普通版:特权包与普通版模块 id 相同,管理器点"更新"时回到普通版
     "zipUrl": f"https://github.com/gx-bangsong/GKUI-Pack/releases/download/{ver}/GKUI-Pack-{ver}.zip",
-    "changelog": "https://raw.githubusercontent.com/gx-bangsong/GKUI-Pack/main/docs/RELEASE-NOTES-v0.0.4.md",
+    "changelog": f"https://raw.githubusercontent.com/gx-bangsong/GKUI-Pack/main/docs/RELEASE-NOTES-{ver}.md",
 }
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(data, fh, ensure_ascii=False, indent=2)
