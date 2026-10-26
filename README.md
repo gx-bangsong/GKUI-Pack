@@ -276,7 +276,7 @@ adb shell pm disable-user --user 0 <stock_package>
 |---|---|---|
 | C1 | **不推断包名** | known 反例:`GKUICalendar` fork 自 Etar,但它的 applicationId 是 `ws.xsoh.etar.debug`,不是 `org.lineageos.etar.debug`。凡不在事实基线中的值一律写 `TODO`,构建失败。 |
 | C2 | **只做 coexist** | `mode` 只允许 `coexist`;不生成任何写入 stock 应用目录的代码;不使用 Magisk 的 `REPLACE` 变量或 `.replace` 文件。 |
-| C3 | **只装 `system/app`**(显式确认制) | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。**物理底线**:本模块绝不进 `priv-app`、绝不生成任何白名单 XML(代码里根本没有这条路径;`customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当作残留清掉)。门禁若检出某 APK **申请**此类权限:① 条目**未写** `privileged_ack` → **排除出模块**,仅走 adb install(fail-safe,缺省行为);② 条目**显式写明** `privileged_ack: true` → 允许以 `install_as: system_app` 纳入 `/system/app`,但报告 / 清单 / 构建摘要会**逐条标注**「该 APK 申请特权权限 X/Y/Z;以普通系统应用纳入,这些权限不会被授予;<`privileged_note`>」—— `/system/app` 只是"系统应用"标记,**并不会授予**这些权限。目前唯一的 ack 条目是录音机(申请 `CAPTURE_AUDIO_OUTPUT`,通话录音不会生效,需 `recorder-priv` 分支的特权变体)。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
+| C3 | **只装 `system/app`**(显式确认制) | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。**物理底线**:本模块绝不进 `priv-app`、绝不生成任何白名单 XML(代码里根本没有这条路径;`customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当作残留清掉)。门禁若检出某 APK **申请**此类权限:① 条目**未写** `privileged_ack` → **排除出模块**,仅走 adb install(fail-safe,缺省行为);② 条目**显式写明** `privileged_ack: true` → 允许以 `install_as: system_app` 纳入 `/system/app`,但报告 / 清单 / 构建摘要会**逐条标注**「该 APK 申请特权权限 X/Y/Z;以普通系统应用纳入,这些权限不会被授予;<`privileged_note`>」—— `/system/app` 只是"系统应用"标记,**并不会授予**这些权限。目前唯一的 ack 条目是录音机(申请 `CAPTURE_AUDIO_OUTPUT`,在普通版里通话录音不会生效;需要特权时刷同次构建产出的 `-recorderpriv.zip` 特权版,见上文「双包」一节)。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
 | C4 | **不含拨号 / 短信 / 联系人** | 它们使用 `sharedUserId="android.uid.shared"` 并依赖 platform 签名,第三方签名无法替换,任何打包尝试都必然失败。因此本仓库**不接受**这类应用,即使被要求也不做。 |
 | C5 | **仓库不含 APK** | `.gitignore` 含 `*.apk`、`dist/`、`build/`、`*.keystore`;验收 `git ls-files \| grep -c '\.apk$'` 必须为 `0`;APK 由 CI 下载并校验 sha256。 |
 | C6 | **签名必须匹配** | 每个 APK 的证书 SHA-256 与 `apps.yaml` 记录不一致 → 构建失败,并提示「需卸载重装,应用内数据会丢失」。 |
@@ -340,11 +340,12 @@ v0.0.3 起录音机作为**普通系统应用**随模块一起进 `/system/app/G
   的条目,表示我们明知以下事实仍选择纳入:
   * **`/system/app` 不会授予 `CAPTURE_AUDIO_OUTPUT`。** 那只是"系统应用"标记,
     不是特权;系统只会把它当作一个普通应用对待。
-  * 因此**通话录音不会生效**;普通的麦克风录音不受影响。
-  * 要让通话录音工作,需要 ROM 侧的 priv-app 落点 + `privapp-permissions` 白名单
-    —— 这超出了本模块的范围(见 C3 的 bootloop 原因),属于 `recorder-priv` 分支的
-    特权变体,**本仓库主线不会做**。本模块绝不进 `priv-app`、绝不生成白名单 XML,
-    `customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当残留清掉。
+  * 因此**普通版里通话录音不会生效**;普通的麦克风录音不受影响。
+  * 需要通话录音时刷**特权版双包之一**(见下文「双包:普通版与 recorder-priv 特权版」):
+    录音机落到 `/system/priv-app/GKUIRecorder/` 并随包写入
+    `privapp-permissions-org.lineageos.recorder.dev.xml` 白名单。普通版 `customize.sh`
+    的物理底线不变:模块目录 `system/` 下除 `app/` 以外的任何落点都会被当残留清掉,
+    两个包模块 id 相同、互刷覆盖,不会同时生效。
 * 这条边界会出现在**三个地方**,不会只藏在文档里:`PREFLIGHT-REPORT.md`(结论
   `privileged_acknowledged` + 标注行)、`build-manifest.txt`(`note` 列)、Actions 日志里的
   构建摘要(`⚠ [privileged_ack]` 行)。
@@ -359,6 +360,30 @@ v0.0.3 起录音机作为**普通系统应用**随模块一起进 `/system/app/G
   tag 指向同一个 commit(fork 默认分支的顶端),`source_url` 按规则如实登记。
 * 复核命令:`bash scripts/probe-device.sh --filter recorder`(列出设备上用户空间的包名
   —— 那里的结果才是证据,规律不是)。
+
+### 双包:普通版与 recorder-priv 特权版
+
+v0.0.4 起单次构建同时产出两个模块 zip(模块 `id` 均为 `gkui-pack`,互刷覆盖):
+
+| 安装包 | 录音机落点 | privapp 白名单 | 通话录音 |
+|---|---|---|---|
+| `GKUI-Pack-<ver>.zip`(普通版,`update.json` 指向它) | `/system/app/GKUIRecorder` | 无 | 不生效 |
+| `GKUI-Pack-<ver>-recorderpriv.zip`(特权版) | `/system/priv-app/GKUIRecorder` | 含 `CAPTURE_AUDIO_OUTPUT` 一项 | 待真机验证 |
+
+* **白名单来源(v0.0.5 正式版)**:`device/framework-permissions.txt` —— Pixel 5 /
+  LineageOS / Android 16(SDK 36,build `BP4A.251205.006`)真机 `pm list permissions -f`
+  实测转储,严格门禁(冲突记录一律 fail-closed)。v0.0.4 的 `-recorderpriv-TEST.zip`
+  用的是源码推导表;v0.0.5 正式版生成的白名单 XML 与 v0.0.4 TEST 版**逐字节相同**
+  (构建时会自动比对,不一致即中止构建)。
+* **当前验证口径(如实标注,不夸大)**:已在 Pixel 5 / Android 16 验证开机与
+  `CAPTURE_AUDIO_OUTPUT` 授予;**通话录音功能本身尚未验证**;白名单 enforce 校验状态
+  待 v0.0.5 诊断确认(`ro.control_privapp_permissions` 在 v0.0.4 诊断中漏采)。
+  不得表述为"白名单已验证正确"。
+* **换设备或换 Android 大版本时,必须重新采集权限表**(用模块诊断生成的
+  `GKUI-diag.txt` 第 [5] 节替换 `device/framework-permissions.txt`),不得跨设备复用;
+  缺少设备表时构建自动回退到源码推导表并重新带 `-TEST` 标记。
+* 在管理器里对特权版点"更新"会被换回普通版(`update.json` 的 `zipUrl` 恒指向普通版),
+  需要特权版时手动下载对应包刷入。
 
 ---
 
@@ -429,9 +454,12 @@ scripts/
   uninstall_all.sh        逐个确认卸载
   probe-device.sh         只读采集设备事实(用于回填 TODO)
   preflight-apk.sh        APK 七项门禁
-module/                   systemless 模块源码(构建时被 build.sh 渲染进 zip)
+module/                   systemless 模块源码(普通版,构建时被 build.sh 渲染进 zip)
   module.prop  customize.sh  post-fs-data.sh  service.sh  uninstall.sh
   META-INF/com/google/android/{update-binary,updater-script}
+module-priv/              recorder-priv 特权版差异文件(Recorder 落点 priv-app + 白名单 XML)
+device/                   白名单权限表:framework-permissions.txt(Pixel 5 真机实测)
+                          与 framework-permissions.source.txt(源码推导回退,产物带 TEST)
 tests/test_build.sh       离线全流程测试(桩工具 + 假 APK)
 .github/workflows/        ci.yml(push/PR,离线)/ release.yml(tag v*,下载 APK 出包)
 AGENTS.md                 agent / 贡献者工作守则(硬约束与踩坑清单)
@@ -479,10 +507,20 @@ NOTICE.md                 上游 → fork → 本仓库 的归属与许可链条
   Magisk 模块约定(读取 `module.prop`、执行 `customize.sh`)"这一公开约定;
   Magisk 侧走标准 `install_module` 流程。`update-binary` 里为非 Magisk 环境提供了
   保守兜底流程(不确定就失败,绝不半成品安装),但同样未在真机验证。
-* **recorder(GKUIRecorder)的通话录音在本模块里不会生效**:它申请的
-  `CAPTURE_AUDIO_OUTPUT` 不会被 `/system/app` 授予(C3 显式确认制,见上文专节)。
+* **recorder(GKUIRecorder)在普通版里通话录音不会生效**:它申请的
+  `CAPTURE_AUDIO_OUTPUT` 不会被 `/system/app` 授予(C3 显式确认制,见上文专节);
+  特权版(`-recorderpriv.zip`)已在 Pixel 5 / Android 16 验证开机与
+  `CAPTURE_AUDIO_OUTPUT` 授予,但**通话录音功能本身尚未验证**,白名单 enforce 校验状态
+  (`ro.control_privapp_permissions`)待 v0.0.5 诊断确认 —— 不得表述为"白名单已验证正确"。
   "以普通系统应用形式装入后,录音机其余功能的真机行为"**未实测**;本仓库只保证门禁结论
   与标注如实。
+* **正式版特权包尚未经真机刷入验证**:v0.0.5 的 `-recorderpriv.zip` 目前只在 CI 用真实
+  APK 构建过,正式包在真机上的实际行为待下一轮诊断确认。
+* **时钟权限归属异常(原因未知,暂无功能影响证据)**:真机权限表中
+  `com.android.deskclock.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 的归属包显示为
+  stock 时钟 `com.android.deskclock`(其余四个 GKUI 应用的同名权限均归属自身),且权限表中
+  不存在 `com.android.deskclock.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`。v0.0.5 诊断
+  已增加 10 包 `pm path` 与 `dumpsys package` 采集以便继续排查,本轮不做修复。
 * **clock 的 APK 未声明 versionCode**,G7 按"未声明=0"参与比较。但"versionCode=0 的 APK
   装入 `/system/app` 后的真机行为"**未实测**。
 * **采集过程留痕**:第一次采集 clock 时 adb 偶发返回空,一度被误读成"未安装";
