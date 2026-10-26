@@ -11,6 +11,15 @@
 #        可写后复制到 /sdcard/Download/GKUI-diag.txt;若超时则在
 #        $MODDIR/GKUI-diag.txt 末尾记录原因并退出。
 #      - 绝不写 $MODDIR 和 /sdcard/Download/GKUI-diag.txt 以外的任何路径。
+#
+# 诊断报告章节(v0.0.5):
+#   [1] 7 个只读属性(键名按规格逐字固定,严禁无参 getprop 全量 dump)
+#   [2] 10 个包(5 GKUI + 5 stock)的 pm path
+#   [3] recorder.dev 的 requested/install/runtime permissions 段
+#   [4] 过滤后的 logcat(privapp|signature changed|PackageManager)
+#   [5] pm list permissions -f 全量权限表(保持原样)
+#   [6] 10 个包各取 dumpsys package 的 declared permissions 段与
+#       signatures / versionCode 行
 # =============================================================================
 MODDIR="${0%/*}"
 rm -f "$MODDIR/.boot_flag"
@@ -62,34 +71,37 @@ rm -f "$MODDIR/.boot_flag"
     printf 'timestamp_epoch: %s\n' "$(date +%s 2>/dev/null || echo unknown)"
     printf 'boot_completed: %s (waited=%ss)\n\n' "$boot_ok" "$boot_waited"
 
-    printf '--- [1] Read-only System Properties (7 allowlisted keys only) ---\n'
-    # 严禁无参 getprop 全量 dump(避免泄露序列号/IMEI)
+    printf '%s\n' '--- [1] Read-only System Properties (7 allowlisted keys only) ---'
+    # 严禁无参 getprop 全量 dump(避免泄露序列号/IMEI)。
+    # 键名逐字按诊断规格固定为以下 7 个,不得增删改(由 tests/test_build.sh 断言):
     for prop in \
-      ro.product.model \
-      ro.build.version.release \
+      ro.lineage.version \
+      ro.build.version.incremental \
+      ro.build.date.utc \
+      ro.build.fingerprint \
+      ro.control_privapp_permissions \
       ro.build.version.sdk \
-      ro.build.display.id \
-      ro.build.type \
-      ro.build.tags \
-      ro.Boot.verifiedbootstate; do
+      ro.product.device; do
       val=""
       if command -v getprop >/dev/null 2>&1; then
         val="$(getprop "$prop" 2>/dev/null)"
-        if [ "$prop" = "ro.Boot.verifiedbootstate" ] && [ -z "$val" ]; then
-          val="$(getprop ro.boot.verifiedbootstate 2>/dev/null)"
-        fi
       fi
       printf '%s: %s\n' "$prop" "${val:-<empty>}"
     done
     printf '\n'
 
-    printf '--- [2] Target Packages pm path (5 apps) ---\n'
+    printf '%s\n' '--- [2] Target Packages pm path (10 apps: 5 GKUI + 5 stock) ---'
     for pkg in \
       ws.xsoh.etar.debug \
       org.lineageos.glimpse.dev \
       com.android.calculator2.dev \
       com.android.deskclock.dev \
-      org.lineageos.recorder.dev; do
+      org.lineageos.recorder.dev \
+      org.lineageos.etar \
+      org.lineageos.glimpse \
+      com.android.calculator2 \
+      com.android.deskclock \
+      org.lineageos.recorder; do
       p_out=""
       if command -v pm >/dev/null 2>&1; then
         p_out="$(pm path "$pkg" 2>/dev/null)"
@@ -98,7 +110,7 @@ rm -f "$MODDIR/.boot_flag"
     done
     printf '\n'
 
-    printf '--- [3] dumpsys package org.lineageos.recorder.dev (permission sections) ---\n'
+    printf '%s\n' '--- [3] dumpsys package org.lineageos.recorder.dev (permission sections) ---'
     if command -v dumpsys >/dev/null 2>&1; then
       dumpsys package org.lineageos.recorder.dev 2>/dev/null | awk '
         /^[[:space:]]*(requested|install|runtime) permissions:/ {
@@ -125,7 +137,7 @@ rm -f "$MODDIR/.boot_flag"
     fi
     printf '\n'
 
-    printf '--- [4] logcat (privapp|signature changed|PackageManager, last 300 lines) ---\n'
+    printf '%s\n' '--- [4] logcat (privapp|signature changed|PackageManager, last 300 lines) ---'
     if command -v logcat >/dev/null 2>&1; then
       logcat -d 2>/dev/null | grep -E 'privapp|signature changed|PackageManager' | tail -n 300
     else
@@ -133,12 +145,58 @@ rm -f "$MODDIR/.boot_flag"
     fi
     printf '\n'
 
-    printf '--- [5] pm list permissions -f ---\n'
+    printf '%s\n' '--- [5] pm list permissions -f ---'
     if command -v pm >/dev/null 2>&1; then
       pm list permissions -f 2>/dev/null
     else
       printf '<pm unavailable>\n'
     fi
+    printf '\n'
+
+    # [6] 对 5 个 GKUI 包 + 5 个 stock 包各采集 dumpsys package 的:
+    #     "declared permissions" 段落,以及 signatures / versionCode 行。
+    #     只做只读 grep/awk 提取,不做任何改写;包未安装时输出 <not installed>。
+    printf '%s\n' '--- [6] dumpsys package x10 (declared permissions / signatures / versionCode) ---'
+    for pkg in \
+      ws.xsoh.etar.debug \
+      org.lineageos.glimpse.dev \
+      com.android.calculator2.dev \
+      com.android.deskclock.dev \
+      org.lineageos.recorder.dev \
+      org.lineageos.etar \
+      org.lineageos.glimpse \
+      com.android.calculator2 \
+      com.android.deskclock \
+      org.lineageos.recorder; do
+      printf '[%s]\n' "$pkg"
+      if command -v dumpsys >/dev/null 2>&1; then
+        d_out="$(dumpsys package "$pkg" 2>/dev/null | awk '
+          /^[[:space:]]*declared permissions:/ {
+            in_sec = 1
+            base_indent = match($0, /[^[:space:]]/) - 1
+            print
+            next
+          }
+          in_sec {
+            if ($0 ~ /^[[:space:]]*$/) {
+              in_sec = 0
+              next
+            }
+            cur_indent = match($0, /[^[:space:]]/) - 1
+            if (cur_indent <= base_indent) {
+              in_sec = 0
+            } else {
+              print
+              next
+            }
+          }
+          /versionCode|signatures/ { print }
+        ')"
+        printf '%s\n' "${d_out:-<not installed>}"
+      else
+        printf '<dumpsys unavailable>\n'
+      fi
+    done
     printf '\n'
   } > "$DIAG_FILE" 2>/dev/null
 
