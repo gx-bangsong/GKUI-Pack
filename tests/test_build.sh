@@ -703,7 +703,8 @@ if [ -f "$ZIP" ]; then
   else
     bad "特权残留未被清除"
   fi
-  if [ "$(ls -A "$MODRES/system" 2>/dev/null | tr '\n' ' ')" = "app " ]; then ok "清理后 system/ 下只剩 app/"; else bad "system/ 下仍有其它落点: $(ls -A "$MODRES/system" | tr '\n' ' ')"; fi
+  system_children="$(find "$MODRES/system" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
+  if [ "$system_children" = "app " ]; then ok "清理后 system/ 下只剩 app/"; else bad "system/ 下仍有其它落点: $system_children"; fi
   if printf '%s' "$out" | grep -q '\[清理\] 移除非 system/app 的残留落点'; then ok "清理动作有明确提示"; else bad "缺少清理提示"; fi
   if [ -f "$MODRES/system/app/GKUICalendar/GKUICalendar.apk" ]; then ok "清理不影响正常挂载"; else bad "清理后应用未挂载"; fi
 
@@ -1211,7 +1212,7 @@ if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
      && grep -q 'GKUI-Pack-v0.0.5-recorderpriv.zip' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q 'GKUI-Pack-v0.0.5.zip' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q '白名单来源：Pixel 5 / Android 16 设备权限表' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
-     && grep -q '已在 Pixel 5 / Android 16 验证开机与 `CAPTURE_AUDIO_OUTPUT` 授予' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
+     && grep -q "已在 Pixel 5 / Android 16 验证开机与 \`CAPTURE_AUDIO_OUTPUT\` 授予" "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q '通话录音功能本身尚未验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q 'enforce 校验状态待 v0.0.5 诊断确认' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q '直接在 Magisk / KernelSU / APatch 管理器里选择' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
@@ -1220,7 +1221,7 @@ if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
   else
     bad "docs/RELEASE-NOTES-v0.0.5.md 缺失或内容不完整"
   fi
-  if grep -q 'BOOT_MAX="\${DIAG_BOOT_MAX_WAIT:-120}"' "$REPO_ROOT/module/service.sh"; then
+  if grep -q "BOOT_MAX=\"\${DIAG_BOOT_MAX_WAIT:-120}\"" "$REPO_ROOT/module/service.sh"; then
     ok "module/service.sh 的 boot_completed 等待上限为 120 秒"
   else
     bad "module/service.sh 的 boot_completed 等待上限不为 120 秒"
@@ -1335,18 +1336,43 @@ if [ "$keys_ok" -eq 1 ] && ! grep -q 'ro.Boot' "$REPO_ROOT/module/service.sh"; t
 else
   bad "service.sh 属性键不符合规格(keys_ok=$keys_ok)"
 fi
-# 10 个诊断包名必须逐字出现在 service.sh(5 GKUI + 5 stock)
+# GKUI 包名保留在诊断脚本;stock 包名只允许来自构建生成的 stock-packages.list。
 pkgs_ok=1
-for pkg in $DIAG_GKUI_PKGS $DIAG_STOCK_PKGS; do
+for pkg in $DIAG_GKUI_PKGS; do
   grep -qF "$pkg" "$REPO_ROOT/module/service.sh" || pkgs_ok=0
 done
-[ "$pkgs_ok" -eq 1 ] && ok "service.sh 包含全部 10 个诊断包名" || bad "service.sh 缺少诊断包名"
+for pkg in $DIAG_STOCK_PKGS; do
+  if awk -v p="$pkg" '$1 == p { found=1 } END { exit found ? 0 : 1 }' "$REPO_ROOT/module/service.sh" \
+     || awk -v p="$pkg" '$1 == p { found=1 } END { exit found ? 0 : 1 }' "$REPO_ROOT/module/uninstall.sh"; then
+    pkgs_ok=0
+  fi
+done
+if [ "$pkgs_ok" -eq 1 ] \
+   && grep -qF 'stock-packages.list' "$REPO_ROOT/module/service.sh" \
+   && grep -qF 'stock-disabled.list' "$REPO_ROOT/module/uninstall.sh"; then
+  ok "service.sh 的 stock 包名仅从 stock-packages.list 读取;卸载从运行时清单恢复"
+else
+  bad "service.sh/uninstall.sh stock 包名来源错误或发生硬编码"
+fi
+if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
+  expected_stock_list="$(printf '%s\n' "$DIAG_STOCK_PKGS" | tr ' ' '\n')"
+  normal_stock_list="$(unzip -p "$ZIP" stock-packages.list)"
+  priv_stock_list="$(unzip -p "$ZIP_PRIV_TEST" stock-packages.list)"
+  if [ "$normal_stock_list" = "$expected_stock_list" ] \
+     && [ "$priv_stock_list" = "$expected_stock_list" ]; then
+    ok "普通版与 recorderpriv 包根目录均含按 enabled stock_package 生成的 stock-packages.list"
+  else
+    bad "双包 stock-packages.list 内容不正确"
+  fi
+fi
 # 既有保护性行为不得改动
-grep -q 'rm -f "$MODDIR/.boot_flag"' "$REPO_ROOT/module/service.sh" \
-  && grep -q 'DIAG_SDCARD_MAX_WAIT:-600' "$REPO_ROOT/module/service.sh" \
-  && grep -q 'BOOT_MAX="${DIAG_BOOT_MAX_WAIT:-120}"' "$REPO_ROOT/module/service.sh" \
-  && ok "service.sh 保留首行 rm .boot_flag / 600 秒 sdcard 轮询 / 120 秒 boot 等待" \
-  || bad "service.sh 既有诊断保护逻辑被改动"
+if grep -q "rm -f \"\$MODDIR/.boot_flag\"" "$REPO_ROOT/module/service.sh" \
+   && grep -q 'DIAG_SDCARD_MAX_WAIT:-600' "$REPO_ROOT/module/service.sh" \
+   && grep -q "BOOT_MAX=\"\${DIAG_BOOT_MAX_WAIT:-120}\"" "$REPO_ROOT/module/service.sh"; then
+  ok "service.sh 保留首行 rm .boot_flag / 600 秒 sdcard 轮询 / 120 秒 boot 等待"
+else
+  bad "service.sh 既有诊断保护逻辑被改动"
+fi
 
 # 12d.2 真机权限表文件本身:头注释、记录数、关键级别、时钟异常、零 dangerous
 if [ -f "$REAL_DUMP" ]; then ok "device/framework-permissions.txt 已入库"; else bad "缺少 device/framework-permissions.txt"; fi
@@ -1493,7 +1519,7 @@ fi
 # 正式特权包内:zip 自带白名单 XML;落点逻辑经渲染后的 customize.sh 实跑验证
 # (zip 内 APK 在 apks/,由 customize.sh 在安装期移动到 priv-app / app)
 if unzip -l "$ZIP_PRIV_DEV" | grep -q 'system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml' \
-   && unzip -p "$ZIP_PRIV_DEV" customize.sh | grep -q '\[ "\$DIR" = "GKUIRecorder" \] && SUBDIR="priv-app"' \
+   && unzip -p "$ZIP_PRIV_DEV" customize.sh | grep -Fq "[ \"\$DIR\" = \"GKUIRecorder\" ] && SUBDIR=\"priv-app\"" \
    && unzip -l "$ZIP_PRIV_DEV" | grep -q 'apks/GKUIRecorder.apk'; then
   ok "正式特权包含白名单 XML 且 customize.sh 保留 Recorder→priv-app 落点逻辑"
 else
@@ -1557,11 +1583,56 @@ else
 fi
 rm -f "$WORK/repo/device/framework-permissions.txt"
 
+head1 "12e) v0.0.6: stock 包清单过滤空值和 '-'"
+STOCK_SENTINEL_REPO="$WORK/repo-stock-sentinel"
+STOCK_SENTINEL_APKS="$WORK/apks-stock-sentinel"
+STOCK_SENTINEL_DIST="$WORK/dist-stock-sentinel"
+cp -a "$WORK/repo" "$STOCK_SENTINEL_REPO"
+build_assets "$STOCK_SENTINEL_APKS" 0
+patch_yaml "$STOCK_SENTINEL_REPO" "$STOCK_SENTINEL_APKS"
+python3 - "$STOCK_SENTINEL_REPO/apps.yaml" <<'PY_STOCK_SENTINEL'
+import sys
+p=sys.argv[1]
+s=open(p, encoding="utf-8").read().splitlines()
+app=None
+for i,line in enumerate(s):
+    if line.startswith("  - id: "):
+        app=line.split(":",1)[1].strip()
+    if app == "calendar" and line.startswith("    stock_package:"):
+        s[i]="    stock_package: -"
+    elif app == "gallery" and line.startswith("    stock_package:"):
+        s[i]='    stock_package: ""'
+open(p,"w",encoding="utf-8").write("\n".join(s)+"\n")
+PY_STOCK_SENTINEL
+out="$(cd "$STOCK_SENTINEL_REPO" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then
+  ok "apps.yaml 显式无 stock 包(空值或 '-')仍通过清单校验"
+else
+  bad "空值/'-' stock_package 被错误拒绝(rc=$rc)"; printf '%s\n' "$out" | tail -12
+fi
+out="$(run_build "$STOCK_SENTINEL_REPO" "$STOCK_SENTINEL_APKS" "$STOCK_SENTINEL_DIST" 2>&1)"; rc=$?
+STOCK_SENTINEL_ZIP="$STOCK_SENTINEL_DIST/GKUI-Pack-test-1.zip"
+STOCK_SENTINEL_PRIV="$STOCK_SENTINEL_DIST/GKUI-Pack-test-1-recorderpriv-TEST.zip"
+expected_sentinel_list="$(printf '%s\n' com.android.calculator2 com.android.deskclock org.lineageos.recorder)"
+actual_sentinel_list="$(unzip -p "$STOCK_SENTINEL_ZIP" stock-packages.list 2>/dev/null)"
+if [ $rc -eq 0 ] && [ "$actual_sentinel_list" = "$expected_sentinel_list" ]; then
+  ok "构建的 stock-packages.list 跳过空值/'-'并保留其他 enabled 包名"
+else
+  bad "stock-packages.list 空值/'-'过滤异常(rc=$rc)"; printf '%s\n' "$actual_sentinel_list"
+fi
+if [ -f "$STOCK_SENTINEL_PRIV" ] \
+   && [ "$(unzip -p "$STOCK_SENTINEL_PRIV" stock-packages.list)" = "$expected_sentinel_list" ]; then
+  ok "recorderpriv 变体也生成相同的 stock-packages.list"
+else
+  bad "recorderpriv stock-packages.list 与普通版不一致"
+fi
+
 # service.sh 后台诊断测试(桩 getprop / dumpsys / logcat / pm)
 DIAG_TEST="$WORK/diag-test"
 mkdir -p "$DIAG_TEST/mod" "$DIAG_TEST/bin" "$DIAG_TEST/sdcard-dl"
 cp "$WORK/dist/GKUI-Pack-test-1-recorderpriv-TEST.zip" "$DIAG_TEST/" 2>/dev/null || true
 unzip -p "$ZIP_PRIV_TEST" service.sh > "$DIAG_TEST/mod/service.sh"
+unzip -p "$ZIP_PRIV_TEST" stock-packages.list > "$DIAG_TEST/mod/stock-packages.list"
 chmod +x "$DIAG_TEST/mod/service.sh"
 touch "$DIAG_TEST/mod/.boot_flag"
 cat > "$DIAG_TEST/bin/getprop" <<'STUB'
@@ -1648,9 +1719,9 @@ else
   bad "GKUI-diag.txt 内容不符合预期"; cat "$DIAG_TEST/mod/GKUI-diag.txt"
 fi
 # 章节标题必须实际落盘(回归:printf '---' 在 dash/bash 下会被当成选项而丢行)
-if grep -qF -e '--- [6] dumpsys package x10' "$DIAG_TEST/mod/GKUI-diag.txt" \
+if grep -qF -e '--- [6] dumpsys package (' "$DIAG_TEST/mod/GKUI-diag.txt" \
    && grep -qF -e '--- [1] Read-only System Properties' "$DIAG_TEST/mod/GKUI-diag.txt"; then
-  ok "诊断报告 6 个章节标题全部落盘(printf 可移植写法)"
+  ok "诊断报告 7 个章节标题全部落盘(含 stock 状态节;printf 可移植写法)"
 else
   bad "诊断报告章节标题缺失"
 fi
@@ -1698,6 +1769,220 @@ if grep -q '^variant: normal$' "$DIAG_TIMEOUT/mod/GKUI-diag.txt" 2>/dev/null \
   ok "service.sh 在 /sdcard/Download 超时未解锁时在 \$MODDIR/GKUI-diag.txt 末尾记录原因并退出"
 else
   bad "service.sh 超时未解锁分支行为异常"
+fi
+
+head1 "12f) v0.0.6: service.sh 可逆停用 stock 的状态机"
+STOCK_TOGGLE="$WORK/stock-toggle"
+STOCK_TOGGLE_MOD="$STOCK_TOGGLE/mod"
+STOCK_TOGGLE_BIN="$STOCK_TOGGLE/bin"
+mkdir -p "$STOCK_TOGGLE_MOD" "$STOCK_TOGGLE_BIN" "$STOCK_TOGGLE/sdcard"
+unzip -q "$ZIP" -d "$STOCK_TOGGLE_MOD"
+cat > "$STOCK_TOGGLE_BIN/getprop" <<'STUB'
+#!/bin/sh
+[ "${1:-}" = sys.boot_completed ] && echo 1
+exit 0
+STUB
+cat > "$STOCK_TOGGLE_BIN/pm" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_PM_CALLS"
+case "${1:-}" in
+  list)
+    if [ "${2:-}" = packages ] && [ "${3:-}" = -e ]; then
+      [ "${FAKE_PM_LIST_RC:-0}" -eq 0 ] || exit "${FAKE_PM_LIST_RC:-1}"
+      if [ -f "$FAKE_PM_ENABLED_FILE" ]; then
+        while IFS= read -r listed_pkg; do
+          [ -n "$listed_pkg" ] && printf 'package:%s\n' "$listed_pkg"
+        done < "$FAKE_PM_ENABLED_FILE"
+      fi
+      exit 0
+    fi
+    if [ "${2:-}" = permissions ]; then
+      printf 'Permissions:\n'
+      exit 0
+    fi
+    exit 0
+    ;;
+  path)
+    printf 'package:/system/stub/%s.apk\n' "${2:-}"
+    exit 0
+    ;;
+  disable-user)
+    pkg="${4:-}"
+    [ "$pkg" != "${FAKE_PM_FAIL_DISABLE:-}" ] || exit 7
+    awk -v p="$pkg" '$0 != p && NF { print }' "$FAKE_PM_ENABLED_FILE" > "$FAKE_PM_ENABLED_FILE.tmp"
+    mv -f "$FAKE_PM_ENABLED_FILE.tmp" "$FAKE_PM_ENABLED_FILE"
+    exit 0
+    ;;
+  enable)
+    pkg="${2:-}"
+    [ "$pkg" != "${FAKE_PM_FAIL_ENABLE:-}" ] || exit 9
+    if ! grep -Fqx "$pkg" "$FAKE_PM_ENABLED_FILE"; then
+      printf '%s\n' "$pkg" >> "$FAKE_PM_ENABLED_FILE"
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$STOCK_TOGGLE_BIN/getprop" "$STOCK_TOGGLE_BIN/pm"
+printf '%s\n' org.lineageos.etar com.android.calculator2 org.lineageos.recorder > "$STOCK_TOGGLE/enabled.list"
+cat > "$STOCK_TOGGLE_MOD/stock-packages.list" <<'EOF'
+org.lineageos.etar
+org.lineageos.etar
+org.lineageos.glimpse
+com.android.calculator2
+com.android.deskclock
+org.lineageos.recorder
+EOF
+run_stock_toggle_service() {
+  rm -f "$STOCK_TOGGLE_MOD/GKUI-diag.txt" "$STOCK_TOGGLE/sdcard/GKUI-diag.txt"
+  env PATH="$STOCK_TOGGLE_BIN:$PATH" \
+      FAKE_PM_CALLS="$STOCK_TOGGLE/pm-calls" \
+      FAKE_PM_ENABLED_FILE="$STOCK_TOGGLE/enabled.list" \
+      FAKE_PM_FAIL_DISABLE="${1:-}" FAKE_PM_FAIL_ENABLE="${2:-}" \
+      DIAG_SDCARD_DIR="$STOCK_TOGGLE/sdcard" \
+      DIAG_BOOT_MAX_WAIT=2 DIAG_SDCARD_MAX_WAIT=2 DIAG_SDCARD_SLEEP=1 \
+      sh "$STOCK_TOGGLE_MOD/service.sh"
+  for _stock_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    grep -q 'sdcard_copy: ok' "$STOCK_TOGGLE_MOD/GKUI-diag.txt" 2>/dev/null && break
+    sleep 0.1
+  done
+}
+: > "$STOCK_TOGGLE/pm-calls"
+run_stock_toggle_service com.android.calculator2 ""
+if grep -Fqx 'disable-user --user 0 org.lineageos.etar' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'disable-user --user 0 com.android.calculator2' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'disable-user --user 0 org.lineageos.recorder' "$STOCK_TOGGLE/pm-calls" \
+   && ! grep -Fqx 'disable-user --user 0 org.lineageos.glimpse' "$STOCK_TOGGLE/pm-calls" \
+   && ! grep -Fqx 'disable-user --user 0 com.android.deskclock' "$STOCK_TOGGLE/pm-calls"; then
+  ok "无 keep-stock 时只对 pm list packages -e 中启用的 stock 调用 disable-user"
+else
+  bad "默认停用错误处理了已停用 stock 包"
+fi
+stock_after_first="$(cat "$STOCK_TOGGLE_MOD/stock-disabled.list" 2>/dev/null)"
+if [ "$stock_after_first" = "org.lineageos.etar
+org.lineageos.recorder" ] \
+   && [ "$(grep -Fc 'package=com.android.calculator2 action=disable-user rc=7' "$STOCK_TOGGLE_MOD/stock-toggle.log" || true)" -eq 1 ] \
+   && grep -q 'package=org.lineageos.glimpse action=preserve-user-disabled rc=0' "$STOCK_TOGGLE_MOD/stock-toggle.log"; then
+  ok "成功停用项唯一追加;失败有 rc 记录,用户自行停用项保持不动"
+else
+  bad "stock-disabled.list 添加/去重或失败日志异常"; cat "$STOCK_TOGGLE_MOD/stock-disabled.list" 2>/dev/null
+fi
+if grep -qF -- '--- [0] Stock app toggle state ---' "$STOCK_TOGGLE_MOD/GKUI-diag.txt" \
+   && grep -q 'stock-toggle.log:' "$STOCK_TOGGLE_MOD/GKUI-diag.txt" \
+   && grep -q 'stock-disabled.list:' "$STOCK_TOGGLE_MOD/GKUI-diag.txt"; then
+  ok "诊断文件打印 stock-toggle.log 与 stock-disabled.list"
+else
+  bad "stock 状态未写入诊断文件"
+fi
+
+# keep-stock 只恢复 stock-disabled.list 中记录的包;去重;失败项仍保留供下次重试。
+printf '%s\n' org.lineageos.etar org.lineageos.etar org.lineageos.recorder com.android.deskclock \
+  > "$STOCK_TOGGLE_MOD/stock-disabled.list"
+touch "$STOCK_TOGGLE_MOD/keep-stock"
+: > "$STOCK_TOGGLE/pm-calls"
+run_stock_toggle_service "" com.android.deskclock
+if grep -Fqx 'enable org.lineageos.etar' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'enable org.lineageos.recorder' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'enable com.android.deskclock' "$STOCK_TOGGLE/pm-calls" \
+   && ! grep -q '^disable-user ' "$STOCK_TOGGLE/pm-calls" \
+   && [ "$(cat "$STOCK_TOGGLE_MOD/stock-disabled.list")" = "com.android.deskclock" ] \
+   && grep -q 'package=com.android.deskclock action=enable rc=9' "$STOCK_TOGGLE_MOD/stock-toggle.log"; then
+  ok "有 keep-stock 时仅 enable 跟踪清单;成功项移除、失败项保留且去重"
+else
+  bad "keep-stock 恢复/移除逻辑异常"; cat "$STOCK_TOGGLE_MOD/stock-disabled.list" 2>/dev/null
+fi
+
+# 删除标记后恢复默认;已启用包被再次停用并登记,失败包仍保持唯一记录。
+rm -f "$STOCK_TOGGLE_MOD/keep-stock"
+: > "$STOCK_TOGGLE/pm-calls"
+run_stock_toggle_service com.android.calculator2 ""
+if grep -Fqx 'disable-user --user 0 org.lineageos.etar' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'disable-user --user 0 org.lineageos.recorder' "$STOCK_TOGGLE/pm-calls" \
+   && [ "$(awk 'NF {n++} END {print n+0}' "$STOCK_TOGGLE_MOD/stock-disabled.list")" -eq 3 ] \
+   && [ "$(sort -u "$STOCK_TOGGLE_MOD/stock-disabled.list" | awk 'NF {n++} END {print n+0}')" -eq 3 ]; then
+  ok "移除 keep-stock 后恢复默认停用,新增记录且 stock-disabled.list 无重复"
+else
+  bad "keep-stock 删除后的默认停用或去重异常"; cat "$STOCK_TOGGLE_MOD/stock-disabled.list" 2>/dev/null
+fi
+
+head1 "12g) v0.0.6: customize getevent 缺失降级、卸载 service.d 自动恢复"
+NOGE_BIN="$WORK/no-getevent-bin"
+mkdir -p "$NOGE_BIN"
+for _cmd in chown chmod find sha256sum cp mkdir wc tr rm cat awk; do
+  _cmd_path="$(command -v "$_cmd" 2>/dev/null)"
+  [ -n "$_cmd_path" ] && ln -sf "$_cmd_path" "$NOGE_BIN/$_cmd"
+done
+cat > "$NOGE_BIN/pm" <<'STUB'
+#!/bin/sh
+case "${1:-}" in
+  list) exit 0 ;;
+  path) exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$NOGE_BIN/pm"
+for _variant in normal priv; do
+  if [ "$_variant" = normal ]; then _zip="$ZIP"; else _zip="$ZIP_PRIV_TEST"; fi
+  _mod="$WORK/no-getevent-$_variant"
+  rm -rf "$_mod"; mkdir -p "$_mod"
+  unzip -q "$_zip" -d "$_mod"
+  out="$(env PATH="$NOGE_BIN" MODPATH="$_mod" /bin/sh "$_mod/customize.sh" 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && [ ! -e "$_mod/keep-stock" ] \
+     && printf '%s' "$out" | grep -q 'getevent 不存在' \
+     && printf '%s' "$out" | grep -q '当前选择:默认停用 stock'; then
+    ok "$_variant customize.sh 在 getevent 缺失时不报错且不创建 keep-stock"
+  else
+    bad "$_variant customize.sh 的 getevent 缺失回退异常(rc=$rc)"; printf '%s\n' "$out" | tail -10
+  fi
+done
+
+UNINSTALL_TEST="$WORK/uninstall-test"
+UNINSTALL_MOD="$UNINSTALL_TEST/mod"
+mkdir -p "$UNINSTALL_MOD"
+unzip -p "$ZIP" uninstall.sh > "$UNINSTALL_MOD/uninstall.sh"
+unzip -p "$ZIP" stock-packages.list > "$UNINSTALL_MOD/stock-packages.list"
+printf '%s\n%s\n' "$DIAG_STOCK_PKGS" org.lineageos.etar | tr ' ' '\n' > "$UNINSTALL_MOD/stock-disabled.list"
+if ! grep -q 'pm ' "$UNINSTALL_MOD/uninstall.sh"; then
+  ok "uninstall.sh 不含直接 PackageManager 调用"
+else
+  bad "uninstall.sh 含 pm 调用文本"
+fi
+sed "s|/data/adb|$UNINSTALL_TEST/data/adb|g" "$UNINSTALL_MOD/uninstall.sh" \
+  > "$UNINSTALL_MOD/uninstall-test.sh"
+sh -n "$UNINSTALL_MOD/uninstall-test.sh"
+out="$(sh "$UNINSTALL_MOD/uninstall-test.sh" 2>&1)"; rc=$?
+RESTORE_SCRIPT="$UNINSTALL_TEST/data/adb/service.d/gkui-pack-restore-stock.sh"
+if [ $rc -eq 0 ] && [ -x "$RESTORE_SCRIPT" ] && sh -n "$RESTORE_SCRIPT"; then
+  ok "uninstall.sh 生成可执行且 sh -n 通过的 service.d 一次性恢复脚本"
+else
+  bad "卸载恢复脚本生成/语法异常(rc=$rc)"; printf '%s\n' "$out"
+fi
+restore_names_ok=1
+for pkg in $DIAG_STOCK_PKGS; do
+  grep -Fqx "$pkg" "$RESTORE_SCRIPT" || restore_names_ok=0
+done
+if [ "$restore_names_ok" -eq 1 ]; then
+  ok "service.d 恢复脚本内联 stock-disabled.list 中的全部包名(重复项去重)"
+else
+  bad "service.d 恢复脚本遗漏包名"
+fi
+: > "$STOCK_TOGGLE/enabled.list"
+: > "$STOCK_TOGGLE/pm-calls"
+env PATH="$STOCK_TOGGLE_BIN:$PATH" \
+    FAKE_PM_CALLS="$STOCK_TOGGLE/pm-calls" \
+    FAKE_PM_ENABLED_FILE="$STOCK_TOGGLE/enabled.list" \
+    FAKE_PM_FAIL_ENABLE="" \
+    sh "$RESTORE_SCRIPT"
+restore_calls_ok=1
+for pkg in $DIAG_STOCK_PKGS; do
+  grep -Fqx "enable $pkg" "$STOCK_TOGGLE/pm-calls" || restore_calls_ok=0
+  grep -q "package=$pkg action=enable rc=0" "$UNINSTALL_TEST/data/adb/gkui-pack-restore.log" || restore_calls_ok=0
+done
+if [ "$restore_calls_ok" -eq 1 ] && [ ! -e "$RESTORE_SCRIPT" ]; then
+  ok "恢复脚本逐包 enable、写 /data/adb/gkui-pack-restore.log 并在执行后自删"
+else
+  bad "service.d 恢复脚本执行结果/日志/自删异常"
 fi
 
 # docs/TESTER.md 行数 <= 15 且不含任何命令,并含刷前卸载提醒

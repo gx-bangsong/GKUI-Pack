@@ -38,7 +38,8 @@
 #
 # 设计要点(勿改,改了会破坏硬约束):
 #   C1/C7  未知值必须是 TODO,并且在构建时**失败**,绝不降级为 warning。
-#   C2     mode 只允许 coexist;绝不生成任何写入 stock 应用目录的代码路径。
+#   C2     mode 只允许 coexist;绝不写 stock 应用目录或替换 stock APK;模块服务阶段仅通过
+#          pm disable-user / pm enable 可逆管理 stock 包的用户 0 启用状态。
 #   C3     只装 system/app(绝不进 priv-app、绝不生成任何白名单 XML)。
 #          检出 privileged 权限申请的条目默认**被排除出模块**(fail-safe);
 #          只有条目**显式写明** privileged_ack: true 时,才允许以 install_as: system_app
@@ -339,6 +340,7 @@ def norm_entry(raw, idx):
     for key in ALL_FIELDS:
         entry[key] = raw.get(key)
     entry["_unknown"] = unknown
+    entry["_present_fields"] = list(raw.keys())
     entry["_todo_fields"] = [k for k in ALL_FIELDS if is_todo(entry.get(k))]
     if isinstance(raw.get("enabled"), bool):
         pass
@@ -403,6 +405,9 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
         # --- 必填字段与 TODO 门禁(C1/C7) ---
         for key in REQUIRED:
             val = entry.get(key)
+            if key == "stock_package" and key in entry["_present_fields"] and val in (None, "", "-"):
+                # 明确登记无对应 stock 包时允许为空或 '-'；构建时不生成到 stock 列表。
+                continue
             if val is None:
                 problems.append("缺少必填字段 %s" % key)
             elif is_todo(val):
@@ -443,11 +448,13 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
                 errors.append("%s: name=%r 是保留名,不能作为模块内目录名" % (eid, name))
         for key in ("application_id", "stock_package"):
             val = entry.get(key)
+            if key == "stock_package" and key in entry["_present_fields"] and val in (None, "", "-"):
+                continue
             if isinstance(val, str) and not is_todo(val) and not RE_PKG.match(val):
                 errors.append("%s: %s=%r 不是合法的包名形式" % (eid, key, val))
         # --- C2:GKUI applicationId 必须与 stock 包名不同 ---
         aid, stock = entry.get("application_id"), entry.get("stock_package")
-        if isinstance(aid, str) and isinstance(stock, str) and not is_todo(aid) and not is_todo(stock):
+        if isinstance(aid, str) and isinstance(stock, str) and stock not in ("", "-") and not is_todo(aid) and not is_todo(stock):
             if aid == stock:
                 errors.append(
                     "%s: application_id 与 stock_package 相同(%s);coexist 模式要求两者不同(C2)" % (eid, aid)
@@ -499,7 +506,7 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
                 errors.append("enabled 条目的 name 重复: %s(模块内目录会冲突)" % name)
             seen_names[name.lower()] = True
         stock = entry.get("stock_package")
-        if isinstance(stock, str) and not is_todo(stock):
+        if isinstance(stock, str) and stock not in ("", "-") and not is_todo(stock):
             if stock in seen_stock:
                 errors.append(
                     "两个 enabled 条目共享同一个 stock_package(%s):同类应用重复入包" % stock
@@ -719,6 +726,32 @@ for app in data["apps"]:
 ' "$1" "$2"
 }
 
+# 从规范化 apps.yaml JSON 生成模块根目录的 stock 包清单(只收 enabled 条目)。
+# 包名为空或 '-' 表示该 GKUI 应用没有对应 stock 包;保序去重,不将其写入产物。
+build_stock_packages_list() { # $1=输出文件
+  apps_python --dump-apps-json | python3 -c '
+import json, sys
+out_path = sys.argv[1]
+data = json.load(sys.stdin)
+packages = []
+seen = set()
+for app in data["apps"]:
+    if app.get("enabled") is not True:
+        continue
+    package = app.get("stock_package")
+    if package in (None, "", "-"):
+        continue
+    if not isinstance(package, str):
+        raise SystemExit("enabled 条目的 stock_package 必须是包名、空值或 '-' ")
+    if package not in seen:
+        seen.add(package)
+        packages.append(package)
+with open(out_path, "w", encoding="utf-8") as fh:
+    if packages:
+        fh.write("\n".join(packages) + "\n")
+' "$1"
+}
+
 # ---------------------------------------------------------------------------
 # 参数解析
 # ---------------------------------------------------------------------------
@@ -800,10 +833,13 @@ mkdir -p "$DIST_DIR" "$APK_DIR"
   printf '# PREFLIGHT-REPORT — GKUI-Pack APK 门禁报告\n\n'
   if [ "$PRIV_IS_TEST" = 1 ]; then
     printf '> **⚠️ [TEST 警告] 白名单来源：源码推导，未经设备验证**\n'
+    # shellcheck disable=SC2016  # Markdown backticks are literal report content.
     printf '> - 来源文件: `device/framework-permissions.source.txt`（提取自 `LineageOS/android_frameworks_base` 分支 `lineage-23.2` commit `f4ed08a03b518772ba77c3c0a1b4185fa1712c9b` 的 `core/res/AndroidManifest.xml`）\n'
+    # shellcheck disable=SC2016  # Markdown backticks are literal report content.
     printf '> - 风险说明: 仓库当前缺少目标设备实测 `device/framework-permissions.txt`（`pm list permissions -f`），特权包标记为 `GKUI-Pack-%s-recorderpriv-TEST.zip`。若目标 ROM 对特权权限的定义与源码不一致，启动阶段可能触发 `PackageManager` 异常（模块内置二次重启自动禁用自救）。\n\n' "$VERSION"
   elif [ -n "$PERM_DUMP" ]; then
     printf '> **特权变体白名单来源：设备权限表（Pixel 5 / Android 16 实测严格门禁）**\n'
+    # shellcheck disable=SC2016  # Markdown backticks are literal report content.
     printf '> - 来源文件: `device/framework-permissions.txt`（Pixel 5 / LineageOS / Android 16 / SDK 36 / build `BP4A.251205.006`，epoch 1793032493 由 v0.0.4 priv-TEST 模块 service.sh 诊断采集，原样保存）\n'
     printf '> - 验证状态: 已在 Pixel 5 / Android 16 验证开机与 CAPTURE_AUDIO_OUTPUT 授予；通话录音功能本身尚未验证；白名单 enforce 校验状态待 v0.0.5 诊断确认（ro.control_privapp_permissions 未采集）。\n'
     printf '> - 换设备或换 Android 大版本时必须重新采集权限表，不得跨设备复用。\n\n'
@@ -831,7 +867,18 @@ if [ "$COLLECT" = 1 ]; then
   } > "$COLLECT_VALUES"
 fi
 
-apps_python --emit-tsv > "$WORK/enabled.tsv"
+# Bash 将 IFS 中的 tab 当作空白字符并折叠连续分隔符;把空字段编码为 '-'
+# 仅用于内部解析,避免 stock_package 为空时后续 TSV 列错位。
+apps_python --emit-tsv | python3 -c '
+import sys
+for line in sys.stdin:
+    cells = line.rstrip("\n").split("\t")
+    if len(cells) != 17:
+        raise SystemExit("enabled 条目 TSV 列数异常: %d" % len(cells))
+    cells = [cell if cell else "-" for cell in cells]
+    sys.stdout.write("\t".join(cells) + "\n")
+' > "$WORK/enabled.tsv"
+build_stock_packages_list "$WORK/stock-packages.list"
 : > "$WORK/included.txt"
 : > "$WORK/excluded.txt"
 
@@ -1024,11 +1071,12 @@ PYEOF
       cp -a "$ROOT/module/." "$P_STAGE/"
       cp -a "$ROOT/module/." "$P_STAGE_PRIV/"
       cp -a "$ROOT/module-priv/." "$P_STAGE_PRIV/"
+      cp "$WORK/stock-packages.list" "$P_STAGE/stock-packages.list"
+      cp "$WORK/stock-packages.list" "$P_STAGE_PRIV/stock-packages.list"
       cp "$PRIV_XML_PREVIEW" "$P_STAGE_PRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
       P_ENTRIES=""
       P_PREDS=""
-      P_STOCKS=""
-      while IFS='|' read -r C_ID C_NAME C_PKG C_STOCK C_SHA; do
+      while IFS='|' read -r C_ID C_NAME C_PKG _C_STOCK C_SHA; do
         [ -n "$C_ID" ] || continue
         cp "$WORK/apks/$C_NAME.apk" "$P_STAGE/apks/$C_NAME.apk"
         cp "$WORK/apks/$C_NAME.apk" "$P_STAGE_PRIV/apks/$C_NAME.apk"
@@ -1040,19 +1088,13 @@ PYEOF
         if [ -n "$p_tag" ] || [ -n "$p_sha" ] || [ -n "$p_sig" ]; then
           P_PREDS="${P_PREDS}${C_PKG}|${C_NAME}|${p_tag}|$(norm_hex "$p_sha")|$(norm_hex "$p_sig")|${c_tag}"$'\n'
         fi
-        case "$(printf '%s\n' "$P_STOCKS")" in
-          *"$C_STOCK"*) : ;;
-          *) P_STOCKS="${P_STOCKS}${C_STOCK}"$'\n' ;;
-        esac
       done < "$WORK/collect-included.txt"
       P_ENTRIES="${P_ENTRIES%$'\n'}"
       P_PREDS="${P_PREDS%$'\n'}"
-      P_STOCKS="${P_STOCKS%$'\n'}"
       render_placeholder "$P_STAGE/module.prop"  '__VERSION__' "$VERSION"
       render_placeholder "$P_STAGE/module.prop"  '__VERSION_CODE__' "$VERSION_CODE"
       render_placeholder "$P_STAGE/customize.sh" '__APP_ENTRIES__' "$P_ENTRIES"
       render_placeholder "$P_STAGE/customize.sh" '__PREDECESSOR_ENTRIES__' "$P_PREDS"
-      render_placeholder "$P_STAGE/uninstall.sh" '__STOCK_PACKAGES__' "$P_STOCKS"
       render_placeholder "$P_STAGE/service.sh"   '__VERSION__' "$VERSION"
       render_placeholder "$P_STAGE/service.sh"   '__VARIANT__' "normal"
       render_placeholder "$P_STAGE_PRIV/module.prop"  '__VERSION__' "$VERSION"
@@ -1062,7 +1104,6 @@ PYEOF
       render_placeholder "$P_STAGE_PRIV/customize.sh" '__APP_ENTRIES__' "$P_ENTRIES"
       render_placeholder "$P_STAGE_PRIV/customize.sh" '__PREDECESSOR_ENTRIES__' "$P_PREDS"
       render_placeholder "$P_STAGE_PRIV/customize.sh" '__PRIVAPP_PERMISSIONS_XML__' "$(cat "$PRIV_XML_PREVIEW")"
-      render_placeholder "$P_STAGE_PRIV/uninstall.sh" '__STOCK_PACKAGES__' "$P_STOCKS"
       render_placeholder "$P_STAGE_PRIV/service.sh"   '__VERSION__' "$VERSION"
       render_placeholder "$P_STAGE_PRIV/service.sh"   '__VARIANT__' "priv-TEST"
       chmod 0755 "$P_STAGE"/*.sh "$P_STAGE/META-INF/com/google/android/update-binary"
@@ -1114,10 +1155,10 @@ excluded_count="$(grep -c . "$WORK/excluded.txt" || true)"
 STAGE="$WORK/stage"
 mkdir -p "$STAGE/apks"
 cp -a "$ROOT/module/." "$STAGE/"
+cp "$WORK/stock-packages.list" "$STAGE/stock-packages.list"
 
 ENTRY_LINES=""
 PREDECESSOR_LINES=""
-STOCK_LINES=""
 while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET _PRIV _NOTE; do
   [ -n "$APP_ID" ] || continue
   cp "$WORK/apks/$APP_NAME.apk" "$STAGE/apks/$APP_NAME.apk"
@@ -1129,20 +1170,14 @@ while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _AS
   if [ -n "$prev_tag" ] || [ -n "$prev_sha" ] || [ -n "$prev_signer" ]; then
     PREDECESSOR_LINES="${PREDECESSOR_LINES}${APP_PKG}|${APP_NAME}|${prev_tag}|$(norm_hex "$prev_sha")|$(norm_hex "$prev_signer")|${curr_tag}"$'\n'
   fi
-  case "$(printf '%s\n' "$STOCK_LINES")" in
-    *"$STOCK_PKG"*) : ;;
-    *) STOCK_LINES="${STOCK_LINES}${STOCK_PKG}"$'\n' ;;
-  esac
 done < "$WORK/included.txt"
 ENTRY_LINES="${ENTRY_LINES%$'\n'}"
 PREDECESSOR_LINES="${PREDECESSOR_LINES%$'\n'}"
-STOCK_LINES="${STOCK_LINES%$'\n'}"
 
 render_placeholder "$STAGE/module.prop"   '__VERSION__'      "$VERSION"
 render_placeholder "$STAGE/module.prop"   '__VERSION_CODE__' "$VERSION_CODE"
 render_placeholder "$STAGE/customize.sh"  '__APP_ENTRIES__'  "$ENTRY_LINES"
 render_placeholder "$STAGE/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
-render_placeholder "$STAGE/uninstall.sh"  '__STOCK_PACKAGES__' "$STOCK_LINES"
 render_placeholder "$STAGE/service.sh"    '__VERSION__'      "$VERSION"
 render_placeholder "$STAGE/service.sh"    '__VARIANT__'      "normal"
 
@@ -1202,6 +1237,7 @@ $diff_out"
   mkdir -p "$STAGE_PRIV/apks" "$STAGE_PRIV/system/etc/permissions"
   cp -a "$ROOT/module/." "$STAGE_PRIV/"
   cp -a "$ROOT/module-priv/." "$STAGE_PRIV/"
+  cp "$WORK/stock-packages.list" "$STAGE_PRIV/stock-packages.list"
   cp -a "$STAGE/apks/." "$STAGE_PRIV/apks/"
   cp "$PRIV_XML" "$STAGE_PRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
 
@@ -1224,7 +1260,6 @@ $diff_out"
   render_placeholder "$STAGE_PRIV/customize.sh"  '__APP_ENTRIES__'      "$ENTRY_LINES"
   render_placeholder "$STAGE_PRIV/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
   render_placeholder "$STAGE_PRIV/customize.sh"  '__PRIVAPP_PERMISSIONS_XML__' "$(cat "$PRIV_XML")"
-  render_placeholder "$STAGE_PRIV/uninstall.sh"  '__STOCK_PACKAGES__'   "$STOCK_LINES"
   render_placeholder "$STAGE_PRIV/service.sh"    '__VERSION__'          "$VERSION"
   render_placeholder "$STAGE_PRIV/service.sh"    '__VARIANT__'          "$PRIV_VARIANT_ID"
 
@@ -1333,5 +1368,5 @@ printf '清单: %s\n' "$MANIFEST"
 [ "$NO_ZIP" = 1 ] || printf '模块包: %s\n' "$ZIP_OUT"
 [ "$NO_ZIP" = 1 ] || [ -z "$PRIV_ZIP_OUT" ] || printf '特权包: %s\n' "$PRIV_ZIP_OUT"
 log ""
-printf '%s完成。%s模块为 coexist 模式:不替换、不修改任何 stock 应用。\n' "$C_GRN" "$C_RST"
+printf '%s完成。%s模块为 coexist 模式:不替换或改写 stock 文件;默认在开机后可逆停用对应 stock 包,可通过 keep-stock 保留。\n' "$C_GRN" "$C_RST"
 printf '提醒:模块与设备 /data 中已安装的同包名应用会冲突,刷入前请先按 README 处理(C8)。\n'

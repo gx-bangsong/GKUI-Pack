@@ -3,5 +3,5 @@
 # 本文件只是模块格式的占位符:MagiHub / Magisk / KernelSU / APatch 的模块 zip
 # 必须在 META-INF/com/google/android/ 下同时存在 updater-script 与 update-binary。
 # 真正的安装逻辑在 ../../../update-binary 与模块根目录的 customize.sh。
-# 本模块为 coexist 模式:不替换、不修改、不禁用任何 ROM 自带应用。
+# 本模块为 coexist 模式:不替换或改写 ROM 自带应用文件;service.sh 会可逆管理对应包的启用状态。
 # ---------------------------------------------------------------------------

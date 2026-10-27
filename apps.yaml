@@ -11,7 +11,8 @@
 #   id                     本工程内部标识(小写字母/数字/下划线)
 #   name                   模块内目录名,产物路径 system/app/<name>/<name>.apk
 #   application_id         【设备实测】GKUI 应用真实包名(带 .debug/.dev 后缀)
-#   stock_package          【设备实测】ROM 自带应用包名(coexist 的参照物,不替换)
+#   stock_package          【设备实测】ROM 自带应用包名(coexist 的参照物,不替换);
+#                          若确认没有对应 stock 包,显式填写空值或 '-'
 #   repo                   APK 来源仓库,格式 owner/name(GitHub Releases)
 #   upstream               repo 的上游项目
 #   license                repo 的许可(以本工程事实基线为准)
@@ -32,7 +33,7 @@
 #                          priv-app、绝不生成白名单 XML 的物理底线不变。
 #   privileged_note        【可选,仅与 privileged_ack: true 搭配】用人话写明后果
 #                          (如"通话录音不会生效,需 priv 变体"),原样进入三处标注。
-#   mode                   仅允许 coexist(见 C2:绝不 replace,绝不碰 stock 应用)
+#   mode                   仅允许 coexist(见 C2:绝不 replace 或写 stock 目录;模块默认可逆管理 stock 包启用状态)
 #   confidence             confirmed / unverified(unverified 一律不得入包)
 #   enabled                是否纳入构建
 #

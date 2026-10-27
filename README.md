@@ -67,8 +67,8 @@ bash scripts/install_all.sh -s <序列号>  # 连接了多台设备时指定
 * 默认「图库 / 相册」→ 选 GKUI 图库(部分 ROM 没有独立的默认图库开关,
   此时打开图片时选「始终使用 GKUI 图库」即可)。
 
-GKUI 应用与 ROM 自带应用是**两个不同的应用**(包名不同),
-切换默认应用只影响「打开方式」,不会卸载或禁用自带应用。
+GKUI 应用与 ROM 自带应用是**两个不同的应用**(包名不同),切换默认应用只影响「打开方式」。
+本节的免 root `adb install` 路径不会更改 stock 应用状态;systemless 模块路径的 stock 处理见下文「stock 应用处理」。
 
 ### 4. 回退
 
@@ -206,8 +206,10 @@ $inner = Get-ChildItem .\calc -Recurse -Filter *.apk | Select-Object -First 1
 
 ## 🧩 次方案:systemless 模块(Magisk / KernelSU / APatch)
 
-模块为 **coexist 模式**:APK 挂载到 `/system/app/<Name>/`,与 ROM 自带应用**共存**,
-**绝不替换、绝不修改、绝不禁用**任何自带应用。
+模块为 **coexist 模式**:GKUI APK 挂载到 `/system/app/<Name>/`(特权版 Recorder 除外),
+GKUI 与 stock 包名不同,不替换/覆盖 stock APK 或分区目录。自 v0.0.6 起,模块默认在开机后
+可逆停用 `apps.yaml` 中对应且当前启用的 stock 应用(仅 user 0);想保留 stock 可在安装时
+按音量下,或使用 `keep-stock` 文件控制,详情见下文。
 
 ### ⚠️ 刷入前必须先做的一件事(C8)
 
@@ -259,14 +261,30 @@ bash build.sh
 * `service.sh`:开机成功进入系统服务阶段后删除 `.boot_flag`,并把时间戳写入
   `last_boot.log`。
 
-### 隐藏 ROM 自带应用(可选,需你自己执行)
+### stock 应用处理(可逆、可选)
 
-本模块**不会**替你做这件事。如果你确实想隐藏自带应用:
+为避免安装后 stock 同类应用图标仍留在桌面,模块 v0.0.6 起默认在开机后读取构建时从
+`apps.yaml` 生成的 `stock-packages.list`,并对**当前仍启用**的同类 stock 包执行
+`pm disable-user --user 0`。stock APK 与 `/system`、`/system_ext`、`/product` 等分区文件
+不会被删除、替换或覆盖;模块只改变 Android PackageManager 中 user 0 的启用状态。
 
-```bash
-adb shell pm disable-user --user 0 <stock_package>
-# 恢复:adb shell pm enable <stock_package>
-```
+**安装时选择**：安装器提示出现后,10 秒内按音量下会在模块目录创建 `keep-stock` 文件,
+表示保留 stock;按音量上、超时,或 `getevent` 不存在/无法读取按键,都会采用默认行为
+(开机后停用 stock)。安装器会打印最终选择。音量键在管理器安装环境中的可读性尚未在真机验证。
+
+**安装后改主意**：用 root 文件管理器在模块目录创建或删除 `keep-stock` 文件,然后重启即可。
+文件存在时模块不再停用 stock;如果模块之前停用过,会在重启时重新启用这些记录过的应用。
+删除文件后,重启会恢复默认策略。模块只会恢复 `stock-disabled.list` 中由自己成功停用的包,
+不会动用户原先自行停用的 stock 应用。
+
+**卸载与模块开关**：卸载模块时会把已记录包名内联到
+`/data/adb/service.d/gkui-pack-restore-stock.sh`;下一次启动后该一次性脚本会逐个恢复应用、
+记录结果并自删。此 service.d 路径在 KernelSU / APatch 下是否执行仍待真机验证。
+仅在管理器里关闭模块开关并不等于卸载:此时 `service.sh` 不再运行,stock 会继续保持停用。
+临时切回 stock 时不要关模块开关;请创建 `keep-stock` 后重启,或直接卸载模块再重启
+(卸载流程会安排自动恢复)。
+
+**时钟提醒**：停用 stock 时钟后,原有 stock 时钟闹钟不会响;请在 GKUI 时钟中重新设置闹钟。
 
 ---
 
@@ -275,7 +293,7 @@ adb shell pm disable-user --user 0 <stock_package>
 | 编号 | 约束 | 说明 |
 |---|---|---|
 | C1 | **不推断包名** | known 反例:`GKUICalendar` fork 自 Etar,但它的 applicationId 是 `ws.xsoh.etar.debug`,不是 `org.lineageos.etar.debug`。凡不在事实基线中的值一律写 `TODO`,构建失败。 |
-| C2 | **只做 coexist** | `mode` 只允许 `coexist`;不生成任何写入 stock 应用目录的代码;不使用 Magisk 的 `REPLACE` 变量或 `.replace` 文件。 |
+| C2 | **只做 coexist;stock 状态可逆** | `mode` 只允许 `coexist`;不写入/删除/覆盖 stock 应用目录,不使用 Magisk `REPLACE` 变量或 `.replace` 文件。v0.0.6 起模块默认在开机后对 `stock-packages.list` 中当前启用的 user 0 包执行 `pm disable-user`,只追踪成功停用项;`keep-stock` 保留/恢复,卸载时安排 service.d 脚本 `pm enable`。禁止 `pm uninstall`、写 `/data/data`。 |
 | C3 | **只装 `system/app`**(显式确认制) | 带后缀的新包名不在 ROM 的 privapp 白名单里,放进特权应用目录并申请 `signature\|privileged` 权限会导致 zygote 抛白名单错误 → bootloop。**物理底线**:本模块绝不进 `priv-app`、绝不生成任何白名单 XML(代码里根本没有这条路径;`customize.sh` 还会把模块目录 `system/` 下除 `app/` 以外的任何落点当作残留清掉)。门禁若检出某 APK **申请**此类权限:① 条目**未写** `privileged_ack` → **排除出模块**,仅走 adb install(fail-safe,缺省行为);② 条目**显式写明** `privileged_ack: true` → 允许以 `install_as: system_app` 纳入 `/system/app`,但报告 / 清单 / 构建摘要会**逐条标注**「该 APK 申请特权权限 X/Y/Z;以普通系统应用纳入,这些权限不会被授予;<`privileged_note`>」—— `/system/app` 只是"系统应用"标记,**并不会授予**这些权限。目前唯一的 ack 条目是录音机(申请 `CAPTURE_AUDIO_OUTPUT`,在普通版里通话录音不会生效;需要特权时刷同次构建产出的 `-recorderpriv.zip` 特权版,见上文「双包」一节)。(注意:APK **自己声明**的 signature 级权限,例如 androidx 的 `*.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,由它自己满足,不构成模块化障碍 → 只报告不排除。) |
 | C4 | **不含拨号 / 短信 / 联系人** | 它们使用 `sharedUserId="android.uid.shared"` 并依赖 platform 签名,第三方签名无法替换,任何打包尝试都必然失败。因此本仓库**不接受**这类应用,即使被要求也不做。 |
 | C5 | **仓库不含 APK** | `.gitignore` 含 `*.apk`、`dist/`、`build/`、`*.keystore`;验收 `git ls-files \| grep -c '\.apk$'` 必须为 `0`;APK 由 CI 下载并校验 sha256。 |
