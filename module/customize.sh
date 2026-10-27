@@ -11,7 +11,7 @@
 # 此时清单为空,脚本会拒绝安装(见下面的清单检查)。
 #
 # 硬约束落实:
-#   C2  只写 system/app,绝不动任何 ROM 自带应用,不产生任何替换语义
+#   C2  只写模块自身挂载目录;不替换/覆盖 stock 文件;开机后可逆管理 stock 启用状态
 #   C3  只装 system/app(绝不使用特权应用目录),也不生成任何权限白名单;
 #       system/ 下除 app/ 以外的任何落点都视为残留并清除(见第 5 步)
 #   C8  与 /data 中同包名应用冲突时:**中止整个安装**并让用户自行卸载,
@@ -43,8 +43,94 @@ fi
 
 ui_print "************************************************"
 ui_print " GKUI-Pack —— coexist 模式 systemless 模块"
-ui_print " 只挂载 system/app;不替换、不修改、不禁用任何自带应用"
+ui_print " 挂载 GKUI 应用;不替换或覆盖 stock 文件;默认开机后可逆停用对应 stock 应用"
 ui_print "************************************************"
+
+choose_stock_policy() {
+  # 安装时重置旧选择;只有本轮明确按音量下才生成 keep-stock。
+  rm -f "$MODPATH/keep-stock" 2>/dev/null
+  ui_print "- stock 应用选择:默认在开机后停用 GKUI 对应的 ROM 自带应用。"
+  ui_print "    10 秒内按音量下 = 保留 stock;按音量上或超时 = 默认停用。"
+
+  GETEVENT_BIN="$(command -v getevent 2>/dev/null)"
+  if [ -z "$GETEVENT_BIN" ] && [ -x /system/bin/getevent ]; then
+    GETEVENT_BIN=/system/bin/getevent
+  fi
+  if [ -z "$GETEVENT_BIN" ]; then
+    ui_print "    当前选择:默认停用 stock(getevent 不存在,未读取按键)。"
+    return 0
+  fi
+
+  STOCK_KEY_EVENTS="$MODPATH/.stock-key-events"
+  rm -f "$STOCK_KEY_EVENTS" 2>/dev/null
+  if ! : > "$STOCK_KEY_EVENTS" 2>/dev/null; then
+    ui_print "    当前选择:默认停用 stock(无法创建按键检测临时文件)。"
+    return 0
+  fi
+
+  "$GETEVENT_BIN" -l > "$STOCK_KEY_EVENTS" 2>/dev/null &
+  GETEVENT_PID=$!
+  STOCK_KEY_CHOICE=""
+  STOCK_KEY_WAITED=0
+  STOCK_KEY_TIMED_OUT=0
+  while [ "$STOCK_KEY_WAITED" -lt 10 ]; do
+    if [ -s "$STOCK_KEY_EVENTS" ]; then
+      STOCK_KEY_CHOICE="$(awk '
+        {
+          value = $NF
+          if (value != "DOWN" && value != "1" && value != "00000001" && value != "0x00000001") next
+          if ($0 ~ /KEY_VOLUMEDOWN/) { print "keep"; exit }
+          if ($0 ~ /KEY_VOLUMEUP/) { print "disable"; exit }
+        }
+      ' "$STOCK_KEY_EVENTS" 2>/dev/null)"
+      [ -n "$STOCK_KEY_CHOICE" ] && break
+    fi
+    if ! kill -0 "$GETEVENT_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+    STOCK_KEY_WAITED=$((STOCK_KEY_WAITED + 1))
+  done
+  if kill -0 "$GETEVENT_PID" 2>/dev/null; then
+    STOCK_KEY_TIMED_OUT=1
+    kill "$GETEVENT_PID" 2>/dev/null || true
+  fi
+  wait "$GETEVENT_PID" 2>/dev/null
+  GETEVENT_RC=$?
+  if [ -z "$STOCK_KEY_CHOICE" ] && [ -s "$STOCK_KEY_EVENTS" ]; then
+    STOCK_KEY_CHOICE="$(awk '
+      {
+        value = $NF
+        if (value != "DOWN" && value != "1" && value != "00000001" && value != "0x00000001") next
+        if ($0 ~ /KEY_VOLUMEDOWN/) { print "keep"; exit }
+        if ($0 ~ /KEY_VOLUMEUP/) { print "disable"; exit }
+      }
+    ' "$STOCK_KEY_EVENTS" 2>/dev/null)"
+  fi
+  rm -f "$STOCK_KEY_EVENTS" 2>/dev/null
+
+  case "$STOCK_KEY_CHOICE" in
+    keep)
+      if : > "$MODPATH/keep-stock" 2>/dev/null; then
+        ui_print "    当前选择:保留/恢复 stock(已创建 keep-stock)。"
+      else
+        ui_print "    当前选择:默认停用 stock(无法创建 keep-stock)。"
+      fi
+      ;;
+    disable)
+      ui_print "    当前选择:默认停用 stock(检测到音量上)。"
+      ;;
+    *)
+      if [ "$STOCK_KEY_TIMED_OUT" -eq 1 ]; then
+        ui_print "    当前选择:默认停用 stock(10 秒内未检测到音量键)。"
+      elif [ "$GETEVENT_RC" -ne 0 ]; then
+        ui_print "    当前选择:默认停用 stock(getevent 读取按键失败)。"
+      else
+        ui_print "    当前选择:默认停用 stock(未检测到音量键)。"
+      fi
+      ;;
+  esac
+}
 
 # -----------------------------------------------------------------------------
 # 1) 环境识别
@@ -274,6 +360,8 @@ if [ -n "$CONFLICT" ]; then
   abort "安装中止:/data 中存在同包名应用(C8)"
 fi
 
+choose_stock_policy
+
 # -----------------------------------------------------------------------------
 # 5) 清理另一种落点(C3 兜底)
 #    本模块(普通版)的 system/ 下**只允许 app/**。特权变体(分支 recorder-priv,
@@ -369,8 +457,7 @@ EOF
 ui_print "    本次挂载: $INSTALLED_COUNT 项,合计 $TOTAL 字节"
 
 ui_print "- 提示:"
-ui_print "    本模块为 coexist 模式,未改动任何自带应用。"
-ui_print "    如需隐藏自带应用,请自行执行(本模块不会替你做):"
-ui_print "        pm disable-user --user 0 <stock_package>"
-ui_print "    重启后生效。若刷入后无法正常开机,下一次开机时本模块会检测到未完成的"
-ui_print "    启动标记并自动禁用自身,从而打破 bootloop(见 post-fs-data.sh)。"
+ui_print "    service.sh 会在开机后按 stock-packages.list 可逆停用对应 stock 应用。"
+ui_print "    安装后可在模块目录创建 keep-stock 文件并重启以保留/恢复 stock;删除该文件后重启则恢复默认停用。"
+ui_print "    卸载模块会安排下一次启动自动恢复本模块曾停用的 stock 应用。"
+ui_print "    若刷入后无法正常开机,下一次开机时模块会检测到未完成的启动标记并自动禁用自身,从而打破 bootloop。"

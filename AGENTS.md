@@ -41,7 +41,7 @@
 | 编号 | 约束 | 在代码中的落点 |
 |---|---|---|
 | C1 | 禁止推断 applicationId;未知值 `TODO` + 构建失败 | `build.sh` 字段校验 |
-| C2 | `mode` 恒为 `coexist`,**严禁** `replace`;禁止任何写 stock 目录的路径;禁止 Magisk `REPLACE` / `.replace` | `build.sh`、`module/customize.sh` |
+| C2 | `mode` 恒为 `coexist`,**严禁** `replace`;禁止写入/删除/覆盖 stock 应用目录;禁止 Magisk `REPLACE` / `.replace`。模块 v0.0.6 起默认在开机后对 `stock-packages.list` 中当前启用的 user 0 包执行可逆 `pm disable-user`,只记录本模块成功停用的包;`keep-stock` 可保留/恢复,卸载时用 service.d 一次性脚本恢复。不得 `pm uninstall`、不得写 `/data/data`。 | `build.sh`、`module/customize.sh`、`module/service.sh`、`module/uninstall.sh` |
 | C3 | 一律装到 `/system/app/<Name>/`,**严禁 `priv-app`**、严禁生成任何白名单 XML(物理底线);检出 privileged 权限申请时按**显式确认制**处理:条目未写 `privileged_ack` → **不入模块**(fail-safe,README 标注"仅走 adb install");条目写明 `privileged_ack: true` → 以 `system_app` 纳入,但报告 / 清单 / 构建摘要必须**逐条标注**申请了哪些特权权限、这些权限不会被授予、后果(`privileged_note`)。`customize.sh` 还会清掉模块目录 `system/` 下除 `app/` 以外的任何落点(从 `recorder-priv` 变体刷回时不留残留) | `preflight-apk.sh`、`build.sh`、`module/customize.sh` |
 | C4 | 严禁纳入拨号 / 短信 / 联系人(`sharedUserId="android.uid.shared"` + platform 签名,第三方签名无法替换) | `apps.yaml` 字段校验 + CI 检查 |
 | C5 | 仓库不得提交任何 `.apk` | `.gitignore`、`tests/test_build.sh` |
@@ -53,6 +53,17 @@
 (它不参与构建)。这样某个应用在"事实待确认"的长期状态下不会卡死整个项目
 (v0.0.2 之前的录音机即如此;v0.0.3 起五个条目全部启用,当前没有条目用到这条宽松)。
 需要字面语义时用 `--strict`。
+
+### v0.0.6 stock 应用策略(覆盖旧规则)
+
+用户反馈安装 GKUI 后 stock 应用图标仍然可见,因此旧的"模块不得禁用 stock,只在 README
+提供手动命令"规则作废。模块现默认在开机后用 `pm disable-user --user 0` 停用仍启用的
+同类 stock 包;通过 `stock-disabled.list` 仅追踪模块本次成功停用的包。安装时可按音量下
+生成 `keep-stock`,也可在模块目录创建/删除该标记后重启以保留或恢复默认行为;卸载时
+生成 `/data/adb/service.d/gkui-pack-restore-stock.sh`,在下次启动后执行 `pm enable` 并自删。
+这只改变 PackageManager 的 user 0 启用状态,stock APK 与分区目录不删除、不替换、不覆盖;
+用户自行停用但未被本模块记录的包不会被恢复。仍然禁止 `pm uninstall`、写 `/data/data`、
+Magisk `REPLACE` 变量和 `.replace` 文件。
 
 ## 3. 目录地图
 

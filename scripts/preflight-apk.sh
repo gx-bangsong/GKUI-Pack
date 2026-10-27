@@ -133,6 +133,9 @@ for app in data.get("apps", []):
         out = []
         for f in fields:
             v = app.get(f)
+            # stock_package 允许显式为空(该 GKUI 应用没有对应 stock 包);用 '-' 保留 TSV 列位。
+            if f == "stock_package" and v in (None, ""):
+                v = "-"
             # 可选字段缺省时输出占位符:IFS=制表符 的 read 会把连续空字段折叠,不能留空
             if f == "privileged_ack":
                 v = "true" if v is True else "false"

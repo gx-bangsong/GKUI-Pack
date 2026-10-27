@@ -3,4 +3,4 @@ name=GKUI-Pack (__PRIV_NAME_SUFFIX__)
 version=__VERSION__
 versionCode=__VERSION_CODE__
 author=GKUI-Pack contributors
-description=以 coexist 模式把 GKUI 本土化应用挂载到系统中(录音机挂载到 system/priv-app/GKUIRecorder 并配置 privapp-permissions 白名单;其余应用挂载到 system/app);不替换、不修改、不禁用任何 ROM 自带应用。__PRIV_SOURCE_NOTE__。安装前须先卸载 /data 中已安装的同包名应用(见 README 与 customize.sh 的冲突检查)。
+description=以 coexist 模式把 GKUI 本土化应用挂载到系统中(录音机挂载到 system/priv-app/GKUIRecorder 并配置 privapp-permissions 白名单;其余应用挂载到 system/app);默认在开机后可逆停用 apps.yaml 对应的 ROM 自带应用,安装时按音量下或创建 keep-stock 可保留,卸载后下次开机自动恢复模块记录停用的应用;不替换或改写 stock 文件。__PRIV_SOURCE_NOTE__。安装前须先卸载 /data 中已安装的同包名应用(见 README 与 customize.sh 的冲突检查)。
