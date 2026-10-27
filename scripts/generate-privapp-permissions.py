@@ -24,6 +24,15 @@
 #      duplicate `<permission>` declarations in AOSP/LineageOS manifest union
 #      their protectionLevel tokens ("宁可多写不能少写": any declaration with
 #      `privileged` is included).
+#   6) Device dumps come from `pm list permissions -f`, which (measured on
+#      Pixel 5 / Android 16) does NOT enumerate dangerous runtime permissions:
+#      the dump contains zero `dangerous` records. A requested permission
+#      absent from such a dump therefore cannot be a privileged permission and
+#      can never belong in a privapp XML — it is skipped with an explicit
+#      report line, never silently guessed. If the dump DOES contain dangerous
+#      records, any absent requested permission remains a fail-closed error
+#      (the coverage gap no longer has a measured explanation). Source mode
+#      always keeps the original fail-closed behavior.
 # =============================================================================
 
 from __future__ import annotations
@@ -221,6 +230,16 @@ def generate(
         "源码推导(未经设备验证)" if mode == "source" else "设备实测转储(strict)"
     )
     report.append(f"白名单模式: {mode} ({source_label}) — 来源文件: {dump}")
+    # 实测属性(见本文件头规则 6):设备端 pm list permissions -f 不列出 dangerous
+    # 运行时权限(Pixel 5 / Android 16 转储中 dangerous 记录数为 0)。该属性只用于
+    # 解释"请求了但转储里没有"的权限;一旦转储本身含有 dangerous 记录,缺失即未知,
+    # 仍然 fail-closed。
+    dump_has_dangerous = any("dangerous" in lvl for lvl in levels.values())
+    if mode == "device" and not dump_has_dangerous:
+        report.append(
+            "设备转储不含 dangerous 运行时权限(pm list permissions -f 的实测行为);"
+            "请求但未出现在转储中的运行时权限显式跳过,不写入白名单"
+        )
 
     for app_json in app_jsons:
         app_id, package, requested, declared = load_app_permissions(app_json)
@@ -251,6 +270,12 @@ def generate(
                 )
                 continue
             if permission not in levels:
+                if mode == "device" and not dump_has_dangerous:
+                    report.append(
+                        f"  - {permission} [设备转储未列出;实测转储无 dangerous 类权限,"
+                        f"该项为运行时权限,非 privapp 白名单范围 → 跳过,不写入]"
+                    )
+                    continue
                 errors.append(f"{app_id}: {permission} 未出现在权限列表中(拒绝猜测)")
                 continue
             if permission in incomplete:
