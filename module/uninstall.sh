@@ -9,6 +9,7 @@
 
 MODDIR=${0%/*}
 STOCK_PACKAGES_FILE="$MODDIR/stock-packages.list"
+MERGED_STOCK_FILE="$MODDIR/stock-merged.list"
 DISABLED_FILE="$MODDIR/stock-disabled.list"
 RESTORE_LIST="$MODDIR/.stock-restore-packages.tmp"
 RESTORE_DIR=/data/adb/service.d
@@ -30,12 +31,21 @@ stock_package_listed() {
   grep -Fqx "$1" "$STOCK_PACKAGES_FILE" 2>/dev/null
 }
 
+stock_package_merged() {
+  [ -r "$MERGED_STOCK_FILE" ] || return 1
+  grep -Fqx "$1" "$MERGED_STOCK_FILE" 2>/dev/null
+}
+
 if [ -s "$DISABLED_FILE" ]; then
   if : > "$RESTORE_LIST" 2>/dev/null; then
     while IFS= read -r PKG; do
       [ -n "$PKG" ] || continue
       if ! valid_stock_package "$PKG"; then
         echo "- 忽略无效的 stock 包名记录: $PKG"
+        continue
+      fi
+      if stock_package_merged "$PKG"; then
+        echo "- 跳过 MERGED stock 包恢复记录: $PKG"
         continue
       fi
       if ! stock_package_listed "$PKG"; then
@@ -70,7 +80,7 @@ while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ]; do
  done
 while IFS= read -r PKG; do
   [ -n "$PKG" ] || continue
-  "$RESTORE_PM" enable "$PKG" >/dev/null 2>&1
+  "$RESTORE_PM" enable --user 0 "$PKG" >/dev/null 2>&1
   RC=$?
   TIMESTAMP="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)"
   [ -n "$TIMESTAMP" ] || TIMESTAMP=unknown
@@ -109,6 +119,7 @@ rm -f "$MODDIR/.boot_flag" \
       "$MODDIR/.preflight.json" \
       "$MODDIR/GKUI-diag.txt" \
       "$MODDIR/stock-toggle.log" \
+      "$MODDIR/grant.log" \
       "$MODDIR/.stock-disabled.list.tmp" \
       "$RESTORE_LIST" 2>/dev/null
 

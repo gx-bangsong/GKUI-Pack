@@ -3,7 +3,7 @@
 # customize.sh —— GKUI-Pack systemless 模块安装脚本(coexist 模式)
 #
 # 由 Magisk / KernelSU / APatch 的模块安装器在解包后执行。
-# 本文件中的 __APP_ENTRIES__ 占位符由仓库根目录的 build.sh 在构建时渲染为:
+# 本文件中的应用清单占位符由仓库根目录的 build.sh 在构建时渲染为:
 #
 #     <application_id>|<目录名>|<该 APK 的 sha256>
 #
@@ -12,11 +12,14 @@
 #
 # 硬约束落实:
 #   C2  只写模块自身挂载目录;不替换/覆盖 stock 文件;开机后可逆管理 stock 启用状态
-#   C3  只装 system/app(绝不使用特权应用目录),也不生成任何权限白名单;
-#       system/ 下除 app/ 以外的任何落点都视为残留并清除(见第 5 步)
+#   C3  普通版应用落在 system/app;构建可选生成 Recorder 特权变体及对应 XML;
+#       两变体脚本来自本文件,仅落点与特权 XML 开关不同
 #   C8  与 /data 中同包名应用冲突时:**中止整个安装**并让用户自行卸载,
 #       模块绝不代为执行 pm uninstall
 # =============================================================================
+
+RECORDER_SYSTEM_SUBDIR="__RECORDER_SUBDIR__" # privapp-permissions variant
+PRIVAPP_XML_ENABLED="__PRIVAPP_XML_ENABLED__" # privapp-permissions variant
 
 # --- 兼容垫片:Magisk 会先加载 util_functions.sh(提供 ui_print / set_perm* /
 #     abort 等);KernelSU / APatch 沿用同一套模块约定。这里**只在确认缺失时**
@@ -26,8 +29,21 @@ has_func() { type "$1" >/dev/null 2>&1 || command -v "$1" >/dev/null 2>&1; }
 if ! has_func ui_print; then
   ui_print() { echo "$1"; }
 fi
+
+# Mirror every installation message without truncating an existing log. Keep the
+# manager-provided ui_print intact so its UI/FD routing continues to work.
+module_ui_print() {
+  _ui_message="$*"
+  if [ -n "${MODPATH:-}" ] && [ -d "$MODPATH" ]; then
+    [ -f "$MODPATH/install.log" ] || : > "$MODPATH/install.log" 2>/dev/null
+    if [ -f "$MODPATH/install.log" ]; then
+      printf '%s\n' "$_ui_message" >> "$MODPATH/install.log" 2>/dev/null
+    fi
+  fi
+  ui_print "$@"
+}
 if ! has_func abort; then
-  abort() { ui_print "$1"; exit 1; }
+  abort() { module_ui_print "$1"; exit 1; }
 fi
 if ! has_func set_perm; then
   set_perm() { chown "$1:$2" "$4" 2>/dev/null; chmod "$3" "$4" 2>/dev/null; }
@@ -41,30 +57,30 @@ if ! has_func set_perm_recursive; then
   }
 fi
 
-ui_print "************************************************"
-ui_print " GKUI-Pack —— coexist 模式 systemless 模块"
-ui_print " 挂载 GKUI 应用;不替换或覆盖 stock 文件;默认开机后可逆停用对应 stock 应用"
-ui_print "************************************************"
+module_ui_print "************************************************"
+module_ui_print " GKUI-Pack —— coexist 模式 systemless 模块"
+module_ui_print " 挂载 GKUI 应用;不替换或覆盖 stock 文件;默认开机后可逆停用对应 stock 应用"
+module_ui_print "************************************************"
 
 choose_stock_policy() {
   # 安装时重置旧选择;只有本轮明确按音量下才生成 keep-stock。
   rm -f "$MODPATH/keep-stock" 2>/dev/null
-  ui_print "- stock 应用选择:默认在开机后停用 GKUI 对应的 ROM 自带应用。"
-  ui_print "    10 秒内按音量下 = 保留 stock;按音量上或超时 = 默认停用。"
+  module_ui_print "- stock 应用选择:默认在开机后停用 GKUI 对应的 ROM 自带应用。"
+  module_ui_print "    10 秒内按音量下 = 保留 stock;按音量上或超时 = 默认停用。"
 
   GETEVENT_BIN="$(command -v getevent 2>/dev/null)"
   if [ -z "$GETEVENT_BIN" ] && [ -x /system/bin/getevent ]; then
     GETEVENT_BIN=/system/bin/getevent
   fi
   if [ -z "$GETEVENT_BIN" ]; then
-    ui_print "    当前选择:默认停用 stock(getevent 不存在,未读取按键)。"
+    module_ui_print "    当前选择:默认停用 stock(getevent 不存在,未读取按键)。"
     return 0
   fi
 
   STOCK_KEY_EVENTS="$MODPATH/.stock-key-events"
   rm -f "$STOCK_KEY_EVENTS" 2>/dev/null
   if ! : > "$STOCK_KEY_EVENTS" 2>/dev/null; then
-    ui_print "    当前选择:默认停用 stock(无法创建按键检测临时文件)。"
+    module_ui_print "    当前选择:默认停用 stock(无法创建按键检测临时文件)。"
     return 0
   fi
 
@@ -112,21 +128,21 @@ choose_stock_policy() {
   case "$STOCK_KEY_CHOICE" in
     keep)
       if : > "$MODPATH/keep-stock" 2>/dev/null; then
-        ui_print "    当前选择:保留/恢复 stock(已创建 keep-stock)。"
+        module_ui_print "    当前选择:保留/恢复 stock(已创建 keep-stock)。"
       else
-        ui_print "    当前选择:默认停用 stock(无法创建 keep-stock)。"
+        module_ui_print "    当前选择:默认停用 stock(无法创建 keep-stock)。"
       fi
       ;;
     disable)
-      ui_print "    当前选择:默认停用 stock(检测到音量上)。"
+      module_ui_print "    当前选择:默认停用 stock(检测到音量上)。"
       ;;
     *)
       if [ "$STOCK_KEY_TIMED_OUT" -eq 1 ]; then
-        ui_print "    当前选择:默认停用 stock(10 秒内未检测到音量键)。"
+        module_ui_print "    当前选择:默认停用 stock(10 秒内未检测到音量键)。"
       elif [ "$GETEVENT_RC" -ne 0 ]; then
-        ui_print "    当前选择:默认停用 stock(getevent 读取按键失败)。"
+        module_ui_print "    当前选择:默认停用 stock(getevent 读取按键失败)。"
       else
-        ui_print "    当前选择:默认停用 stock(未检测到音量键)。"
+        module_ui_print "    当前选择:默认停用 stock(未检测到音量键)。"
       fi
       ;;
   esac
@@ -135,15 +151,15 @@ choose_stock_policy() {
 # -----------------------------------------------------------------------------
 # 1) 环境识别
 # -----------------------------------------------------------------------------
-ui_print "- 环境探测:"
-ui_print "    MAGISK_VER_CODE = ${MAGISK_VER_CODE:-<未设置>}"
-ui_print "    MAGISK_VER      = ${MAGISK_VER:-<未设置>}"
-ui_print "    KSU             = ${KSU:-<未设置>}"
-ui_print "    KSU_VER         = ${KSU_VER:-<未设置>}"
-ui_print "    APATCH          = ${APATCH:-<未设置>}"
-ui_print "    APATCH_VER      = ${APATCH_VER:-<未设置>}"
-ui_print "    BOOTMODE        = ${BOOTMODE:-<未设置>}"
-ui_print "    MODPATH         = ${MODPATH:-<未设置>}"
+module_ui_print "- 环境探测:"
+module_ui_print "    MAGISK_VER_CODE = ${MAGISK_VER_CODE:-<未设置>}"
+module_ui_print "    MAGISK_VER      = ${MAGISK_VER:-<未设置>}"
+module_ui_print "    KSU             = ${KSU:-<未设置>}"
+module_ui_print "    KSU_VER         = ${KSU_VER:-<未设置>}"
+module_ui_print "    APATCH          = ${APATCH:-<未设置>}"
+module_ui_print "    APATCH_VER      = ${APATCH_VER:-<未设置>}"
+module_ui_print "    BOOTMODE        = ${BOOTMODE:-<未设置>}"
+module_ui_print "    MODPATH         = ${MODPATH:-<未设置>}"
 
 if [ -z "${MODPATH:-}" ]; then
   abort "!! MODPATH 未设置:当前不是受支持的模块安装环境,拒绝继续。"
@@ -163,8 +179,8 @@ __PREDECESSOR_ENTRIES__
 "
 
 if [ -z "$(printf '%s' "$APP_ENTRIES" | tr -d ' \n')" ]; then
-  ui_print "!! 模块内没有应用清单:这个 zip 不是在仓库里用 build.sh 构建的。"
-  ui_print "!! 请执行  bash build.sh  生成 dist/GKUI-Pack-*.zip 后重新刷入。"
+  module_ui_print "!! 模块内没有应用清单:这个 zip 不是在仓库里用 build.sh 构建的。"
+  module_ui_print "!! 请执行  bash build.sh  生成 dist/GKUI-Pack-*.zip 后重新刷入。"
   abort "拒绝安装:未渲染/空的模块清单"
 fi
 
@@ -191,9 +207,9 @@ $APP_ENTRIES
 EOF
 
 if [ -n "$BAD_ENTRY" ]; then
-  ui_print "!! 模块清单条目格式非法: '$BAD_ENTRY'"
-  ui_print "!! 这通常意味着该 zip 的占位符未被渲染(直接打包 module/ 目录得到的 zip"
-  ui_print "!! 是无效的)。请执行  bash build.sh  生成 dist/GKUI-Pack-*.zip 后重新刷入。"
+  module_ui_print "!! 模块清单条目格式非法: '$BAD_ENTRY'"
+  module_ui_print "!! 这通常意味着该 zip 的占位符未被渲染(直接打包 module/ 目录得到的 zip"
+  module_ui_print "!! 是无效的)。请执行  bash build.sh  生成 dist/GKUI-Pack-*.zip 后重新刷入。"
   abort "拒绝安装:模块清单格式非法(未渲染)"
 fi
 
@@ -208,15 +224,15 @@ for cand in pm /system/bin/pm; do
   fi
 done
 if [ -z "$PM_BIN" ]; then
-  ui_print "!! 当前环境没有可用的 pm(Package Manager)"
-  ui_print "!! 这通常意味着你在 recovery 下刷入。本模块必须先确认 /data 中没有"
-  ui_print "!! 同包名应用,否则会出现两个同包名应用互相抢夺的情况。"
-  ui_print "!! 请在系统已启动时用 Magisk / KernelSU / APatch 管理器安装本模块,"
-  ui_print "!! 或改用免 root 的 adb 安装方案(scripts/install_all.sh)。"
+  module_ui_print "!! 当前环境没有可用的 pm(Package Manager)"
+  module_ui_print "!! 这通常意味着你在 recovery 下刷入。本模块必须先确认 /data 中没有"
+  module_ui_print "!! 同包名应用,否则会出现两个同包名应用互相抢夺的情况。"
+  module_ui_print "!! 请在系统已启动时用 Magisk / KernelSU / APatch 管理器安装本模块,"
+  module_ui_print "!! 或改用免 root 的 adb 安装方案(scripts/install_all.sh)。"
   abort "拒绝安装:无法检测 /data 冲突(C8)"
 fi
 if ! "$PM_BIN" list packages >/dev/null 2>&1; then
-  ui_print "!! pm 存在但不可用(pm list packages 失败),无法完成冲突检查。"
+  module_ui_print "!! pm 存在但不可用(pm list packages 失败),无法完成冲突检查。"
   abort "拒绝安装:pm 不可用(C8)"
 fi
 
@@ -228,7 +244,7 @@ fi
 #    - 其余 /data 同包名应用 → 中止整个安装(禁止模块自行卸载);
 #    - 其余 /system 已有同包名 → 视为模块已生效,该条目跳过。
 # -----------------------------------------------------------------------------
-ui_print "- 检查 /data 用户空间中的同包名应用与签名一致性(C8):"
+module_ui_print "- 检查 /data 用户空间中的同包名应用与签名一致性(C8):"
 CONFLICT=""
 SIG_CONFLICT=""
 SIG_TRANSITION=""
@@ -258,7 +274,7 @@ EOF
     PATHS="package:$EXISTING_MODDIR/system/app/$DIR/$DIR.apk"
   fi
   if [ -z "$PATHS" ]; then
-    ui_print "    [ok] $PKG 未安装,可安全挂载"
+    module_ui_print "    [ok] $PKG 未安装,可安全挂载"
     continue
   fi
   HIT_DATA=""
@@ -304,7 +320,7 @@ $PATHS
 EOF
   if [ -n "$HIT_SIG" ]; then
     trans="${PRED_TAG:-旧版} → ${TARGET_TAG:-新版}"
-    ui_print "    [签名变更] $PKG ($DIR) 检测到 $trans 签名不一致: $HIT_SIG"
+    module_ui_print "    [签名变更] $PKG ($DIR) 检测到 $trans 签名不一致: $HIT_SIG"
     if [ -z "$SIG_CONFLICT" ]; then
       SIG_CONFLICT="$PKG"
       SIG_TRANSITION="$trans"
@@ -313,78 +329,81 @@ EOF
     continue
   fi
   if [ -n "$HIT_DATA" ]; then
-    ui_print "    [冲突] $PKG 已安装于用户空间: $HIT_DATA"
+    module_ui_print "    [冲突] $PKG 已安装于用户空间: $HIT_DATA"
     [ -n "$CONFLICT" ] || CONFLICT="$PKG"
     continue
   fi
   if [ -n "$HIT_ADOPT" ]; then
-    ui_print "    [接管] $PKG 已安装 APK 字节与目标 sha256 一致($HIT_ADOPT),可正常接管"
+    module_ui_print "    [接管] $PKG 已安装 APK 字节与目标 sha256 一致($HIT_ADOPT),可正常接管"
     continue
   fi
   if [ -n "$HIT_SYSTEM" ]; then
-    ui_print "    [跳过] $PKG 已由系统分区提供($HIT_SYSTEM):模块已生效,不再重复挂载"
+    module_ui_print "    [跳过] $PKG 已由系统分区提供($HIT_SYSTEM):模块已生效,不再重复挂载"
     SKIP_LIST="$SKIP_LIST$PKG|"
     continue
   fi
-  ui_print "    [ok] $PKG 未在用户空间安装(路径: $PATHS)"
+  module_ui_print "    [ok] $PKG 未在用户空间安装(路径: $PATHS)"
 done <<EOF
 $APP_ENTRIES
 EOF
 
 if [ -n "$SIG_CONFLICT" ]; then
   rm -rf "$MODPATH/system" "$MODPATH/apks" 2>/dev/null
-  ui_print ""
-  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  ui_print "检测到 $SIG_CONFLICT 存在跨版本签名变更($SIG_TRANSITION)!"
-  ui_print "已安装路径: $SIG_PATH"
-  ui_print "直接覆盖会导致系统因签名不一致(INSTALL_FAILED_UPDATE_INCOMPATIBLE)拒绝加载该应用。"
-  ui_print "请按以下步骤手动处理后再刷入:"
-  ui_print "  1. 备份:先备份该应用内的重要数据(如录音机已录制的音频文件);"
-  ui_print "  2. 手动卸载或删旧模块:在「设置 → 应用」中手动卸载(或执行 \`pm uninstall $SIG_CONFLICT\`),"
-  ui_print "     若来自旧版模块则在管理器中删除旧模块;"
-  ui_print "  3. 重启:重启手机后,再重新刷入本模块。"
-  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  ui_print "本模块严禁自动卸载或写 /data:所有卸载与清理必须由你手动完成。"
+  module_ui_print ""
+  module_ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  module_ui_print "检测到 $SIG_CONFLICT 存在跨版本签名变更($SIG_TRANSITION)!"
+  module_ui_print "已安装路径: $SIG_PATH"
+  module_ui_print "直接覆盖会导致系统因签名不一致(INSTALL_FAILED_UPDATE_INCOMPATIBLE)拒绝加载该应用。"
+  module_ui_print "请按以下步骤手动处理后再刷入:"
+  module_ui_print "  1. 备份:先备份该应用内的重要数据(如录音机已录制的音频文件);"
+  module_ui_print "  2. 手动卸载或删旧模块:在「设置 → 应用」中手动卸载(或执行 \`pm uninstall $SIG_CONFLICT\`),"
+  module_ui_print "     若来自旧版模块则在管理器中删除旧模块;"
+  module_ui_print "  3. 重启:重启手机后,再重新刷入本模块。"
+  module_ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  module_ui_print "本模块严禁自动卸载或写 /data:所有卸载与清理必须由你手动完成。"
   abort "安装中止:检测到 $SIG_TRANSITION 签名变更(C8)"
 fi
 
 if [ -n "$CONFLICT" ]; then
   rm -rf "$MODPATH/system" "$MODPATH/apks" 2>/dev/null
-  ui_print ""
-  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  ui_print "检测到 $CONFLICT 已安装于用户空间。请先 \`pm uninstall $CONFLICT\`"
-  ui_print "(日历/图库数据存于系统 Provider 不受影响,时钟闹钟/计算器历史/录音机设置会丢失),"
-  ui_print "重启后再刷入本模块。"
-  ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  ui_print "本模块不会替你执行卸载:卸载必须由你显式执行。"
+  module_ui_print ""
+  module_ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  module_ui_print "检测到 $CONFLICT 已安装于用户空间。请先 \`pm uninstall $CONFLICT\`"
+  module_ui_print "(日历/图库数据存于系统 Provider 不受影响,时钟闹钟/计算器历史/录音机设置会丢失),"
+  module_ui_print "重启后再刷入本模块。"
+  module_ui_print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  module_ui_print "本模块不会替你执行卸载:卸载必须由你显式执行。"
   abort "安装中止:/data 中存在同包名应用(C8)"
 fi
 
 choose_stock_policy
 
 # -----------------------------------------------------------------------------
-# 5) 清理另一种落点(C3 兜底)
-#    本模块(普通版)的 system/ 下**只允许 app/**。特权变体(分支 recorder-priv,
-#    同一模块 id)会用到特权应用目录与 privapp-permissions 白名单 XML;从特权变体
-#    刷回普通版时,这里把 system/ 下除 app/ 以外的任何落点一律清除,保证模块目录里
-#    不留任何特权残留。普通版的 zip 里本来就没有这些内容,正常安装时此步为空操作。
-#    (同一模块 id 不存在并存问题,因此不需要任何"两模块互相检测"逻辑。)
+# 5) 清理旧变体残留;同一模块 id 可在普通版与 Recorder 特权版间互刷。
+#    普通版移除特权落点/XML;Recorder 特权版移除可能遗留的普通 Recorder APK。
 # -----------------------------------------------------------------------------
+if [ "$PRIVAPP_XML_ENABLED" = "true" ] && [ -d "$MODPATH/system/app/GKUIRecorder" ]; then
+  module_ui_print "    [清理] 移除普通版 Recorder 残留落点"
+  rm -rf "$MODPATH/system/app/GKUIRecorder"
+fi
 if [ -d "$MODPATH/system" ]; then
   for p in "$MODPATH/system"/* "$MODPATH/system"/.[!.]*; do
     [ -e "$p" ] || continue
     case "$p" in
-      "$MODPATH/system/app") continue ;;
+      "$MODPATH/system/app"|"$MODPATH/system/$RECORDER_SYSTEM_SUBDIR") continue ;;
+      "$MODPATH/system/etc")
+        [ "$PRIVAPP_XML_ENABLED" = "true" ] && continue
+        ;;
     esac
-    ui_print "    [清理] 移除非 system/app 的残留落点: ${p#"$MODPATH"/}"
+    module_ui_print "    [清理] 移除非当前变体所需的残留落点: ${p#"$MODPATH"/}"
     rm -rf "$p"
   done
 fi
 
 # -----------------------------------------------------------------------------
-# 6) 逐个应用:APK → system/app/<目录名>/<目录名>.apk,并设置权限
+# 6) 逐个应用:APK → build-selected system subdirectory/<目录名>/<目录名>.apk
 # -----------------------------------------------------------------------------
-ui_print "- 开始挂载应用:"
+module_ui_print "- 开始挂载应用:"
 INSTALLED_COUNT=0
 while IFS='|' read -r PKG DIR APK_SHA; do
   [ -n "$PKG" ] || continue
@@ -392,13 +411,15 @@ while IFS='|' read -r PKG DIR APK_SHA; do
 
   case "$SKIP_LIST" in
     *"|$PKG|"*)
-      ui_print "    [跳过] $PKG:系统分区已有同包名应用,无需挂载"
+      module_ui_print "    [跳过] $PKG:系统分区已有同包名应用,无需挂载"
       continue
       ;;
   esac
 
   SRC="$MODPATH/apks/$DIR.apk"
-  DEST_DIR="$MODPATH/system/app/$DIR"
+  SUBDIR="app"
+  [ "$DIR" = "GKUIRecorder" ] && SUBDIR="$RECORDER_SYSTEM_SUBDIR"
+  DEST_DIR="$MODPATH/system/$SUBDIR/$DIR"
   DEST="$DEST_DIR/$DIR.apk"
 
   if [ ! -f "$SRC" ]; then
@@ -410,25 +431,37 @@ while IFS='|' read -r PKG DIR APK_SHA; do
     ACTUAL="$(sha256sum "$SRC")"
     ACTUAL="${ACTUAL%% *}"
     if [ "$ACTUAL" != "$APK_SHA" ]; then
-      ui_print "!! $DIR.apk 校验失败:期望 $APK_SHA,实际 $ACTUAL"
+      module_ui_print "!! $DIR.apk 校验失败:期望 $APK_SHA,实际 $ACTUAL"
       abort "安装中止:APK 完整性校验失败"
     fi
   else
-    ui_print "    [警告] 缺少 sha256sum,跳过 $DIR.apk 的完整性校验"
+    module_ui_print "    [警告] 缺少 sha256sum,跳过 $DIR.apk 的完整性校验"
   fi
 
   mkdir -p "$DEST_DIR" || abort "!! 无法创建 $DEST_DIR"
   cp -f "$SRC" "$DEST" || abort "!! 无法写入 $DEST"
   set_perm_recursive "$DEST_DIR" 0 0 0755 0644
   INSTALLED_COUNT=$((INSTALLED_COUNT + 1))
-  ui_print "    [完成] $PKG → /system/app/$DIR/$DIR.apk"
+  module_ui_print "    [完成] $PKG → /system/$SUBDIR/$DIR/$DIR.apk"
 done <<EOF
 $APP_ENTRIES
 EOF
 
+if [ "$PRIVAPP_XML_ENABLED" = "true" ]; then
+  PRIVAPP_XML_COUNT=0
+  for PRIVAPP_XML in "$MODPATH"/system/etc/permissions/privapp-permissions-*.xml; do
+    [ -f "$PRIVAPP_XML" ] || continue
+    set_perm 0 0 0644 "$PRIVAPP_XML"
+    PRIVAPP_XML_COUNT=$((PRIVAPP_XML_COUNT + 1))
+  done
+  [ "$PRIVAPP_XML_COUNT" -gt 0 ] || abort "!! recorderpriv 变体缺少构建生成的 privapp-permissions XML"
+  set_perm_recursive 0 0 0755 0644 "$MODPATH/system/etc"
+  module_ui_print "    [白名单] 已校验并设置构建生成的 privapp-permissions XML"
+fi
+
 if [ "$INSTALLED_COUNT" -eq 0 ]; then
-  ui_print "!! 所有条目都已由系统分区提供:本模块没有需要挂载的内容。"
-  ui_print "!! 这通常说明你已经刷过本模块(或同等内容),无需重复安装。"
+  module_ui_print "!! 所有条目都已由系统分区提供:本模块没有需要挂载的内容。"
+  module_ui_print "!! 这通常说明你已经刷过本模块(或同等内容),无需重复安装。"
   abort "安装中止:没有需要挂载的应用"
 fi
 
@@ -438,26 +471,28 @@ rm -rf "$MODPATH/apks" 2>/dev/null
 # -----------------------------------------------------------------------------
 # 7) 安装摘要(路径 + 体积)
 # -----------------------------------------------------------------------------
-ui_print "- 安装摘要:"
+module_ui_print "- 安装摘要:"
 TOTAL=0
 while IFS='|' read -r PKG DIR APK_SHA; do
   [ -n "$PKG" ] || continue
   [ -n "$DIR" ] || continue
-  F="$MODPATH/system/app/$DIR/$DIR.apk"
+  SUBDIR="app"
+  [ "$DIR" = "GKUIRecorder" ] && SUBDIR="$RECORDER_SYSTEM_SUBDIR"
+  F="$MODPATH/system/$SUBDIR/$DIR/$DIR.apk"
   if [ -f "$F" ]; then
     SZ="$(wc -c < "$F" | tr -d ' ')"
     TOTAL=$((TOTAL + SZ))
-    ui_print "    /system/app/$DIR/$DIR.apk  $SZ 字节  ($PKG)"
+    module_ui_print "    /system/$SUBDIR/$DIR/$DIR.apk  $SZ 字节  ($PKG)"
   else
-    ui_print "    (未挂载) $PKG —— 系统分区已有同包名应用"
+    module_ui_print "    (未挂载) $PKG —— 系统分区已有同包名应用"
   fi
 done <<EOF
 $APP_ENTRIES
 EOF
-ui_print "    本次挂载: $INSTALLED_COUNT 项,合计 $TOTAL 字节"
+module_ui_print "    本次挂载: $INSTALLED_COUNT 项,合计 $TOTAL 字节"
 
-ui_print "- 提示:"
-ui_print "    service.sh 会在开机后按 stock-packages.list 可逆停用对应 stock 应用。"
-ui_print "    安装后可在模块目录创建 keep-stock 文件并重启以保留/恢复 stock;删除该文件后重启则恢复默认停用。"
-ui_print "    卸载模块会安排下一次启动自动恢复本模块曾停用的 stock 应用。"
-ui_print "    若刷入后无法正常开机,下一次开机时模块会检测到未完成的启动标记并自动禁用自身,从而打破 bootloop。"
+module_ui_print "- 提示:"
+module_ui_print "    service.sh 会在开机后按 stock-packages.list 可逆停用对应 stock 应用。"
+module_ui_print "    安装后可在模块目录创建 keep-stock 文件并重启以保留/恢复 stock;删除该文件后重启则恢复默认停用。"
+module_ui_print "    卸载模块会安排下一次启动自动恢复本模块曾停用的 stock 应用。"
+module_ui_print "    若刷入后无法正常开机,下一次开机时模块会检测到未完成的启动标记并自动禁用自身,从而打破 bootloop。"

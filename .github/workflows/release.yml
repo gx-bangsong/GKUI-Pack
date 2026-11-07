@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# Release —— tag v* 触发
+# Release —— tag v* / main push 触发
 #
 # 流程:下载 APK → 校验 sha256 / 签名证书(preflight 七项门禁)→ build.sh
 #       → 上传模块 zip + 门禁报告。
@@ -17,6 +17,7 @@ name: Release
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -41,6 +42,47 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+
+      - name: 确定发布版本
+        id: release-version
+        run: |
+          set -euo pipefail
+          next_tag() {
+            python3 - <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          tags = subprocess.check_output(
+              ["git", "tag", "--list", "v*"], text=True
+          ).splitlines()
+          versions = []
+          for tag in tags:
+              match = re.fullmatch(r"v(\d+(?:\.\d+)*)", tag)
+              if match:
+                  parts = match.group(1).split(".")
+                  versions.append((tuple(int(part) for part in parts), parts))
+          if not versions:
+              sys.exit("::error::no numeric v* tag found")
+          parts = list(max(versions, key=lambda entry: entry[0])[1])
+          parts[-1] = str(int(parts[-1]) + 1)
+          print("v" + ".".join(parts))
+          PY
+          }
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            NEXT_TAG="$(next_tag)"
+            VERSION="$NEXT_TAG"
+          else
+            NEXT_TAG="$TAG"
+            VERSION="$TAG"
+          fi
+          echo "Selected release tag: $NEXT_TAG"
+          echo "TAG=$NEXT_TAG" >> "$GITHUB_ENV"
+          echo "NEXT_TAG=$NEXT_TAG" >> "$GITHUB_ENV"
+          echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: 安装 aapt / apksigner / JDK
         run: |
@@ -91,7 +133,7 @@ jobs:
 
       - name: 构建(含 C5 sha256 / C6 签名 / C2 coexist / G7 versionCode 等门禁)
         env:
-          VERSION: ${{ env.TAG }}
+          VERSION: ${{ steps.release-version.outputs.version }}
           VERSION_CODE: ${{ github.run_number }}
         run: bash build.sh --no-color
 
@@ -238,7 +280,12 @@ jobs:
             gh release upload "$TAG" "${assets[@]}" --clobber
             gh release edit "$TAG" --title "GKUI-Pack $TAG" --notes-file notes.md
           else
-            gh release create "$TAG" "${assets[@]}" \
-              --title "GKUI-Pack $TAG" --notes-file notes.md
+            if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+              gh release create "$NEXT_TAG" "${assets[@]}" --target "$GITHUB_SHA" \
+                --title "GKUI-Pack $NEXT_TAG" --notes-file notes.md
+            else
+              gh release create "$TAG" "${assets[@]}" \
+                --title "GKUI-Pack $TAG" --notes-file notes.md
+            fi
           fi
           gh release view "$TAG" --json url --jq .url

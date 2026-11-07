@@ -19,7 +19,7 @@
 
 > 说明:下表 `commit` 列为 **GitHub Releases 中对应 tag 经 GitHub API 解析出的提交**
 > (解析时间见各条),用于满足 GPL 的"对应源码"提供义务。
-> 上游仓库许可以本工程「事实基线」(设备实测/人工确认)为准;
+> 上游仓库许可以本工程「事实基线」(AndVM 虚拟机配置或人工确认的仓库元数据)为准;
 > 部分上游仓库在 GitHub API 上**未声明** SPDX 许可(见备注),不影响其实际许可文本。
 
 ### 2.1 GKUICalendar(日历)
@@ -84,14 +84,14 @@
 | 本仓库 | `apps.yaml` → `id: recorder`,`privileged_ack: true` | Apache-2.0(并入 GPL-3.0 分发) |
 
 - 对应源码链接:<https://github.com/gx-bangsong/GKUIRecorder/commit/4650818fbc158d996263b4a21b378af4deb9970a>
-- 备注:v0.0.3 起纳入构建,以**普通系统应用**(`/system/app`)形式安装。该 APK 申请
+- 备注:v0.0.3 起进入普通版,以**普通系统应用**(`/system/app`)形式安装。该 APK 申请
   `android.permission.CAPTURE_AUDIO_OUTPUT`(通话录音所需的特权权限),`/system/app`
-  **不会授予**该权限,因此**通话录音不会生效**;本模块绝不进 `priv-app`、绝不生成
-  privapp 白名单 XML(硬约束 C3)。这一点在 `PREFLIGHT-REPORT.md`、`build-manifest.txt`
-  与构建摘要中逐条标注。
-- 备注:`application_id` / `installed_version_code` 为真机实测,`signer_sha256` 为 CI 在
-  真实 APK 上采集(临时 tag `v0.0.3-collect`),Release 字段取自 GitHub Releases API;本仓库
-  **不猜测**任何值(见硬约束 C1)。
+  **不会授予**该权限,所以普通版通话录音不会生效。当前另有 Recorder 专用特权变体，
+  由 build.sh 生成白名单；真实设备上的权限授予与通话录音效果未验证(C3)。相关申请仍在
+  `PREFLIGHT-REPORT.md`、`build-manifest.txt` 与构建摘要中逐条标注。
+- 备注:`application_id` / `installed_version_code` 为 AndVM 虚拟机配置记录；`signer_sha256`
+  来自 CI 在实际 APK 上采集(临时 tag `v0.0.3-collect`),Release 字段取自 GitHub Releases API；
+  本仓库**不猜测**任何值(见硬约束 C1)。
 - upstream / license 的核实时间:2026-10-08。
 
 ---

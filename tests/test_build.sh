@@ -55,7 +55,7 @@ cp -a "$REPO_ROOT/scripts" "$WORK/repo/scripts"
 cp -a "$REPO_ROOT/module" "$WORK/repo/module"
 cp -a "$REPO_ROOT/module-priv" "$WORK/repo/module-priv"
 cp -a "$REPO_ROOT/device" "$WORK/repo/device"
-# 默认测试工作区保持源码回退(TEST)模式:v0.0.5 入库的真机权限表只在专门的
+# 默认测试工作区保持源码回退(TEST)模式:v0.0.5 入库的 AndVM 虚拟机权限快照只在专门的
 # 设备模式测试(12d)里按需放入,避免改变既有 source/TEST 路径的断言。
 rm -f "$WORK/repo/device/framework-permissions.txt"
 chmod +x "$WORK/repo/scripts/"*.sh "$WORK/repo/scripts/"*.py "$WORK/repo/build.sh"
@@ -101,6 +101,17 @@ case "${1:-}" in
     if [ "$sub" = "xmltree" ]; then
       echo "E: manifest (line=1)"
       echo "  A: android:versionCode(0x0101021b)=(type 0x10)0x0"
+      # 标记 #original:<package> → 模拟 APK 声明 <original-package>。
+      original_pkg="$(sed -n 's/^#original://p' "$apk" | head -n 1)"
+      if [ -n "$original_pkg" ]; then
+        echo "  E: original-package (line=2)"
+        echo "    A: android:name(0x01010003)=\"$original_pkg\" (Raw: \"$original_pkg\")"
+      fi
+      # 标记 #shared:<id> → 模拟 sharedUserId(C4) 并验证 JSON/report 提取。
+      shared_uid="$(sed -n 's/^#shared://p' "$apk" | head -n 1)"
+      if [ -n "$shared_uid" ]; then
+        echo "  A: android:sharedUserId(0x0101000b)=\"$shared_uid\" (Raw: \"$shared_uid\")"
+      fi
       # 标记 #decl → 自声明一项 signature 级权限(真实 aapt 是数值形式!
       # 早期用关键字匹配的实现在这里永远命中不了,故专门覆盖)
       if grep -q '^#decl$' "$apk"; then
@@ -375,6 +386,30 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# 不允许 stock_package 与任何已启用 GKUI application_id 冲突,否则运行时无法安全保护。
+COLLISION_REPO="$WORK/repo-stock-app-collision"
+cp -a "$WORK/repo" "$COLLISION_REPO"
+python3 - "$COLLISION_REPO/apps.yaml" <<'PY_COLLISION'
+import sys
+p=sys.argv[1]
+s=open(p,encoding="utf-8").read()
+s=s.replace("    stock_package: org.lineageos.etar", "    stock_package: com.android.deskclock.dev", 1)
+blocks=s.split("  - id: ")
+out=[blocks[0]]
+for block in blocks[1:]:
+    lines=block.splitlines()
+    if lines and lines[0].strip()=="clock":
+        lines=["    enabled: false" if line.startswith("    enabled:") else line for line in lines]
+    out.append("  - id: "+"\n".join(lines)+"\n")
+open(p,"w",encoding="utf-8").write("".join(out))
+PY_COLLISION
+out="$(cd "$COLLISION_REPO" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'stock_package .*application_id 冲突'; then
+  ok "stock_package 与另一 enabled application_id 冲突时构建校验失败"
+else
+  bad "stock/GKUI 包名冲突未被拒绝(rc=$rc)"; printf '%s\n' "$out" | tail -10
+fi
+
 head1 "3) 资产 sha256 不匹配必须失败(C5)"
 # -----------------------------------------------------------------------------
 cp "$WORK/apks/GKUICalendar-1.0.apk" "$WORK/apks/GKUICalendar-1.0.apk.bak"
@@ -407,6 +442,7 @@ fi
 if [ -f "$ZIP" ]; then
   listing="$(unzip -l "$ZIP" | awk '{print $4}')"
   for need in module.prop customize.sh post-fs-data.sh service.sh uninstall.sh \
+              gkui-packages.list stock-packages.list stock-gkui-map.list stock-merged.list runtime-grants.list appop-map.txt \
               META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script; do
     if printf '%s\n' "$listing" | grep -q "^$need\$"; then ok "zip 内含 $need"; else bad "zip 缺少 $need"; fi
   done
@@ -441,8 +477,81 @@ if [ -f "$ZIP" ]; then
     bad "缺少 PREFLIGHT-REPORT.md"
   fi
 fi
+if [ -f "$ZIP" ]; then
+  expected_gkui_list="$(printf '%s\n' "$DIAG_GKUI_PKGS" | tr ' ' '\n')"
+  expected_stock_list="$(printf '%s\n' "$DIAG_STOCK_PKGS" | tr ' ' '\n')"
+  expected_map="$(printf '%s\n' \
+    'org.lineageos.etar|ws.xsoh.etar.debug' \
+    'org.lineageos.glimpse|org.lineageos.glimpse.dev' \
+    'com.android.calculator2|com.android.calculator2.dev' \
+    'com.android.deskclock|com.android.deskclock.dev' \
+    'org.lineageos.recorder|org.lineageos.recorder.dev')"
+  if [ "$(unzip -p "$ZIP" gkui-packages.list)" = "$expected_gkui_list" ] \
+     && [ "$(unzip -p "$ZIP" stock-packages.list)" = "$expected_stock_list" ] \
+     && [ "$(unzip -p "$ZIP" stock-gkui-map.list)" = "$expected_map" ] \
+     && [ -z "$(unzip -p "$ZIP" stock-merged.list)" ] \
+     && [ -z "$(unzip -p "$ZIP" runtime-grants.list)" ]; then
+    ok "构建按 enabled apps 生成 5 个 GKUI/stock 清单与映射,默认 merge/grant 清单为空"
+  else
+    bad "构建生成的包清单/映射/默认可选清单不正确"
+    unzip -p "$ZIP" gkui-packages.list; unzip -p "$ZIP" stock-gkui-map.list
+  fi
+  if ! unzip -l "$ZIP" | grep -qE '[[:space:]]no-auto-grant$'; then
+    ok "普通构建不放置 no-auto-grant opt-out 标记(运行时授权默认开启)"
+  else
+    bad "普通构建意外放置 no-auto-grant opt-out 标记"
+  fi
+fi
 
 # -----------------------------------------------------------------------------
+# 假 APK 的 original-package 必须自动派生 merge_with_stock,并进入报告/摘要/清单/运行清单。
+MERGED_REPO="$WORK/repo-original-package"
+MERGED_APKS="$WORK/apks-original-package"
+MERGED_DIST="$WORK/dist-original-package"
+cp -a "$WORK/repo" "$MERGED_REPO"
+build_assets "$MERGED_APKS" 0
+printf '\n#original:com.android.deskclock\n#decl\n#auth\n' >> "$MERGED_APKS/DeskClock-debug.apk"
+patch_yaml "$MERGED_REPO" "$MERGED_APKS"
+out="$(run_build "$MERGED_REPO" "$MERGED_APKS" "$MERGED_DIST" 2>&1)"; rc=$?
+MERGED_ZIP="$MERGED_DIST/GKUI-Pack-test-1.zip"
+if [ $rc -eq 0 ] && [ -f "$MERGED_ZIP" ] \
+   && [ "$(unzip -p "$MERGED_ZIP" stock-merged.list)" = "com.android.deskclock" ] \
+   && printf '%s' "$out" | grep -q '\[MERGED/替换\].*<original-package> 命中 stock_package'; then
+  ok "fake APK original-package 与 stock package 相等时自动标记 MERGED 并从停用清单排除"
+else
+  bad "original-package 未派生 merged 结果/摘要(rc=$rc)"; printf '%s\n' "$out" | tail -16
+fi
+if awk -F '\t' '$2 == "clock" { found=1; if ($10 == "true" && $11 == "com.android.deskclock" && $12 == "-" && $13 == "com.example.stub.fileprovider" && $14 ~ /android.permission.INTERNET/ && $15 == "com.android.deskclock.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" && index($16, "0x12") > 0) ok=1 } END { exit (found && ok) ? 0 : 1 }' "$MERGED_DIST/build-manifest.txt" \
+   && grep -q 'merge_with_stock=true' "$MERGED_DIST/PREFLIGHT-REPORT.md" \
+   && grep -q 'com.android.deskclock' "$MERGED_DIST/PREFLIGHT-REPORT.md"; then
+  ok "build manifest/preflight report 记录 original-package、merge、authority 与 declared permission 元数据"
+else
+  bad "build manifest 或 preflight report 的 APK manifest 元数据不完整"
+fi
+
+# sharedUserId 仍是 C4 硬门禁,但必须报告实际值并写入 JSON 供诊断。
+SHARED_APK="$WORK/shared-user-id.apk"
+SHARED_REPORT="$WORK/shared-user-id-report.md"
+SHARED_JSON="$WORK/shared-user-id.json"
+make_fake_apk "$SHARED_APK" "com.android.deskclock.dev" "80000" "$SIGNER_CLOCK" '#shared:android.uid.system' "0"
+out="$(AAPT="$WORK/bin/aapt" APKSIGNER="$WORK/bin/apksigner" \
+  bash "$REPO_ROOT/scripts/preflight-apk.sh" "$SHARED_APK" clock \
+  --report "$SHARED_REPORT" --json "$SHARED_JSON" --no-color 2>&1)"; rc=$?
+shared_meta_ok=0
+if python3 - "$SHARED_JSON" <<'PY_SHARED'
+import json,sys
+d=json.load(open(sys.argv[1],encoding="utf-8"))
+assert d["shared_user_id_detected"] is True
+assert d["shared_user_id"] == "android.uid.system"
+PY_SHARED
+then shared_meta_ok=1; fi
+if [ $rc -ne 0 ] && [ "$shared_meta_ok" -eq 1 ] \
+   && grep -q 'sharedUserId 值: android.uid.system' "$SHARED_REPORT"; then
+  ok "fake APK sharedUserId 被拒绝打包但值同时写入 preflight JSON/report"
+else
+  bad "sharedUserId 值未被报告(rc=$rc)"; printf '%s\n' "$out" | tail -12
+fi
+
 head1 "5) 签名证书不一致必须失败(C6)"
 # -----------------------------------------------------------------------------
 sed -i.bak 's/    signer_sha256: 1111111111111111111111111111111111111111111111111111111111111111/    signer_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' "$WORK/repo/apps.yaml"
@@ -665,6 +774,12 @@ if [ -f "$ZIP" ]; then
   out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODOK" FAKE_PM_PKG="__none__" \
           FAKE_PM_MODE="absent" sh "$MODOK/customize.sh" 2>&1 )"; rc=$?
   if [ $rc -eq 0 ]; then ok "无冲突时安装成功"; else bad "无冲突却安装失败(rc=$rc)"; printf '%s\n' "$out" | tail -20; fi
+  printf '%s\n' "$out" > "$WORK/modok.stdout"
+  if [ -s "$MODOK/install.log" ] && cmp -s "$WORK/modok.stdout" "$MODOK/install.log"; then
+    ok "customize.sh 的全部 ui_print 安装输出逐行镜像到 MODPATH/install.log"
+  else
+    bad "customize.sh install.log 与 ui_print 输出不一致"
+  fi
   for name in GKUICalendar GKUIPhotos GKUICalculator GKUIClock GKUIRecorder; do
     f="$MODOK/system/app/$name/$name.apk"
     if [ -f "$f" ]; then ok "已安装到 system/app/$name/$name.apk"; else bad "缺少 $f"; fi
@@ -705,7 +820,7 @@ if [ -f "$ZIP" ]; then
   fi
   system_children="$(find "$MODRES/system" -mindepth 1 -maxdepth 1 -print 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')"
   if [ "$system_children" = "app " ]; then ok "清理后 system/ 下只剩 app/"; else bad "system/ 下仍有其它落点: $system_children"; fi
-  if printf '%s' "$out" | grep -q '\[清理\] 移除非 system/app 的残留落点'; then ok "清理动作有明确提示"; else bad "缺少清理提示"; fi
+  if printf '%s' "$out" | grep -q '\[清理\] 移除非当前变体所需的残留落点'; then ok "清理动作有明确提示"; else bad "缺少清理提示"; fi
   if [ -f "$MODRES/system/app/GKUICalendar/GKUICalendar.apk" ]; then ok "清理不影响正常挂载"; else bad "清理后应用未挂载"; fi
 
   # 8.5 未渲染的 customize.sh(仓库原始版)必须拒绝安装
@@ -990,7 +1105,11 @@ head1 "11) 硬约束验收项(在真实仓库上检查)"
 count_apk="$(cd "$REPO_ROOT" && git ls-files 2>/dev/null | grep -c '\.apk$' || true)"
 if [ "$count_apk" = "0" ]; then ok "git ls-files | grep -c '.apk\$' == 0(C5)"; else bad "仓库跟踪了 $count_apk 个 .apk(C5 违规)"; fi
 if grep -rn "mode: replace" "$REPO_ROOT/apps.yaml" >/dev/null 2>&1; then bad "apps.yaml 出现 mode: replace(C2)"; else ok "apps.yaml 无 mode: replace"; fi
-if grep -rn "priv-app" "$REPO_ROOT/module/" >/dev/null 2>&1; then bad "module/ 出现特权应用目录字样(C3)"; else ok "module/ 无 priv-app 字样"; fi
+if find "$REPO_ROOT/module" -type d -path '*/system/priv-app' -print -quit | grep -q .; then
+  bad "module/ 实际包含 privileged app 目录(C3)"
+else
+  ok "module/ 不包含实际 privileged app 目录(C3;诊断中的目标路径不算目录内容)"
+fi
 if grep -rniE "dialer|telephony|messaging|contacts" "$REPO_ROOT/apps.yaml" >/dev/null 2>&1; then
   bad "apps.yaml 命中 C4 禁用类别"
 else
@@ -1039,7 +1158,7 @@ head1 "12) APK 未声明 versionCode:必须明确失败并解释(G7)"
 # -----------------------------------------------------------------------------
 # 真实 CI 上遇到过:LineageOS 的 DeskClock APK 的 badging 行为
 #   package: name='com.android.deskclock.dev' versionCode='' versionName=''
-# 平台语义:未声明 → 按 0 处理(设备上那一份的实测值也确实记录了 0,见 apps.yaml)。
+# 平台语义:未声明 → 按 0 处理(AndVM 配置记录为 0,见 apps.yaml)。
 # 因此 G7 的行为是:
 #   * 设备上有副本且副本版本更高 → 失败(模块内更旧,会被压制);
 #   * 设备上副本也是 0 → 相等 → 放行(刷入前按 C8 先卸载副本);
@@ -1055,7 +1174,7 @@ if printf '%s' "$out" | grep -q 'versionCode: 未知'; then ok "报告里以『�
 # 12.1 设备上已有副本、且副本版本更高(79999)→ 模块内(未声明→0)更旧 → 必须失败
 #      (12.1 的三条断言见上)
 
-# 12.2a 真实 clock 情形:APK 未声明 versionCode,设备上那一份实测为 0
+# 12.2a clock 配置情形:APK 未声明 versionCode,AndVM 配置记录为 0
 #       → 按平台语义"未声明=0",两侧相等 → 放行,并说明原因
 sed -i.bak 's/^    installed_version_code: 79999$/    installed_version_code: 0/' "$WORK/repo/apps.yaml"
 out="$(run_build "$WORK/repo" "$WORK/apks-nover" "$WORK/dist-nover0" 2>&1)"; rc=$?
@@ -1191,8 +1310,8 @@ if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
     bad "module.prop id 不一致(norm=$id_norm, priv=$id_priv)"
   fi
   # TEST 标记检查:1) 文件名含 -recorderpriv-TEST.zip; 2) module.prop description; 3) PREFLIGHT-REPORT.md 开头; 4) RELEASE-NOTES-v0.0.4.md
-  if unzip -p "$ZIP_PRIV_TEST" module.prop | grep -q '^description=.*白名单来源：源码推导，未经设备验证'; then
-    ok "TEST 版 module.prop description 注明『白名单来源：源码推导，未经设备验证』"
+  if unzip -p "$ZIP_PRIV_TEST" module.prop | grep -q '^description=.*白名单来源：源码推导；AndVM 与真机行为未验证'; then
+    ok "TEST 版 module.prop description 注明源码推导来源且限制 AndVM/真机验证口径"
   else
     bad "TEST 版 module.prop 缺少源码推导说明"
   fi
@@ -1211,10 +1330,11 @@ if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
   if [ -f "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" ] \
      && grep -q 'GKUI-Pack-v0.0.5-recorderpriv.zip' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q 'GKUI-Pack-v0.0.5.zip' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
-     && grep -q '白名单来源：Pixel 5 / Android 16 设备权限表' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
-     && grep -q "已在 Pixel 5 / Android 16 验证开机与 \`CAPTURE_AUDIO_OUTPUT\` 授予" "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
-     && grep -q '通话录音功能本身尚未验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
-     && grep -q 'enforce 校验状态待 v0.0.5 诊断确认' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
+     && grep -q '权限表来源：AndVM 虚拟机快照' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
+     && grep -q '已在虚拟机环境（AndVM，Pixel 5 / OnePlus7TPro 配置）验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
+     && grep -q '真实设备行为、KernelSU/APatch、A/B、OTA、权限实际授予及通话录音均未验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
+     && ! grep -q '已在 Pixel 5 / Android 16 验证' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
+     && grep -q '闹钟数据由 GKUI Clock 继承是预期' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q '直接在 Magisk / KernelSU / APatch 管理器里选择' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md" \
      && grep -q '会被换回普通版' "$REPO_ROOT/docs/RELEASE-NOTES-v0.0.5.md"; then
     ok "docs/RELEASE-NOTES-v0.0.5.md 含双包说明/TEST→正式升级方法/更新换回普通版/验证口径"
@@ -1321,7 +1441,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-head1 "12d) v0.0.5: 真机权限表入库、设备模式正式包、XML 逐字节一致、严格门禁停止条件"
+head1 "12d) v0.0.5: AndVM 权限快照入库、设备模式正式包、XML 逐字节一致、严格门禁停止条件"
 # -----------------------------------------------------------------------------
 REAL_DUMP="$REPO_ROOT/device/framework-permissions.txt"
 SPEC_PROPS="ro.lineage.version ro.build.version.incremental ro.build.date.utc ro.build.fingerprint ro.control_privapp_permissions ro.build.version.sdk ro.product.device"
@@ -1338,9 +1458,7 @@ else
 fi
 # GKUI 包名保留在诊断脚本;stock 包名只允许来自构建生成的 stock-packages.list。
 pkgs_ok=1
-for pkg in $DIAG_GKUI_PKGS; do
-  grep -qF "$pkg" "$REPO_ROOT/module/service.sh" || pkgs_ok=0
-done
+grep -qF 'gkui-packages.list' "$REPO_ROOT/module/service.sh" || pkgs_ok=0
 for pkg in $DIAG_STOCK_PKGS; do
   if awk -v p="$pkg" '$1 == p { found=1 } END { exit found ? 0 : 1 }' "$REPO_ROOT/module/service.sh" \
      || awk -v p="$pkg" '$1 == p { found=1 } END { exit found ? 0 : 1 }' "$REPO_ROOT/module/uninstall.sh"; then
@@ -1350,9 +1468,9 @@ done
 if [ "$pkgs_ok" -eq 1 ] \
    && grep -qF 'stock-packages.list' "$REPO_ROOT/module/service.sh" \
    && grep -qF 'stock-disabled.list' "$REPO_ROOT/module/uninstall.sh"; then
-  ok "service.sh 的 stock 包名仅从 stock-packages.list 读取;卸载从运行时清单恢复"
+  ok "service.sh 使用生成的 GKUI/stock 清单且无 stock 硬编码;卸载从运行时清单恢复"
 else
-  bad "service.sh/uninstall.sh stock 包名来源错误或发生硬编码"
+  bad "service.sh/uninstall.sh 清单来源错误或 stock 包名发生硬编码"
 fi
 if [ -f "$ZIP" ] && [ -f "$ZIP_PRIV_TEST" ]; then
   expected_stock_list="$(printf '%s\n' "$DIAG_STOCK_PKGS" | tr ' ' '\n')"
@@ -1374,24 +1492,29 @@ else
   bad "service.sh 既有诊断保护逻辑被改动"
 fi
 
-# 12d.2 真机权限表文件本身:头注释、记录数、关键级别、时钟异常、零 dangerous
+# 12d.2 AndVM 虚拟机权限快照本身:头注释、记录数、关键级别、时钟异常、零 dangerous
 if [ -f "$REAL_DUMP" ]; then ok "device/framework-permissions.txt 已入库"; else bad "缺少 device/framework-permissions.txt"; fi
-if grep -q '^# Device: Pixel 5' "$REAL_DUMP" \
+if grep -q '^# Device: AndVM virtual machine' "$REAL_DUMP" \
    && grep -q '^# SDK: 36' "$REAL_DUMP" \
    && grep -q 'BP4A.251205.006' "$REAL_DUMP" \
    && grep -q 'epoch 1793032493' "$REAL_DUMP" \
-   && grep -q 'v0.0.4 priv-TEST 模块 service.sh 诊断' "$REAL_DUMP"; then
-  ok "设备权限表头注释含设备/SDK/build/epoch/采集方式"
+   && grep -q 'GKUI-Pack diagnostic section \[5\], v0.0.4 privileged TEST package' "$REAL_DUMP"; then
+  ok "AndVM 权限表头注释含设备/SDK/build/epoch/采集方式"
 else
   bad "设备权限表头注释不完整"
 fi
-if grep -q 'ro.control_privapp_permissions' "$REAL_DUMP" \
-   && grep -q 'ro.lineage.version' "$REAL_DUMP" \
-   && grep -q 'ro.build.version.incremental' "$REAL_DUMP" \
-   && grep -q 'ro.build.date.utc' "$REAL_DUMP"; then
-  ok "设备权限表头注释注明 4 个未采集属性及原因"
+if grep -q 'ro.control_privapp_permissions: enforce' "$REAL_DUMP" \
+   && grep -q 'ro.lineage.version: 23.2-20261005-NIGHTLY-redfin' "$REAL_DUMP" \
+   && grep -q 'ro.build.version.incremental: 45397edbf2' "$REAL_DUMP" \
+   && grep -q 'ro.build.date.utc: 1791158517' "$REAL_DUMP"; then
+  ok "设备权限表头注明已确认的 enforce 与 LineageOS/build 属性"
 else
-  bad "设备权限表未注明未采集属性"
+  bad "设备权限表头缺少确认后的设备属性"
+fi
+if [ "$(sed -n '/^--- \[5\] pm list permissions -f ---$/,$p' "$REAL_DUMP" | tail -n +2 | sha256sum | awk '{print $1}')" = "957eeee05fc26070408ef99c71ef2176b59cde23abcc3275d6fb8a76527ad08a" ]; then
+  ok "设备权限表 [5] 后的数据内容 SHA-256 未改动"
+else
+  bad "设备权限表 [5] 后的数据内容与原始采集不一致"
 fi
 if [ "$(grep -c '^+ permission:' "$REAL_DUMP" || true)" -eq 1195 ]; then
   ok "设备权限表原样保存 1195 条 permission 记录"
@@ -1399,7 +1522,7 @@ else
   bad "设备权限表记录数异常: $(grep -c '^+ permission:' "$REAL_DUMP" || true)"
 fi
 if ! grep -q 'protectionLevel:.*dangerous' "$REAL_DUMP"; then
-  ok "设备权限表不含 dangerous 级权限(pm list permissions 实测行为)"
+  ok "AndVM 快照不含 dangerous 级权限(pm list permissions 采集结果)"
 else
   bad "设备权限表出现 dangerous 记录,跳过规则前提变化"
 fi
@@ -1407,7 +1530,7 @@ if awk '/^\+ permission:android\.permission\.CAPTURE_AUDIO_OUTPUT$/{f=1; next} f
    && awk '/^\+ permission:android\.permission\.REQUEST_INSTALL_PACKAGES$/{f=1; next} f && /^  protectionLevel:/{if ($0 == "  protectionLevel:signature|appop") ok=1; f=0} END{exit ok?0:1}' "$REAL_DUMP"; then
   ok "CAPTURE_AUDIO_OUTPUT=signature|privileged|role、REQUEST_INSTALL_PACKAGES=signature|appop 与诊断一致"
 else
-  bad "关键权限 protectionLevel 与真机诊断不符"
+  bad "关键权限 protectionLevel 与 AndVM 快照不符"
 fi
 if [ "$(awk '/^\+ permission:com.android.deskclock.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION$/{getline; print}' "$REAL_DUMP")" = "  package:com.android.deskclock" ] \
    && ! grep -q '^+ permission:com.android.deskclock.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION$' "$REAL_DUMP"; then
@@ -1421,22 +1544,22 @@ else
   bad "设备权限表缺少第 [5] 节标题"
 fi
 
-# 12d.3 生成器:真机表 + Recorder 真实权限形态 → 仅 CAPTURE_AUDIO_OUTPUT 入 XML,
+# 12d.3 生成器:AndVM 快照 + Recorder 权限夹具 → 仅 CAPTURE_AUDIO_OUTPUT 入 XML,
 #       缺失的 dangerous 运行时权限显式跳过而非 fail-closed
 out="$(python3 "$REPO_ROOT/scripts/generate-privapp-permissions.py" \
   --dump "$REAL_DUMP" --mode device --app-json "$WORK/rec-pf-ok.json" \
   --out "$WORK/real-device.xml" 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && [ -f "$WORK/real-device.xml" ]; then
-  ok "生成器接受真机权限表(缺失的 dangerous 运行时权限按实测规则跳过)"
+  ok "生成器接受 AndVM 权限快照(缺失的 dangerous 运行时权限按实测规则跳过)"
 else
-  bad "生成器无法处理真机权限表(rc=$rc)"; printf '%s\n' "$out"
+  bad "生成器无法处理 AndVM 权限快照(rc=$rc)"; printf '%s\n' "$out"
 fi
 if [ -f "$WORK/real-device.xml" ] \
    && [ "$(grep -c '<permission name=' "$WORK/real-device.xml")" -eq 1 ] \
    && grep -q '<permission name="android.permission.CAPTURE_AUDIO_OUTPUT" />' "$WORK/real-device.xml"; then
-  ok "真机表生成的 XML 仅含 CAPTURE_AUDIO_OUTPUT 一项"
+  ok "AndVM 快照生成的 XML 仅含 CAPTURE_AUDIO_OUTPUT 一项"
 else
-  bad "真机表 XML 内容异常"; cat "$WORK/real-device.xml" 2>/dev/null
+  bad "AndVM 快照 XML 内容异常"; cat "$WORK/real-device.xml" 2>/dev/null
 fi
 # 反向:转储若含 dangerous 记录却缺请求权限,仍须 fail-closed
 cat > "$WORK/neg-dump.txt" <<'EOF'
@@ -1475,14 +1598,14 @@ if [ $rc -eq 0 ] && [ -f "$ZIP_PRIV_DEV" ] && [ ! -f "$ZIP_TEST_DEV" ] && [ -f "
 else
   bad "设备模式构建异常(rc=$rc)"; printf '%s\n' "$out" | tail -25
 fi
-if printf '%s' "$out" | grep -q '白名单来源：设备权限表（Pixel 5 / Android 16 实测，严格门禁）' \
+if printf '%s' "$out" | grep -q 'recorder-priv 白名单来源：AndVM 虚拟机权限快照；真机行为未验证' \
    && printf '%s' "$out" | grep -q '设备表 XML 与 v0.0.4 TEST 版逐字节一致'; then
-  ok "构建日志明确打印白名单来源=设备权限表与 XML 逐字节一致结论"
+  ok "构建日志明确打印白名单来源=AndVM 快照与 XML 逐字节一致结论"
 else
   bad "构建日志缺少白名单来源/逐字节一致标注"
 fi
-if unzip -p "$ZIP_PRIV_DEV" module.prop | grep -q '^description=.*白名单来源：Pixel 5 / Android 16 设备权限表'; then
-  ok "正式特权包 module.prop description 注明设备权限表来源且无 TEST 标记"
+if unzip -p "$ZIP_PRIV_DEV" module.prop | grep -q '^description=.*白名单来源：device/framework-permissions.txt（AndVM 虚拟机快照；真机未验证）'; then
+  ok "正式特权包 module.prop description 注明 AndVM 权限表来源且无 TEST 标记"
 else
   bad "正式特权包 module.prop 来源标注错误"
 fi
@@ -1497,11 +1620,11 @@ if [ "$(unzip -p "$ZIP_NORM_DEV" module.prop | grep '^id=')" = "id=gkui-pack" ] 
 else
   bad "双包模块 id 不一致"
 fi
-if head -n 12 "$WORK/dist-device/PREFLIGHT-REPORT.md" | grep -q '特权变体白名单来源：设备权限表（Pixel 5 / Android 16 实测严格门禁）' \
-   && grep -q '已在 Pixel 5 / Android 16 验证开机与 CAPTURE_AUDIO_OUTPUT 授予' "$WORK/dist-device/PREFLIGHT-REPORT.md" \
-   && grep -q '通话录音功能本身尚未验证' "$WORK/dist-device/PREFLIGHT-REPORT.md" \
-   && grep -q 'enforce 校验状态待 v0.0.5 诊断确认' "$WORK/dist-device/PREFLIGHT-REPORT.md"; then
-  ok "PREFLIGHT-REPORT.md 标注设备权限表来源与准确验证口径(不写白名单已验证正确)"
+if head -n 12 "$WORK/dist-device/PREFLIGHT-REPORT.md" | grep -q '特权变体白名单来源：AndVM 虚拟机权限快照；真机行为未验证' \
+   && grep -q "ro.control_privapp_permissions=\`enforce\`" "$WORK/dist-device/PREFLIGHT-REPORT.md" \
+   && grep -q '已在虚拟机环境（AndVM，Pixel 5 / OnePlus7TPro 配置）验证' "$WORK/dist-device/PREFLIGHT-REPORT.md" \
+   && grep -q '通话录音不会生效' "$WORK/dist-device/PREFLIGHT-REPORT.md"; then
+  ok "PREFLIGHT-REPORT.md 标注 AndVM enforce 与准确验证口径"
 else
   bad "PREFLIGHT-REPORT.md 来源/验证口径标注缺失"
 fi
@@ -1519,7 +1642,8 @@ fi
 # 正式特权包内:zip 自带白名单 XML;落点逻辑经渲染后的 customize.sh 实跑验证
 # (zip 内 APK 在 apks/,由 customize.sh 在安装期移动到 priv-app / app)
 if unzip -l "$ZIP_PRIV_DEV" | grep -q 'system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml' \
-   && unzip -p "$ZIP_PRIV_DEV" customize.sh | grep -Fq "[ \"\$DIR\" = \"GKUIRecorder\" ] && SUBDIR=\"priv-app\"" \
+   && unzip -p "$ZIP_PRIV_DEV" customize.sh | grep -Fq 'RECORDER_SYSTEM_SUBDIR="priv-app"' \
+   && unzip -p "$ZIP_PRIV_DEV" customize.sh | grep -Fq '[ "$DIR" = "GKUIRecorder" ] && SUBDIR="$RECORDER_SYSTEM_SUBDIR"' \
    && unzip -l "$ZIP_PRIV_DEV" | grep -q 'apks/GKUIRecorder.apk'; then
   ok "正式特权包含白名单 XML 且 customize.sh 保留 Recorder→priv-app 落点逻辑"
 else
@@ -1627,12 +1751,257 @@ else
   bad "recorderpriv stock-packages.list 与普通版不一致"
 fi
 
+head1 "12e.1) v0.0.8: runtime grant default-on、过滤器、AppOps 与版本标记"
+RUNTIME_REPO="$WORK/repo-runtime-grants"
+RUNTIME_APKS="$WORK/apks-runtime-grants"
+RUNTIME_DIST="$WORK/dist-runtime-grants"
+cp -a "$WORK/repo" "$RUNTIME_REPO"
+build_assets "$RUNTIME_APKS" 0 "uses-permission: name='android.permission.CAMERA'
+uses-permission: name='android.permission.RECORD_AUDIO'
+uses-permission: name='android.permission.ACCESS_BACKGROUND_LOCATION'
+uses-permission: name='android.permission.ACCESS_FINE_LOCATION'
+uses-permission: name='android.permission.SCHEDULE_EXACT_ALARM'"
+python3 - "$RUNTIME_REPO/apps.yaml" <<'PY_RUNTIME_YAML'
+import sys
+p=sys.argv[1]
+blocks=open(p,encoding="utf-8").read().split("  - id: ")
+out=[blocks[0]]
+for block in blocks[1:]:
+    lines=block.splitlines()
+    if lines and lines[0].strip()=="calendar":
+        for i,line in enumerate(lines):
+            if line.startswith("    enabled:"):
+                lines[i+1:i+1]=[
+                    "    runtime_permissions_only:",
+                    "      - android.permission.CAMERA",
+                    "      - android.permission.RECORD_AUDIO",
+                    "      - android.permission.ACCESS_BACKGROUND_LOCATION",
+                    "      - android.permission.ACCESS_FINE_LOCATION",
+                    "      - android.permission.SCHEDULE_EXACT_ALARM",
+                ]
+                break
+    out.append("  - id: "+"\n".join(lines)+"\n")
+open(p,"w",encoding="utf-8").write("".join(out))
+PY_RUNTIME_YAML
+patch_yaml "$RUNTIME_REPO" "$RUNTIME_APKS"
+cp "$REAL_DUMP" "$RUNTIME_REPO/device/framework-permissions.txt"
+cat >> "$RUNTIME_REPO/device/framework-permissions.txt" <<'EOF'
++ permission:android.permission.CAMERA
+  package:android
+  protectionLevel:dangerous
++ permission:android.permission.RECORD_AUDIO
+  package:android
+  protectionLevel:dangerous
++ permission:android.permission.ACCESS_BACKGROUND_LOCATION
+  package:android
+  protectionLevel:dangerous
++ permission:android.permission.ACCESS_FINE_LOCATION
+  package:android
+  protectionLevel:dangerous
+EOF
+out="$(run_build "$RUNTIME_REPO" "$RUNTIME_APKS" "$RUNTIME_DIST" 2>&1)"; rc=$?
+RUNTIME_ZIP="$RUNTIME_DIST/GKUI-Pack-test-1.zip"
+EXPECTED_RUNTIME_GRANTS="$(printf '%s\n' \
+  'ws.xsoh.etar.debug|android.permission.CAMERA|grant' \
+  'ws.xsoh.etar.debug|android.permission.RECORD_AUDIO|grant' \
+  'ws.xsoh.etar.debug|android.permission.ACCESS_FINE_LOCATION|grant' \
+  'ws.xsoh.etar.debug|android.permission.SCHEDULE_EXACT_ALARM|appops' \
+  'ws.xsoh.etar.debug|android.permission.ACCESS_BACKGROUND_LOCATION|grant' \
+  'org.lineageos.recorder.dev|android.permission.REQUEST_INSTALL_PACKAGES|appops')"
+if [ $rc -eq 0 ] && [ -f "$RUNTIME_ZIP" ] \
+   && [ "$(unzip -p "$RUNTIME_ZIP" runtime-grants.list)" = "$EXPECTED_RUNTIME_GRANTS" ] \
+   && [ "$(unzip -p "$RUNTIME_ZIP" appop-map.txt)" = "$(cat "$REPO_ROOT/scripts/appop-map.txt")" ] \
+   && ! unzip -l "$RUNTIME_ZIP" | grep -qE '[[:space:]]no-auto-grant$'; then
+  ok "dangerous / mapped appop permissions generate ordered runtime-grants.list and default-on module data"
+else
+  bad "runtime grant build/list/map/default-on abnormal(rc=$rc)"; printf '%s\n' "$out" | tail -16
+fi
+
+# runtime_permissions_only / runtime_permissions_exclude are mutually exclusive.
+RUNTIME_FILTER_CONFLICT="$WORK/repo-runtime-filter-conflict"
+cp -a "$RUNTIME_REPO" "$RUNTIME_FILTER_CONFLICT"
+python3 - "$RUNTIME_FILTER_CONFLICT/apps.yaml" <<'PY_FILTER_CONFLICT'
+import sys
+p=sys.argv[1]
+s=open(p,encoding="utf-8").read()
+s=s.replace("      - android.permission.SCHEDULE_EXACT_ALARM\n", "      - android.permission.SCHEDULE_EXACT_ALARM\n    runtime_permissions_exclude:\n      - android.permission.CAMERA\n", 1)
+open(p,"w",encoding="utf-8").write(s)
+PY_FILTER_CONFLICT
+out="$(cd "$RUNTIME_FILTER_CONFLICT" && bash build.sh --check 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'runtime_permissions_only 与 runtime_permissions_exclude 互斥'; then
+  ok "runtime_permissions_only 与 runtime_permissions_exclude 同时设置时拒绝构建"
+else
+  bad "runtime permission 互斥过滤器未 fail-closed(rc=$rc)"; printf '%s\n' "$out" | tail -12
+fi
+
+# 仅选 normal 权限时不产出授权行,不会把它升级为 pm grant。
+NON_DANGEROUS_REPO="$WORK/repo-runtime-nondangerous"
+cp -a "$RUNTIME_REPO" "$NON_DANGEROUS_REPO"
+python3 - "$NON_DANGEROUS_REPO/apps.yaml" <<'PY_NORMAL_FILTER'
+import sys
+p=sys.argv[1]
+lines=open(p,encoding="utf-8").read().splitlines()
+start=next(i for i,line in enumerate(lines) if line == "    runtime_permissions_only:")
+end=start+1
+while end < len(lines) and lines[end].startswith("      - "):
+    end += 1
+lines[start:end]=["    runtime_permissions_only:","      - android.permission.INTERNET"]
+open(p,"w",encoding="utf-8").write("\n".join(lines)+"\n")
+PY_NORMAL_FILTER
+out="$(run_build "$NON_DANGEROUS_REPO" "$RUNTIME_APKS" "$WORK/dist-runtime-nondangerous" 2>&1)"; rc=$?
+NON_DANGEROUS_ZIP="$WORK/dist-runtime-nondangerous/GKUI-Pack-test-1.zip"
+if [ $rc -eq 0 ] && [ -f "$NON_DANGEROUS_ZIP" ] \
+   && [ "$(unzip -p "$NON_DANGEROUS_ZIP" runtime-grants.list)" = "org.lineageos.recorder.dev|android.permission.REQUEST_INSTALL_PACKAGES|appops" ] \
+   && ! printf '%s' "$out" | grep -q 'android.permission.INTERNET|grant'; then
+  ok "normal 权限未列入 runtime-grants.list(pm grant 默认 fail-closed)"
+else
+  bad "normal 权限被错误纳入 runtime grants(rc=$rc)"; printf '%s\n' "$out" | tail -12
+fi
+
+GRANT_TEST="$WORK/runtime-grant-service"
+GRANT_MOD="$GRANT_TEST/mod"
+GRANT_BIN="$GRANT_TEST/bin"
+mkdir -p "$GRANT_MOD" "$GRANT_BIN" "$GRANT_TEST/sdcard"
+unzip -q "$RUNTIME_ZIP" -d "$GRANT_MOD"
+printf '%s\n' org.lineageos.etar > "$GRANT_TEST/enabled.list"
+: > "$GRANT_TEST/disabled.list"
+cat > "$GRANT_BIN/getprop" <<'STUB'
+#!/bin/sh
+[ "${1:-}" = sys.boot_completed ] && echo 1
+exit 0
+STUB
+cat > "$GRANT_BIN/pm" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_PM_CALLS"
+case "${1:-}" in
+  list)
+    case "${2:-}:${3:-}" in
+      packages:-d)
+        while IFS= read -r p; do [ -n "$p" ] && printf 'package:%s\n' "$p"; done < "$FAKE_PM_DISABLED_FILE"
+        ;;
+      packages:-e) printf 'package:org.lineageos.etar\n' ;;
+      permissions) printf 'Permissions:\n' ;;
+    esac
+    exit 0
+    ;;
+  path)
+    case "${2:-}" in
+      org.lineageos.etar) echo 'package:/product/app/Etar/Etar.apk' ;;
+      ws.xsoh.etar.debug) echo 'package:/system/app/GKUICalendar/GKUICalendar.apk' ;;
+    esac
+    exit 0
+    ;;
+  disable-user) exit 0 ;;
+  enable) exit 0 ;;
+  grant)
+    if [ "${FAKE_PM_FAIL_GRANT:-}" = "${3:-}" ]; then
+      printf 'forced pm grant failure for %s\n' "${3:-}" >&2
+      exit 7
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+STUB
+cat > "$GRANT_BIN/appops" <<'STUB'
+#!/bin/sh
+printf 'appops %s\n' "$*" >> "$FAKE_PM_CALLS"
+if [ "${FAKE_APPOPS_FAIL:-}" = "${3:-}" ]; then
+  printf 'forced appops failure for %s\n' "${3:-}" >&2
+  exit 8
+fi
+exit 0
+STUB
+cat > "$GRANT_BIN/dumpsys" <<'STUB'
+#!/bin/sh
+if [ "${1:-}" = package ] && [ -n "${2:-}" ]; then
+  printf 'Package [%s] versionCode=%s targetSdk=36\n' "$2" "${FAKE_VERSION_CODE:-90000}"
+elif [ "${1:-}" = package ]; then
+  printf 'Renamed packages:\n'
+fi
+exit 0
+STUB
+chmod +x "$GRANT_BIN/getprop" "$GRANT_BIN/pm" "$GRANT_BIN/appops" "$GRANT_BIN/dumpsys"
+run_grant_service() {
+  rm -f "$GRANT_MOD/GKUI-diag.txt" "$GRANT_TEST/sdcard/GKUI-diag.txt"
+  env PATH="$GRANT_BIN:$PATH" \
+      FAKE_PM_CALLS="$GRANT_TEST/pm-calls" \
+      FAKE_PM_DISABLED_FILE="$GRANT_TEST/disabled.list" \
+      DIAG_SDCARD_DIR="$GRANT_TEST/sdcard" \
+      DIAG_BOOT_MAX_WAIT=2 DIAG_SDCARD_MAX_WAIT=2 DIAG_SDCARD_SLEEP=1 \
+      FAKE_PM_FAIL_GRANT="${FAKE_PM_FAIL_GRANT:-}" \
+      FAKE_APPOPS_FAIL="${FAKE_APPOPS_FAIL:-}" \
+      FAKE_VERSION_CODE="${FAKE_VERSION_CODE:-90000}" \
+      sh "$GRANT_MOD/service.sh"
+  for _grant_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    grep -q 'sdcard_copy: ok' "$GRANT_MOD/GKUI-diag.txt" 2>/dev/null && break
+    sleep 0.1
+  done
+}
+: > "$GRANT_TEST/pm-calls"
+FAKE_PM_FAIL_GRANT=android.permission.CAMERA run_grant_service
+_disable_line="$(grep -nFx 'disable-user --user 0 org.lineageos.etar' "$GRANT_TEST/pm-calls" | cut -d: -f1)"
+_fine_line="$(grep -nFx 'grant ws.xsoh.etar.debug android.permission.ACCESS_FINE_LOCATION' "$GRANT_TEST/pm-calls" | cut -d: -f1)"
+_background_line="$(grep -nFx 'grant ws.xsoh.etar.debug android.permission.ACCESS_BACKGROUND_LOCATION' "$GRANT_TEST/pm-calls" | cut -d: -f1)"
+if [ -n "$_disable_line" ] && [ -n "$_fine_line" ] && [ -n "$_background_line" ] \
+   && [ "$_disable_line" -lt "$_fine_line" ] && [ "$_fine_line" -lt "$_background_line" ] \
+   && grep -Fqx 'appops set ws.xsoh.etar.debug SCHEDULE_EXACT_ALARM allow' "$GRANT_TEST/pm-calls" \
+   && grep -q 'package=ws.xsoh.etar.debug permission=android.permission.CAMERA method=grant rc=7 stderr=forced pm grant failure for android.permission.CAMERA' "$GRANT_MOD/grant.log" \
+   && grep -q 'package=ws.xsoh.etar.debug permission=android.permission.ACCESS_FINE_LOCATION method=grant rc=0' "$GRANT_MOD/grant.log" \
+   && grep -q 'method=appops rc=0' "$GRANT_MOD/grant.log" \
+   && [ ! -e "$GRANT_MOD/granted/ws.xsoh.etar.debug.90000" ] \
+   && grep -q 'no-auto-grant marker: absent (runtime grants default-on)' "$GRANT_MOD/GKUI-diag.txt"; then
+  ok "默认授权先于诊断执行；失败记录 rc/stderr 后继续，AppOps 与 location 依赖顺序正确"
+else
+  bad "runtime grant 默认执行/顺序/非致命失败记录异常"; cat "$GRANT_TEST/pm-calls"; cat "$GRANT_MOD/grant.log" 2>/dev/null
+fi
+
+: > "$GRANT_TEST/pm-calls"
+FAKE_PM_FAIL_GRANT= run_grant_service
+if [ -f "$GRANT_MOD/granted/ws.xsoh.etar.debug.90000" ] \
+   && grep -q 'permission=android.permission.CAMERA method=grant rc=0' "$GRANT_MOD/grant.log" \
+   && grep -q 'runtime grant marker status by package/version:' "$GRANT_MOD/GKUI-diag.txt"; then
+  ok "同一 versionCode 的全部授权成功后持久化 granted/<pkg>.<versionCode> marker"
+else
+  bad "runtime grant 成功 marker 未生成/未写入诊断"
+fi
+: > "$GRANT_TEST/pm-calls"
+run_grant_service
+if ! grep -qE '^(grant |appops set )' "$GRANT_TEST/pm-calls"; then
+  ok "已成功标记的 package/version 不重复尝试授权"
+else
+  bad "成功 marker 存在时重复执行 runtime grant"
+fi
+: > "$GRANT_TEST/pm-calls"
+FAKE_VERSION_CODE=90001 run_grant_service
+if [ -f "$GRANT_MOD/granted/ws.xsoh.etar.debug.90001" ] \
+   && grep -qE '^(grant |appops set )' "$GRANT_TEST/pm-calls"; then
+  ok "应用 versionCode 改变后允许一次新的授权尝试并创建新 marker"
+else
+  bad "versionCode 改变后没有重新尝试 runtime grant"
+fi
+touch "$GRANT_MOD/no-auto-grant"
+: > "$GRANT_TEST/pm-calls"
+FAKE_VERSION_CODE=90002 run_grant_service
+if ! grep -qE '^(grant |appops set )' "$GRANT_TEST/pm-calls" \
+   && [ ! -e "$GRANT_MOD/granted/ws.xsoh.etar.debug.90002" ] \
+   && grep -q 'no-auto-grant marker: present (runtime grants skipped)' "$GRANT_MOD/GKUI-diag.txt" \
+   && grep -q '^disable-user --user 0 org.lineageos.etar$' "$GRANT_TEST/pm-calls"; then
+  ok "no-auto-grant 存在时完全跳过授权，但继续执行 stock 切换与诊断"
+else
+  bad "no-auto-grant opt-out 仍触发授权或中断其他 service 工作"
+fi
+
 # service.sh 后台诊断测试(桩 getprop / dumpsys / logcat / pm)
 DIAG_TEST="$WORK/diag-test"
 mkdir -p "$DIAG_TEST/mod" "$DIAG_TEST/bin" "$DIAG_TEST/sdcard-dl"
 cp "$WORK/dist/GKUI-Pack-test-1-recorderpriv-TEST.zip" "$DIAG_TEST/" 2>/dev/null || true
 unzip -p "$ZIP_PRIV_TEST" service.sh > "$DIAG_TEST/mod/service.sh"
 unzip -p "$ZIP_PRIV_TEST" stock-packages.list > "$DIAG_TEST/mod/stock-packages.list"
+unzip -p "$ZIP_PRIV_TEST" gkui-packages.list > "$DIAG_TEST/mod/gkui-packages.list"
+unzip -p "$ZIP_PRIV_TEST" stock-gkui-map.list > "$DIAG_TEST/mod/stock-gkui-map.list"
+unzip -p "$ZIP_PRIV_TEST" stock-merged.list > "$DIAG_TEST/mod/stock-merged.list"
+unzip -p "$ZIP_PRIV_TEST" runtime-grants.list > "$DIAG_TEST/mod/runtime-grants.list"
 chmod +x "$DIAG_TEST/mod/service.sh"
 touch "$DIAG_TEST/mod/.boot_flag"
 cat > "$DIAG_TEST/bin/getprop" <<'STUB'
@@ -1654,19 +2023,33 @@ cat > "$DIAG_TEST/bin/pm" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
   list)
-    printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel:signature|privileged|role\n'
+    case "${2:-}:${3:-}" in
+      packages:-d) printf 'package:org.lineageos.glimpse.dev\n' ;;
+      packages:-s) printf 'package:com.android.deskclock\n' ;;
+      permissions) printf '+ permission:android.permission.CAPTURE_AUDIO_OUTPUT\n  protectionLevel:signature|privileged|role\n' ;;
+    esac
     ;;
-  path)
-    echo "package:/system/stub/${2}.apk"
-    ;;
+  path) echo "package:/system/stub/${2}.apk" ;;
+  enable|disable-user) exit 0 ;;
 esac
+exit 0
 STUB
 cat > "$DIAG_TEST/bin/dumpsys" <<'STUB'
 #!/usr/bin/env bash
+if [ "${2:-}" = "" ]; then
+  echo "Renamed packages:"
+  echo "  com.android.deskclock -> com.android.deskclock.dev"
+  echo
+  exit 0
+fi
 cat <<EOF
 Packages:
   Package [${2:-org.lineageos.recorder.dev}] (12345):
+    realName=${2:-org.lineageos.recorder.dev}
+    codePath=/system/app/${2:-org.lineageos.recorder.dev}
     versionCode=90000 targetSdk=36
+    flags=[ SYSTEM ]
+    User 0: installed=true hidden=false enabled=0
     signatures=PackageSignatures{stub-signature}
     requested permissions:
       android.permission.CAPTURE_AUDIO_OUTPUT
@@ -1681,12 +2064,18 @@ Packages:
       should_not_appear
 EOF
 STUB
+cat > "$DIAG_TEST/bin/cmd" <<'STUB'
+#!/usr/bin/env bash
+printf 'ws.xsoh.etar.debug/.ui.MainActivity\ncom.android.deskclock/.DeskClock\n'
+STUB
 cat > "$DIAG_TEST/bin/logcat" <<'STUB'
 #!/usr/bin/env bash
 echo "10-12 08:00:00.000  1000  1000 I PackageManager: privapp permissions ok for org.lineageos.recorder.dev"
 echo "10-12 08:00:01.000  1000  1000 D UnrelatedTag: should be filtered out"
 STUB
-chmod +x "$DIAG_TEST/bin/getprop" "$DIAG_TEST/bin/pm" "$DIAG_TEST/bin/dumpsys" "$DIAG_TEST/bin/logcat"
+chmod +x "$DIAG_TEST/bin/getprop" "$DIAG_TEST/bin/pm" "$DIAG_TEST/bin/dumpsys" "$DIAG_TEST/bin/cmd" "$DIAG_TEST/bin/logcat"
+mkdir -p "$DIAG_TEST/mod/system/app/GKUICalendar"
+printf 'fixture apk\n' > "$DIAG_TEST/mod/system/app/GKUICalendar/GKUICalendar.apk"
 
 env PATH="$DIAG_TEST/bin:$PATH" \
     DIAG_SDCARD_DIR="$DIAG_TEST/sdcard-dl" \
@@ -1708,7 +2097,7 @@ if [ -s "$DIAG_TEST/mod/GKUI-diag.txt" ] && [ -s "$DIAG_TEST/sdcard-dl/GKUI-diag
 else
   bad "service.sh 未生成或未复制 GKUI-diag.txt"
 fi
-if grep -q '^variant: priv-TEST$' "$DIAG_TEST/mod/GKUI-diag.txt" \
+if grep -q '^variant: recorderpriv$' "$DIAG_TEST/mod/GKUI-diag.txt" \
    && grep -q 'ro.product.device: redfinstub' "$DIAG_TEST/mod/GKUI-diag.txt" \
    && grep -q 'ro.control_privapp_permissions: enforce' "$DIAG_TEST/mod/GKUI-diag.txt" \
    && grep -q 'android.permission.CAPTURE_AUDIO_OUTPUT: granted=true' "$DIAG_TEST/mod/GKUI-diag.txt" \
@@ -1720,8 +2109,22 @@ else
 fi
 # 章节标题必须实际落盘(回归:printf '---' 在 dash/bash 下会被当成选项而丢行)
 if grep -qF -e '--- [6] dumpsys package (' "$DIAG_TEST/mod/GKUI-diag.txt" \
-   && grep -qF -e '--- [1] Read-only System Properties' "$DIAG_TEST/mod/GKUI-diag.txt"; then
-  ok "诊断报告 7 个章节标题全部落盘(含 stock 状态节;printf 可移植写法)"
+   && grep -qF -e '--- [1] Read-only System Properties' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -qF -e '--- [7] PackageManager renamed packages ---' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -qF -e '--- [8] Disabled and system package listings ---' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -qF -e '--- [9] Relevant launcher activities (package lists are dynamic) ---' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -qF -e '--- [10] Module mount tree ---' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -qF -e '--- [11] Module-related mount lines ---' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'com.android.deskclock -> com.android.deskclock.dev' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'pm list packages -d:' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'gkui-packages.list marker:' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'stock-gkui-map.list marker:' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'no-auto-grant marker: absent (runtime grants default-on)' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'runtime grant marker status by package/version:' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'grant.log:' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'ws.xsoh.etar.debug/.ui.MainActivity' "$DIAG_TEST/mod/GKUI-diag.txt" \
+   && grep -q 'system/app/GKUICalendar' "$DIAG_TEST/mod/GKUI-diag.txt"; then
+  ok "诊断报告保留旧节并包含 renamed/disabled/system/launcher/mount/list/marker 新节"
 else
   bad "诊断报告章节标题缺失"
 fi
@@ -1729,10 +2132,12 @@ fi
 diag_missing=""
 for pkg in $DIAG_GKUI_PKGS $DIAG_STOCK_PKGS; do
   n="$(grep -c "^\[$pkg\]\$" "$DIAG_TEST/mod/GKUI-diag.txt" || true)"
-  [ "$n" -eq 2 ] || diag_missing="$diag_missing $pkg($n)"
+  expected_n=3
+  case "$pkg" in ws.xsoh.etar.debug|com.android.deskclock) expected_n=4 ;; esac
+  [ "$n" -eq "$expected_n" ] || diag_missing="$diag_missing $pkg($n)"
 done
 if [ -z "$diag_missing" ]; then
-  ok "[2]/[6] 两节覆盖全部 10 个包(5 GKUI + 5 stock),每包各出现 2 次"
+  ok "[2]/[3]/[6] 三节覆盖全部 10 包;有匹配 launcher 的两项另有精确结果行"
 else
   bad "10 包采集缺失:$diag_missing"
 fi
@@ -1742,10 +2147,12 @@ else
   bad "[2] pm path 采集行数不是 10"
 fi
 # [6] 每包都要带 declared permissions 段、signatures 与 versionCode 行
-if [ "$(grep -c '^    declared permissions:$' "$DIAG_TEST/mod/GKUI-diag.txt" || true)" -eq 10 ] \
-   && [ "$(grep -c 'signatures=PackageSignatures' "$DIAG_TEST/mod/GKUI-diag.txt" || true)" -eq 10 ] \
-   && [ "$(grep -c 'versionCode=90000' "$DIAG_TEST/mod/GKUI-diag.txt" || true)" -eq 10 ]; then
-  ok "[6] 10 包 dumpsys 的 declared permissions / signatures / versionCode 均已采集"
+diag6="$(sed -n '/--- \[6\]/,/--- \[7\]/p' "$DIAG_TEST/mod/GKUI-diag.txt")"
+if [ "$(printf '%s\n' "$diag6" | grep -c '^    declared permissions:$' || true)" -eq 10 ] \
+   && [ "$(printf '%s\n' "$diag6" | grep -c 'signatures=PackageSignatures' || true)" -eq 10 ] \
+   && [ "$(printf '%s\n' "$diag6" | grep -c 'versionCode=90000' || true)" -eq 10 ] \
+   && [ "$(printf '%s\n' "$diag6" | grep -c 'User 0:' || true)" -eq 10 ]; then
+  ok "[6] 10 包 dumpsys 的 identity / User 0 / declared permissions / signatures / versionCode 均已采集"
 else
   bad "[6] dumpsys 采集不完整"
 fi
@@ -1787,12 +2194,26 @@ cat > "$STOCK_TOGGLE_BIN/pm" <<'STUB'
 printf '%s\n' "$*" >> "$FAKE_PM_CALLS"
 case "${1:-}" in
   list)
+    if [ "${2:-}" = packages ] && [ "${3:-}" = -d ]; then
+      [ "${FAKE_PM_LIST_RC:-0}" -eq 0 ] || exit "${FAKE_PM_LIST_RC:-1}"
+      if [ -f "$FAKE_PM_DISABLED_FILE" ]; then
+        while IFS= read -r listed_pkg; do
+          [ -n "$listed_pkg" ] && printf 'package:%s\n' "$listed_pkg"
+        done < "$FAKE_PM_DISABLED_FILE"
+      fi
+      exit 0
+    fi
     if [ "${2:-}" = packages ] && [ "${3:-}" = -e ]; then
       [ "${FAKE_PM_LIST_RC:-0}" -eq 0 ] || exit "${FAKE_PM_LIST_RC:-1}"
       if [ -f "$FAKE_PM_ENABLED_FILE" ]; then
-        while IFS= read -r listed_pkg; do
-          [ -n "$listed_pkg" ] && printf 'package:%s\n' "$listed_pkg"
-        done < "$FAKE_PM_ENABLED_FILE"
+        if [ "${FAKE_PM_RANDOM_ORDER:-forward}" = reverse ]; then
+          awk '{ rows[NR]=$0 } END { for (i=NR; i>0; i--) print rows[i] }' "$FAKE_PM_ENABLED_FILE" |
+            while IFS= read -r listed_pkg; do [ -n "$listed_pkg" ] && printf 'package:%s\n' "$listed_pkg"; done
+        else
+          while IFS= read -r listed_pkg; do
+            [ -n "$listed_pkg" ] && printf 'package:%s\n' "$listed_pkg"
+          done < "$FAKE_PM_ENABLED_FILE"
+        fi
       fi
       exit 0
     fi
@@ -1803,7 +2224,25 @@ case "${1:-}" in
     exit 0
     ;;
   path)
-    printf 'package:/system/stub/%s.apk\n' "${2:-}"
+    pkg="${2:-}"
+    [ "$pkg" != "${FAKE_PM_EMPTY_PATH:-}" ] || exit 0
+    if [ "${FAKE_PM_STOCK_GKUI_PATH:-0}" = 1 ]; then
+      case "$pkg" in
+        com.android.deskclock) echo 'package:/system/app/GKUIClock/GKUIClock.apk'; exit 0 ;;
+        com.android.deskclock.dev) echo 'package:/system/stub/com.android.deskclock.dev.apk'; exit 0 ;;
+      esac
+    fi
+    if [ "${FAKE_PM_SPLIT_CLOCK:-0}" = 1 ]; then
+      case "$pkg" in
+        com.android.deskclock) echo 'package:/product/app/DeskClock/DeskClock.apk'; exit 0 ;;
+        com.android.deskclock.dev) echo 'package:/system/app/GKUIClock/GKUIClock.apk'; exit 0 ;;
+      esac
+    else
+      case "$pkg" in
+        com.android.deskclock|com.android.deskclock.dev) echo 'package:/system/app/GKUIClock/GKUIClock.apk'; exit 0 ;;
+      esac
+    fi
+    printf 'package:/system/stub/%s.apk\n' "$pkg"
     exit 0
     ;;
   disable-user)
@@ -1814,10 +2253,14 @@ case "${1:-}" in
     exit 0
     ;;
   enable)
-    pkg="${2:-}"
+    pkg="${4:-}"
     [ "$pkg" != "${FAKE_PM_FAIL_ENABLE:-}" ] || exit 9
     if ! grep -Fqx "$pkg" "$FAKE_PM_ENABLED_FILE"; then
       printf '%s\n' "$pkg" >> "$FAKE_PM_ENABLED_FILE"
+    fi
+    if [ -f "$FAKE_PM_DISABLED_FILE" ]; then
+      awk -v p="$pkg" '$0 != p && NF { print }' "$FAKE_PM_DISABLED_FILE" > "$FAKE_PM_DISABLED_FILE.tmp"
+      mv -f "$FAKE_PM_DISABLED_FILE.tmp" "$FAKE_PM_DISABLED_FILE"
     fi
     exit 0
     ;;
@@ -1826,6 +2269,7 @@ exit 0
 STUB
 chmod +x "$STOCK_TOGGLE_BIN/getprop" "$STOCK_TOGGLE_BIN/pm"
 printf '%s\n' org.lineageos.etar com.android.calculator2 org.lineageos.recorder > "$STOCK_TOGGLE/enabled.list"
+: > "$STOCK_TOGGLE/disabled.list"
 cat > "$STOCK_TOGGLE_MOD/stock-packages.list" <<'EOF'
 org.lineageos.etar
 org.lineageos.etar
@@ -1839,6 +2283,11 @@ run_stock_toggle_service() {
   env PATH="$STOCK_TOGGLE_BIN:$PATH" \
       FAKE_PM_CALLS="$STOCK_TOGGLE/pm-calls" \
       FAKE_PM_ENABLED_FILE="$STOCK_TOGGLE/enabled.list" \
+      FAKE_PM_DISABLED_FILE="$STOCK_TOGGLE/disabled.list" \
+      FAKE_PM_RANDOM_ORDER="${FAKE_PM_RANDOM_ORDER:-forward}" \
+      FAKE_PM_SPLIT_CLOCK="${FAKE_PM_SPLIT_CLOCK:-0}" \
+      FAKE_PM_STOCK_GKUI_PATH="${FAKE_PM_STOCK_GKUI_PATH:-0}" \
+      FAKE_PM_EMPTY_PATH="${FAKE_PM_EMPTY_PATH:-}" \
       FAKE_PM_FAIL_DISABLE="${1:-}" FAKE_PM_FAIL_ENABLE="${2:-}" \
       DIAG_SDCARD_DIR="$STOCK_TOGGLE/sdcard" \
       DIAG_BOOT_MAX_WAIT=2 DIAG_SDCARD_MAX_WAIT=2 DIAG_SDCARD_SLEEP=1 \
@@ -1868,9 +2317,100 @@ org.lineageos.recorder" ] \
 else
   bad "stock-disabled.list 添加/去重或失败日志异常"; cat "$STOCK_TOGGLE_MOD/stock-disabled.list" 2>/dev/null
 fi
+if grep -q 'package=com.android.deskclock action=MERGED: resolves to com.android.deskclock.dev APK; skip disable rc=0' "$STOCK_TOGGLE_MOD/stock-toggle.log" \
+   && ! grep -Fqx 'com.android.deskclock' "$STOCK_TOGGLE_MOD/stock-disabled.list"; then
+  ok "同路径 DeskClock 被记录为 MERGED,不执行 disable 且不进入恢复跟踪清单"
+else
+  bad "MERGED 时钟未跳过停用/跟踪"
+fi
+
+# A2 regression:PM 扫描将 APK 的 original-package alias 映射回 GKUIClock 路径;
+# 即使 .dev 名称返回不同路径,也必须在 enabled 分支再次检查 stock 的模块路径。
+printf '%s\n' com.android.deskclock > "$STOCK_TOGGLE/enabled.list"
+: > "$STOCK_TOGGLE/disabled.list"
+: > "$STOCK_TOGGLE_MOD/stock-disabled.list"
+: > "$STOCK_TOGGLE/pm-calls"
+FAKE_PM_STOCK_GKUI_PATH=1 run_stock_toggle_service "" ""
+if grep -q 'package=com.android.deskclock action=skip-merged-gkUI rc=0' "$STOCK_TOGGLE_MOD/stock-toggle.log" \
+   && [ "$(grep -Fc 'path com.android.deskclock' "$STOCK_TOGGLE/pm-calls" || true)" -ge 2 ] \
+   && ! grep -Fqx 'disable-user --user 0 com.android.deskclock' "$STOCK_TOGGLE/pm-calls" \
+   && ! grep -Fqx 'com.android.deskclock' "$STOCK_TOGGLE_MOD/stock-disabled.list"; then
+  ok "A2:enabled stock 解析到 /system/app/GKUIClock 时记录 skip-merged-gkUI 且不停用/跟踪"
+else
+  bad "A2:module-mounted GKUI path 未阻止 stock alias 被停用"; cat "$STOCK_TOGGLE_MOD/stock-toggle.log" 2>/dev/null
+fi
+
+# 精确整行匹配:PackageManager 包列表故意改变返回顺序,stock 名称应且仅应精确命中。
+if grep -Eq 'pm[[:space:]]+list[[:space:]]+packages[^#]*\$[A-Za-z_{]' "$REPO_ROOT/module/service.sh"; then
+  bad "service.sh 使用 pm list packages <变量过滤器> (禁止子串过滤)"
+else
+  ok "service.sh 不向 pm list packages 传入变量过滤器"
+fi
+for order in forward reverse; do
+  printf '%s\n' com.android.deskclock com.android.deskclock.dev > "$STOCK_TOGGLE/enabled.list"
+  : > "$STOCK_TOGGLE/disabled.list"
+  : > "$STOCK_TOGGLE_MOD/stock-disabled.list"
+  : > "$STOCK_TOGGLE/pm-calls"
+  FAKE_PM_SPLIT_CLOCK=1 FAKE_PM_RANDOM_ORDER="$order" run_stock_toggle_service "" ""
+  if [ "$(grep -Fc 'disable-user --user 0 com.android.deskclock' "$STOCK_TOGGLE/pm-calls" || true)" -eq 1 ] \
+     && ! grep -Fqx 'disable-user --user 0 com.android.deskclock.dev' "$STOCK_TOGGLE/pm-calls" \
+     && ! grep -Eq '^list packages -e .+' "$STOCK_TOGGLE/pm-calls"; then
+    ok "enabled 包列表 $order 顺序下仅精确停用 stock 名称,从不停用 GKUI 后缀包"
+  else
+    bad "enabled 包列表 $order 顺序下精确匹配异常"; cat "$STOCK_TOGGLE/pm-calls"
+  fi
+done
+unset FAKE_PM_SPLIT_CLOCK FAKE_PM_RANDOM_ORDER
+
+# 空 pm path 必须以 rc=0 记为 ABSENT 并跳过,不进入 stock-disabled.list。
+printf '%s\n' org.lineageos.glimpse > "$STOCK_TOGGLE/enabled.list"
+: > "$STOCK_TOGGLE/disabled.list"
+: > "$STOCK_TOGGLE_MOD/stock-disabled.list"
+: > "$STOCK_TOGGLE/pm-calls"
+FAKE_PM_EMPTY_PATH=org.lineageos.glimpse run_stock_toggle_service "" ""
+if grep -q 'package=org.lineageos.glimpse action=ABSENT: stock pm path empty; skip rc=0' "$STOCK_TOGGLE_MOD/stock-toggle.log" \
+   && ! grep -Fqx 'disable-user --user 0 org.lineageos.glimpse' "$STOCK_TOGGLE/pm-calls" \
+   && ! grep -Fqx 'org.lineageos.glimpse' "$STOCK_TOGGLE_MOD/stock-disabled.list"; then
+  ok "不存在的 stock 包记录 ABSENT/rc 0,不停用也不跟踪"
+else
+  bad "ABSENT 包处理异常"
+fi
+unset FAKE_PM_EMPTY_PATH
+
+# 旧模块若禁用了 GKUI 包,新 service 必须先以精确 package 行自愈。
+printf '%s\n' com.android.deskclock.dev.fake com.android.deskclock.dev > "$STOCK_TOGGLE/disabled.list"
+: > "$STOCK_TOGGLE/enabled.list"
+: > "$STOCK_TOGGLE_MOD/stock-disabled.list"
+: > "$STOCK_TOGGLE/pm-calls"
+run_stock_toggle_service "" ""
+if grep -Fqx 'enable --user 0 com.android.deskclock.dev' "$STOCK_TOGGLE/pm-calls" \
+   && [ "$(grep -Fc 'package=com.android.deskclock.dev action=SELF-HEAL GKUI-disabled rc=0' "$STOCK_TOGGLE_MOD/stock-toggle.log" || true)" -eq 1 ] \
+   && ! grep -Fqx 'com.android.deskclock.dev' "$STOCK_TOGGLE/disabled.list" \
+   && ! grep -Fqx 'enable --user 0 com.android.deskclock.dev.fake' "$STOCK_TOGGLE/pm-calls"; then
+  ok "disabled GKUI package 在停用 stock 前按精确匹配自愈"
+else
+  bad "GKUI disabled self-heal 未执行或非精确匹配"
+fi
+
+# 旧版跟踪的合并 stock 别名也必须先 enable 并从恢复列表移除。
+printf '%s\n' com.android.deskclock > "$STOCK_TOGGLE_MOD/stock-disabled.list"
+printf '%s\n' com.android.deskclock > "$STOCK_TOGGLE/disabled.list"
+: > "$STOCK_TOGGLE/enabled.list"
+: > "$STOCK_TOGGLE/pm-calls"
+run_stock_toggle_service "" ""
+if grep -Fqx 'enable --user 0 com.android.deskclock' "$STOCK_TOGGLE/pm-calls" \
+   && grep -q 'package=com.android.deskclock action=SELF-HEAL merged-tracked-stock rc=0' "$STOCK_TOGGLE_MOD/stock-toggle.log" \
+   && [ ! -s "$STOCK_TOGGLE_MOD/stock-disabled.list" ] \
+   && [ ! -s "$STOCK_TOGGLE/disabled.list" ] \
+   && ! grep -Fqx 'disable-user --user 0 com.android.deskclock' "$STOCK_TOGGLE/pm-calls"; then
+  ok "旧版跟踪的 MERGED stock 名称先自愈,成功后从恢复清单移除"
+else
+  bad "MERGED stock self-heal/取消跟踪异常"
+fi
+
 if grep -qF -- '--- [0] Stock app toggle state ---' "$STOCK_TOGGLE_MOD/GKUI-diag.txt" \
    && grep -q 'stock-toggle.log:' "$STOCK_TOGGLE_MOD/GKUI-diag.txt" \
-   && grep -q 'stock-disabled.list:' "$STOCK_TOGGLE_MOD/GKUI-diag.txt"; then
+   && grep -q 'stock-disabled.list marker:' "$STOCK_TOGGLE_MOD/GKUI-diag.txt"; then
   ok "诊断文件打印 stock-toggle.log 与 stock-disabled.list"
 else
   bad "stock 状态未写入诊断文件"
@@ -1882,9 +2422,9 @@ printf '%s\n' org.lineageos.etar org.lineageos.etar org.lineageos.recorder com.a
 touch "$STOCK_TOGGLE_MOD/keep-stock"
 : > "$STOCK_TOGGLE/pm-calls"
 run_stock_toggle_service "" com.android.deskclock
-if grep -Fqx 'enable org.lineageos.etar' "$STOCK_TOGGLE/pm-calls" \
-   && grep -Fqx 'enable org.lineageos.recorder' "$STOCK_TOGGLE/pm-calls" \
-   && grep -Fqx 'enable com.android.deskclock' "$STOCK_TOGGLE/pm-calls" \
+if grep -Fqx 'enable --user 0 org.lineageos.etar' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'enable --user 0 org.lineageos.recorder' "$STOCK_TOGGLE/pm-calls" \
+   && grep -Fqx 'enable --user 0 com.android.deskclock' "$STOCK_TOGGLE/pm-calls" \
    && ! grep -q '^disable-user ' "$STOCK_TOGGLE/pm-calls" \
    && [ "$(cat "$STOCK_TOGGLE_MOD/stock-disabled.list")" = "com.android.deskclock" ] \
    && grep -q 'package=com.android.deskclock action=enable rc=9' "$STOCK_TOGGLE_MOD/stock-toggle.log"; then
@@ -1899,9 +2439,10 @@ rm -f "$STOCK_TOGGLE_MOD/keep-stock"
 run_stock_toggle_service com.android.calculator2 ""
 if grep -Fqx 'disable-user --user 0 org.lineageos.etar' "$STOCK_TOGGLE/pm-calls" \
    && grep -Fqx 'disable-user --user 0 org.lineageos.recorder' "$STOCK_TOGGLE/pm-calls" \
-   && [ "$(awk 'NF {n++} END {print n+0}' "$STOCK_TOGGLE_MOD/stock-disabled.list")" -eq 3 ] \
-   && [ "$(sort -u "$STOCK_TOGGLE_MOD/stock-disabled.list" | awk 'NF {n++} END {print n+0}')" -eq 3 ]; then
-  ok "移除 keep-stock 后恢复默认停用,新增记录且 stock-disabled.list 无重复"
+   && [ "$(awk 'NF {n++} END {print n+0}' "$STOCK_TOGGLE_MOD/stock-disabled.list")" -eq 2 ] \
+   && [ "$(sort -u "$STOCK_TOGGLE_MOD/stock-disabled.list" | awk 'NF {n++} END {print n+0}')" -eq 2 ] \
+   && ! grep -Fqx 'com.android.deskclock' "$STOCK_TOGGLE_MOD/stock-disabled.list"; then
+  ok "移除 keep-stock 后恢复默认停用,只跟踪 separate stock app 且无重复/merged clock"
 else
   bad "keep-stock 删除后的默认停用或去重异常"; cat "$STOCK_TOGGLE_MOD/stock-disabled.list" 2>/dev/null
 fi
@@ -1930,8 +2471,9 @@ for _variant in normal priv; do
   out="$(env PATH="$NOGE_BIN" MODPATH="$_mod" /bin/sh "$_mod/customize.sh" 2>&1)"; rc=$?
   if [ $rc -eq 0 ] && [ ! -e "$_mod/keep-stock" ] \
      && printf '%s' "$out" | grep -q 'getevent 不存在' \
-     && printf '%s' "$out" | grep -q '当前选择:默认停用 stock'; then
-    ok "$_variant customize.sh 在 getevent 缺失时不报错且不创建 keep-stock"
+     && printf '%s' "$out" | grep -q '当前选择:默认停用 stock' \
+     && [ -s "$_mod/install.log" ] && grep -q 'getevent 不存在' "$_mod/install.log"; then
+    ok "$_variant customize.sh 在 getevent 缺失时正常降级、未创建 keep-stock 且镜像 install.log"
   else
     bad "$_variant customize.sh 的 getevent 缺失回退异常(rc=$rc)"; printf '%s\n' "$out" | tail -10
   fi
@@ -1942,6 +2484,8 @@ UNINSTALL_MOD="$UNINSTALL_TEST/mod"
 mkdir -p "$UNINSTALL_MOD"
 unzip -p "$ZIP" uninstall.sh > "$UNINSTALL_MOD/uninstall.sh"
 unzip -p "$ZIP" stock-packages.list > "$UNINSTALL_MOD/stock-packages.list"
+unzip -p "$ZIP" stock-merged.list > "$UNINSTALL_MOD/stock-merged.list"
+printf '%s\n' com.android.deskclock >> "$UNINSTALL_MOD/stock-merged.list"
 printf '%s\n%s\n' "$DIAG_STOCK_PKGS" org.lineageos.etar | tr ' ' '\n' > "$UNINSTALL_MOD/stock-disabled.list"
 if ! grep -q 'pm ' "$UNINSTALL_MOD/uninstall.sh"; then
   ok "uninstall.sh 不含直接 PackageManager 调用"
@@ -1960,12 +2504,17 @@ else
 fi
 restore_names_ok=1
 for pkg in $DIAG_STOCK_PKGS; do
-  grep -Fqx "$pkg" "$RESTORE_SCRIPT" || restore_names_ok=0
+  if [ "$pkg" = com.android.deskclock ]; then
+    grep -Fqx "$pkg" "$RESTORE_SCRIPT" && restore_names_ok=0
+  else
+    grep -Fqx "$pkg" "$RESTORE_SCRIPT" || restore_names_ok=0
+  fi
 done
-if [ "$restore_names_ok" -eq 1 ]; then
-  ok "service.d 恢复脚本内联 stock-disabled.list 中的全部包名(重复项去重)"
+if [ "$restore_names_ok" -eq 1 ] \
+   && printf '%s' "$out" | grep -q '跳过 MERGED stock 包恢复记录: com.android.deskclock'; then
+  ok "service.d 恢复脚本跳过 MERGED clock,并内联其余 stock 包(重复项去重)"
 else
-  bad "service.d 恢复脚本遗漏包名"
+  bad "service.d 恢复脚本未排除 merged package 或遗漏其他包"
 fi
 : > "$STOCK_TOGGLE/enabled.list"
 : > "$STOCK_TOGGLE/pm-calls"
@@ -1976,11 +2525,16 @@ env PATH="$STOCK_TOGGLE_BIN:$PATH" \
     sh "$RESTORE_SCRIPT"
 restore_calls_ok=1
 for pkg in $DIAG_STOCK_PKGS; do
-  grep -Fqx "enable $pkg" "$STOCK_TOGGLE/pm-calls" || restore_calls_ok=0
-  grep -q "package=$pkg action=enable rc=0" "$UNINSTALL_TEST/data/adb/gkui-pack-restore.log" || restore_calls_ok=0
+  if [ "$pkg" = com.android.deskclock ]; then
+    grep -Fqx "enable --user 0 $pkg" "$STOCK_TOGGLE/pm-calls" && restore_calls_ok=0
+    grep -q "package=$pkg action=enable rc=0" "$UNINSTALL_TEST/data/adb/gkui-pack-restore.log" && restore_calls_ok=0
+  else
+    grep -Fqx "enable --user 0 $pkg" "$STOCK_TOGGLE/pm-calls" || restore_calls_ok=0
+    grep -q "package=$pkg action=enable rc=0" "$UNINSTALL_TEST/data/adb/gkui-pack-restore.log" || restore_calls_ok=0
+  fi
 done
 if [ "$restore_calls_ok" -eq 1 ] && [ ! -e "$RESTORE_SCRIPT" ]; then
-  ok "恢复脚本逐包 enable、写 /data/adb/gkui-pack-restore.log 并在执行后自删"
+  ok "恢复脚本只 enable 非 MERGED stock、写结果日志并在执行后自删"
 else
   bad "service.d 恢复脚本执行结果/日志/自删异常"
 fi
@@ -1990,7 +2544,10 @@ if [ -f "$REPO_ROOT/docs/TESTER.md" ]; then
   tester_lines="$(wc -l < "$REPO_ROOT/docs/TESTER.md" | tr -d ' ')"
   if [ "$tester_lines" -le 15 ] \
      && grep -q '设置 → 应用' "$REPO_ROOT/docs/TESTER.md" \
-     && ! grep -qE 'adb |pm uninstall|sh |bash ' "$REPO_ROOT/docs/TESTER.md"; then
+     && grep -q '时钟只会有一个，这是正常的。' "$REPO_ROOT/docs/TESTER.md" \
+     && grep -q '等待约一分钟' "$REPO_ROOT/docs/TESTER.md" \
+     && grep -q '权限请求弹窗' "$REPO_ROOT/docs/TESTER.md" \
+     && ! grep -qE '^[[:space:]]*(adb|pm uninstall|sh|bash)([[:space:]]|$)' "$REPO_ROOT/docs/TESTER.md"; then
     ok "docs/TESTER.md 行数 <= 15(实际=${tester_lines}行)、0 条命令且含『设置 → 应用』刷前卸载提醒"
   else
     bad "docs/TESTER.md 不符合行数/0命令/卸载提醒要求(lines=$tester_lines)"

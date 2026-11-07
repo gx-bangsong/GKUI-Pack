@@ -24,8 +24,8 @@
 #      duplicate `<permission>` declarations in AOSP/LineageOS manifest union
 #      their protectionLevel tokens ("宁可多写不能少写": any declaration with
 #      `privileged` is included).
-#   6) Device dumps come from `pm list permissions -f`, which (measured on
-#      Pixel 5 / Android 16) does NOT enumerate dangerous runtime permissions:
+#   6) The checked-in AndVM virtual-machine snapshot comes from `pm list permissions -f`,
+#      which (Pixel 5 / Android 16 configuration) does NOT enumerate dangerous runtime permissions:
 #      the dump contains zero `dangerous` records. A requested permission
 #      absent from such a dump therefore cannot be a privileged permission and
 #      can never belong in a privapp XML — it is skipped with an explicit
@@ -227,17 +227,17 @@ def generate(
     entries: dict[str, set[str]] = {}
 
     source_label = (
-        "源码推导(未经设备验证)" if mode == "source" else "设备实测转储(strict)"
+        "源码推导(未经设备验证)" if mode == "source" else "AndVM 虚拟机权限快照(strict)"
     )
     report.append(f"白名单模式: {mode} ({source_label}) — 来源文件: {dump}")
-    # 实测属性(见本文件头规则 6):设备端 pm list permissions -f 不列出 dangerous
-    # 运行时权限(Pixel 5 / Android 16 转储中 dangerous 记录数为 0)。该属性只用于
-    # 解释"请求了但转储里没有"的权限;一旦转储本身含有 dangerous 记录,缺失即未知,
+    # AndVM 快照属性(见本文件头规则 6):该环境的 pm list permissions -f 未列出
+    # dangerous 运行时权限(Pixel 5 / Android 16 配置中记录数为 0)。这仅解释
+    # "请求了但快照里没有"的权限;一旦转储本身含有 dangerous 记录,缺失即未知,
     # 仍然 fail-closed。
     dump_has_dangerous = any("dangerous" in lvl for lvl in levels.values())
     if mode == "device" and not dump_has_dangerous:
         report.append(
-            "设备转储不含 dangerous 运行时权限(pm list permissions -f 的实测行为);"
+            "AndVM 虚拟机快照不含 dangerous 运行时权限(pm list permissions -f 的采集结果);"
             "请求但未出现在转储中的运行时权限显式跳过,不写入白名单"
         )
 

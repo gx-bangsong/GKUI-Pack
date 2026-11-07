@@ -2,6 +2,8 @@
 
 > 面向以 agent 模式或人工方式修改本仓库的所有人。
 > **本文件的规则优先于任何"看起来更合理"的直觉。**
+>
+> 本轮验证口径只限虚拟机环境（AndVM，Pixel 5 / OnePlus7TPro 配置）；真实设备、KernelSU/APatch、A/B 与 OTA 均未验证。真实设备、`pm grant` / AppOps 与数据继承不得写成已验证。
 
 ## 0. 这个仓库是什么
 
@@ -30,19 +32,18 @@
   (不得编造 sha256、版本号、包名、路径、仓库名、commit)。
 - 任何 `TODO` 或 `confidence: unverified` 都会让 `build.sh` **`exit 1`**。
   这是**有意设计**,不是 bug;不要"顺手填上"以让构建通过。
-- 录音机(GKUIRecorder)条目的 `application_id = org.lineageos.recorder.dev` 来自
-  2026-10-08 的真机实测(`pm list packages -3` + `dumpsys package`),**不是**从仓库描述
-  "基于 LineageOS 录音机"或源码里的 `applicationIdSuffix` 推出来的 —— 那些**不构成**包名
-  证据,只是事后恰好一致。同理,它的 `signer_sha256` 来自 CI 在真实 APK 上的 `apksigner`
-  采集(临时 tag `v0.0.3-collect`),Release 字段来自 GitHub Releases API 原样抄录。
+- 录音机(GKUIRecorder)条目的 `application_id = org.lineageos.recorder.dev` 与
+  `installed_version_code` 的范围必须按 `apps.yaml` 注释说明；本轮文档只将设备侧观察表述为
+  AndVM 虚拟机配置，不可据此宣称真实设备已验证。签名摘要应来自 CI 对实际 APK 的
+  `apksigner` 采集，Release 字段来自 GitHub Releases API；不能从包名后缀规律推断。
 
 ## 2. 硬约束(违反任一 = 失败)
 
 | 编号 | 约束 | 在代码中的落点 |
 |---|---|---|
 | C1 | 禁止推断 applicationId;未知值 `TODO` + 构建失败 | `build.sh` 字段校验 |
-| C2 | `mode` 恒为 `coexist`,**严禁** `replace`;禁止写入/删除/覆盖 stock 应用目录;禁止 Magisk `REPLACE` / `.replace`。模块 v0.0.6 起默认在开机后对 `stock-packages.list` 中当前启用的 user 0 包执行可逆 `pm disable-user`,只记录本模块成功停用的包;`keep-stock` 可保留/恢复,卸载时用 service.d 一次性脚本恢复。不得 `pm uninstall`、不得写 `/data/data`。 | `build.sh`、`module/customize.sh`、`module/service.sh`、`module/uninstall.sh` |
-| C3 | 一律装到 `/system/app/<Name>/`,**严禁 `priv-app`**、严禁生成任何白名单 XML(物理底线);检出 privileged 权限申请时按**显式确认制**处理:条目未写 `privileged_ack` → **不入模块**(fail-safe,README 标注"仅走 adb install");条目写明 `privileged_ack: true` → 以 `system_app` 纳入,但报告 / 清单 / 构建摘要必须**逐条标注**申请了哪些特权权限、这些权限不会被授予、后果(`privileged_note`)。`customize.sh` 还会清掉模块目录 `system/` 下除 `app/` 以外的任何落点(从 `recorder-priv` 变体刷回时不留残留) | `preflight-apk.sh`、`build.sh`、`module/customize.sh` |
+| C2 | `mode` 恒为 `coexist`,禁止 `replace`、Magisk `REPLACE`、`.replace`，不改写 stock APK/分区。只对映射中路径不同且当前启用的 user 0 stock 执行 `pm disable-user`；同路径 `MERGED`、空路径 `ABSENT` 均 rc 0 跳过；GKUI disabled 与旧 tracked merged 状态先 `SELF-HEAL`。读取完整 `pm list packages -e/-d` 并匹配完整 `package:<name>` 行，禁止变量包名过滤。`keep-stock`、成功记录和卸载恢复保持可逆。Runtime grants 默认开启；`$MODDIR/no-auto-grant` 存在时完全跳过。不得 `pm uninstall`、不得写 `/data/data`。 | `build.sh`、`module/customize.sh`、`module/service.sh`、`module/uninstall.sh` |
+| C3 | 普通版落在 `/system/app/<Name>/`。仅 Recorder 提供特权变体；privileged 权限申请仍走 `privileged_ack` 显式确认。`build.sh` 从 `module/` 源码生成两种脚本，只替换 Recorder 落点与生成的 `privapp-permissions` XML，并验证变体脚本差异行仅含 `priv-app` / `privapp-permissions`。为满足 `.github/workflows/ci.yml`，`module/` 下任何文件不得出现字面 `priv-app`；`module-priv/` 仅保留 module.prop 模板。普通版 `/system/app` 不因此获得特权权限。 | `preflight-apk.sh`、`build.sh`、`module/customize.sh` |
 | C4 | 严禁纳入拨号 / 短信 / 联系人(`sharedUserId="android.uid.shared"` + platform 签名,第三方签名无法替换) | `apps.yaml` 字段校验 + CI 检查 |
 | C5 | 仓库不得提交任何 `.apk` | `.gitignore`、`tests/test_build.sh` |
 | C6 | 记录 APK 签名证书 SHA-256;证书与 `apps.yaml` 不一致时 CI fail 并提示卸载重装会丢数据 | `preflight-apk.sh`、`release.yml` |
@@ -54,16 +55,52 @@
 (v0.0.2 之前的录音机即如此;v0.0.3 起五个条目全部启用,当前没有条目用到这条宽松)。
 需要字面语义时用 `--strict`。
 
-### v0.0.6 stock 应用策略(覆盖旧规则)
+### v0.0.8 stock、Clock merge 与 runtime grants
 
-用户反馈安装 GKUI 后 stock 应用图标仍然可见,因此旧的"模块不得禁用 stock,只在 README
-提供手动命令"规则作废。模块现默认在开机后用 `pm disable-user --user 0` 停用仍启用的
-同类 stock 包;通过 `stock-disabled.list` 仅追踪模块本次成功停用的包。安装时可按音量下
-生成 `keep-stock`,也可在模块目录创建/删除该标记后重启以保留或恢复默认行为;卸载时
-生成 `/data/adb/service.d/gkui-pack-restore-stock.sh`,在下次启动后执行 `pm enable` 并自删。
-这只改变 PackageManager 的 user 0 启用状态,stock APK 与分区目录不删除、不替换、不覆盖;
-用户自行停用但未被本模块记录的包不会被恢复。仍然禁止 `pm uninstall`、写 `/data/data`、
-Magisk `REPLACE` 变量和 `.replace` 文件。
+`build.sh` 从 `apps.yaml` 生成 `gkui-packages.list`、`stock-packages.list` 与
+`stock-gkui-map.list`，映射行格式为 `stock|gkui`；preflight 派生 `stock-merged.list` 与
+`merge_with_stock`。构建必须拒绝任一 `stock_package` 与任何 `application_id` 相同。
+
+Clock 根因只采用用户提供的事实：APK 声明
+`<original-package android:name="com.android.deskclock"/>`；stock 与 GKUI 名称的首个 `pm path`
+相同，均为 `/system/app/GKUIClock/GKUIClock.apk`，共享 PackageSetting；
+`/product/app/DeskClock` 被跳过为重复 APK。不要归因于子串匹配或 GKUI Clock 未安装。
+用户报告 v0.0.7 没有 `Renamed packages:` 段、没有 `MERGED` / `SELF-HEAL` / `ABSENT` 日志，且
+stock-toggle 日志与 v0.0.6 相同。仓库审计显示 v0.0.6/v0.0.7 都指向
+`1d34861b50436c29415628a06f1b7769ece2bb8a`，PR #6“feat: 自动停用 stock 同类应用（可逆）”
+未含 `<original-package>` 修复；查询列表中没有后续 PR。`transfer/diag-v0.0.7` 不可访问，
+不要宣称读过、合并或复制它。
+
+两种变体的 service 都先自愈 disabled GKUI 包与旧版 tracked merged stock，再执行正常切换。
+按每个 `stock|gkui` pair 比较首个 `pm path`：相同写 `MERGED`、rc 0 跳过且不跟踪；任一空值写
+`ABSENT`、rc 0 跳过；不同才检查 stock 状态。所有 `pm list packages -e/-d` 都读取完整输出，
+对完整 `package:<name>` 行做精确匹配，绝不传变量包名作为过滤参数；禁止停用 GKUI 包。
+`stock-toggle.log` 保留 timestamp/package/action/rc。`keep-stock`、boot flag 清除、后台诊断、成功项
+记录与 service.d 卸载恢复必须保留；卸载恢复排除 merged stock。
+
+闹钟数据由共享 PackageSetting 继承只是预期，不是已验证事实。其他四个应用的
+`<original-package>` 替换不在本轮实现。
+
+#### Runtime grants
+
+默认开启。`$MODDIR/no-auto-grant` 存在时跳过全部授权。Build 对每个通过 preflight 的 APK，按
+实际 `aapt dump badging` `uses-permission`、`device/framework-permissions.txt`、
+`scripts/appop-map.txt` 派生 `runtime-grants.list` (`pkg|perm|method`)：`dangerous` → `grant`；
+非 dangerous 且标记 `appop`、并有映射 → `appops`；其余不生成授权行。生成清单必须 fail-closed
+校验。`runtime_permissions_only` 与 `runtime_permissions_exclude` 是互斥的 per-app 过滤器，
+列表权限必须确实由 APK 请求。不要改动人类来源的 `apps.yaml` 字段，也不得编造 APK 权限数据。
+
+Prerequisite grants 必须排在 dependent 前。Service 使用 `pm grant` 或
+`appops set <package> <mapped-op> allow`，逐项记录 timestamp/package/permission/method/rc/stderr
+首行；失败后继续。仅当某包所有行成功后写 `granted/<pkg>.<versionCode>`；成功后不重复，撤销后重启
+也不自动重授，APK versionCode 变化产生一次新尝试。权限、package 名不能硬编码在 `service.sh`。
+
+构建报告、ZIP 要列出实际生成的权限；实际五个 APK 的 grant 清单只能从此次构建产物读取，不能猜测。
+`device/framework-permissions.txt` 只在头部补充提供的 AndVM 元数据，`--- [5]` 后权限正文必须
+逐字节不变。
+
+本轮验证范围：已在虚拟机环境（AndVM，Pixel 5 / OnePlus7TPro 配置）验证。真实设备、KernelSU/APatch、
+A/B、OTA、真实设备 `pm grant` / AppOps、`/product/app/DeskClock` 卸载恢复、闹钟数据继承均未验证。
 
 ## 3. 目录地图
 
@@ -75,7 +112,10 @@ scripts/install_all.sh        【主推】adb 免 root 批量安装
 scripts/uninstall_all.sh      adb 卸载(逐个确认)
 scripts/probe-device.sh       只读采集设备事实(用于回填 apps.yaml 的 TODO)
 scripts/preflight-apk.sh      七项门禁(APK 侧;可校验单个 APK 或整个 APK_DIR)
-module/                       systemless 模块源码(构建时被渲染进 zip)
+module/                       唯一模块脚本源码;源码不得出现字面 priv-app
+module-priv/                   仅特权变体 module.prop 模板;不维护重复脚本
+scripts/appop-map.txt          permission 到 AppOps 映射
+scripts/runtime-permission-dependencies.txt  runtime grant 前置依赖顺序
 tests/test_build.sh           离线全流程测试:桩 aapt/apksigner + 假 APK
 .github/workflows/ci.yml      push/PR:shellcheck + yamllint + 离线测试
 .github/workflows/release.yml tag v*:下载 APK → 校验 → preflight → 构建 zip
@@ -114,15 +154,12 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 - **不要读解包 manifest 的 `package` 属性当 applicationId**。
   Etar 系那里是 AOSP 历史残留 `com.android.calendar`,会误导。
   必须用 `aapt dump badging` 的 `package: name=`(已编译进 APK 的真值)。
-- **不要把带后缀的新包名放进 `priv-app`**。
-  它不在 ROM 自带的 `privapp-permissions` 白名单里,
-  一旦申请 `signature|privileged` 权限就会让 zygote 抛
-  `Signature|privileged permissions not in privapp-permissions whitelist` → bootloop。
-  检出此情况**不要生成白名单 XML**:缺省**不入模块**并提示仅走 adb 安装;只有条目显式写
-  `privileged_ack: true` 才以**普通系统应用**纳入,且必须逐条标注"这些权限不会被授予"
-  (`/system/app` 只是"系统应用"标记,**不会授予** `CAPTURE_AUDIO_OUTPUT` 之类的特权权限)。
-  不要为了让某个应用"功能完整"而放宽这条 —— 需要特权的功能属于 priv 变体(`recorder-priv`
-  分支)/ ROM 侧集成,超出本模块范围。
+- **任意应用不得随意进入 `priv-app` 或生成白名单 XML**。
+  带后缀的新包名不在 ROM 的特权白名单里，未经完整权限表验证就可能导致 PackageManager/zygote
+  异常。通用 C3 处理仍是：未写 `privileged_ack` → 排除；写 `privileged_ack: true` → 普通版纳入
+  `system/app` 并逐项标注权限不会被授予。唯一的 Recorder 特权变体由 `build.sh` 从 `module/`
+  源码生成，并按对应 `device/framework-permissions.txt` 生成 `privapp-permissions` XML；构建
+  校验脚本差异只包含 Recorder 落点与 XML。除该特定路径外，不扩展 privileged 例外。
 - **解析 `aapt dump badging` 必须按字段名整体匹配,绝不能做子串匹配**。
   真实输出形如:
 
@@ -141,19 +178,17 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
   不适合模块化;**声明**只报告(用 `describe_protection_level` 解码)。
 - **xmltree 里同一条 authority 会出现两次**(类型化值 + `(Raw: ...)` 原值),
   报告输出前必须去重,否则每条都打印两遍。
-- **G7 不能写成"模块内 versionCode 必须严格大于设备已装版本"**。
-  2026-10-08 真机实测:三个已安装应用与模块内 APK 的 versionCode **恰好相同**
-  (51/1/1),旧规则会让构建永远无法通过 —— 而它想防的"压制"其实由 C8 在刷入时
-  强制拦截(检出 /data 副本即中止)。现行语义:小于 → 失败(回退);
-  相等 → 通过并提示(先卸载 /data 副本);`installed_version_code: none`
-  (实测设备无副本)→ 通过;设备上有副本但 APK 未声明 versionCode → 失败。
-- **`installed_version_code` 的合法值是"整数 或 none"**,`none` 表示"实测设备上没有
-  该包名的副本"(是测量结果,不是未知)。
-- **APK 未声明 versionCode ≠ 未知**:Android 平台按 0 处理,设备上那一份的实测值也确实是 0
-  (clock 已验证)。所以 G7 用"有效 versionCode = 0"照常比较,不要再写"未知就拦"的特例;
-  `build.sh` 对该情形记为 `0(未声明)` 并放行(preflight 已负责比较)。
-- **判断"设备上是否安装"要用 `pm list packages`,不要用 dumpsys 是否取到 versionCode**:
-  adb 偶发返回空,会被误读成"未安装"(clock 上真实踩过,一度把 IVC 记成 none)。
+- **G7 不能写成"模块内 versionCode 必须严格大于已安装版本"**。
+  现行语义为：小于 → 失败；相等 → 通过并提示先按 C8 处理 `/data` 副本；
+  `installed_version_code: none` → 仅在明确检查无该包时通过。README/apps.yaml 中已有的数字
+  只代表 AndVM 虚拟机配置，不得称为真实设备测量。
+- **`installed_version_code` 的合法值是整数或 `none`**；`none` 表示采集时明确检查无该包，
+  不是未知或 adb 空输出。
+- **APK 未声明 versionCode ≠ 未知**：Android 平台按 0 处理，`build.sh` 将有效值记作
+  `0(未声明)` 并由 preflight 与记录值比较；不据此推断真实设备安装行为。
+- **Clock 根因只使用已明确提供的事实**：`<original-package>`、相同首个 `pm path`、共享
+  PackageSetting 与 `/product/app/DeskClock` duplicate skip。不要添加 UID、额外日志或数据迁移
+  断言；数据继承只能写作预期。
 
 - **门禁断言不要绑死在某个具体字段上**。曾有验收写成"recorder 的 `application_id`
   必须以 `TODO` 开头",结果每回填一个实测值都要求同步改 CI 工作流 —— 而工作流只有
@@ -164,9 +199,11 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 - **versionName ≠ versionCode**。用户说"版本号是 1.1"时,1.1 只可能是 versionName;
   versionCode 是整数(该例实测为 1)。`apps.yaml` 的 `installed_version_code`
   只登记整数,永远不要把小数值当 versionCode 写进去。
-- **`pm list packages <关键词>` 是子串过滤,不是精确匹配**:用 `Contains()` 判定
-  "是否存在"时,理论上可能被相似包名误命中(录音机这次同时拿到了 `versionCode=1`,
-  误命中概率极低)。要更严格可再用 `pm path <完整包名>` 复核一次。
+- **`pm list packages <关键词>` 是子串过滤,不是精确匹配**:禁止把包名变量作为过滤参数;
+  读取完整 `pm list packages -e/-d` 输出后必须用 `grep -Fx 'package:<完整包名>'`。
+  这项通用精确匹配要求保留,但不能拿来解释本次 clock 故障:stock-toggle 仅有一次
+  对 `com.android.deskclock` 的精确 disable 命令;实际根因是 `<original-package>` rename
+  令 stock / GKUI 名称共享 PackageSetting 与 APK 路径。
 
 - **`set -o pipefail` + `grep -q` = 假失败**:`grep -q` 一命中就退出并关闭管道,
   上游还在写(如 `git log`)就会吃到 SIGPIPE,管道整体返回 **141** —— 于是"找到了"
@@ -179,14 +216,18 @@ apps.yaml**,不要在别处再写一个 YAML 解析器(那会变成两套事实�
 
 `apps.yaml` 中已经填好的值**只能**来自可复核的来源,并且必须在 PR / 提交信息里说明出处:
 
-* 包名 / `stock_package`:设备实测(事实基线)或 `probe-device.sh` 的输出;
+* 包名 / `stock_package`:在本仓库允许的验证范围内由 AndVM 虚拟机配置或 `probe-device.sh` 输出支持；未确认值必须为 TODO;
 * `release_tag` / `asset_name` / `sha256`:对应仓库的 Release 元数据
   (`gh api repos/<owner>/<repo>/releases`;`sha256` 取自 asset 的 `digest` 字段);
 * `source_url`(GPL 必需):Release tag 经 API 解析出的 commit 链接;
-* `signer_sha256` / `installed_version_code`:**TODO**,必须由真实 APK 与真实设备采集
-  (`--collect-only` / `probe-device.sh`),**任何人都不许手写**。
+* `signer_sha256`:实际 APK 的 `apksigner` 输出；`installed_version_code`:明确采集的目标环境数据。
+  不手写、不猜测；任何已验证表述均须限定为 AndVM 虚拟机配置，不能声称真实设备验证。
 
-## 8. 提交前自检
+## 8. 发布 / PR 与提交前自检
+
+PR 描述必须从最终构建 ZIP 的 `runtime-grants.list` 原样列出五个应用的权限与 method，不能手填或从 APK 源码猜；若实际 ZIP 尚未构建/访问，明确阻塞并索取产物。PR 同时列明未验证项：真实设备行为、KernelSU/APatch、A/B、OTA、卸载后 `/product/app/DeskClock` 恢复、闹钟数据继承、真实设备 `pm grant` 与 AppOps。
+
+`docs/TESTER.md` 不超过 15 行、没有命令，并包含“时钟只会有一个，这是正常的。”及“刷后等一分钟/不会出现权限弹窗”的提醒。
 
 ```bash
 git ls-files | grep -c '\.apk$'                      # 必须为 0

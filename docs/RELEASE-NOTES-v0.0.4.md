@@ -4,7 +4,7 @@
 > - **`-recorderpriv-TEST.zip` 为测试专用特权变体，`白名单来源：源码推导，未经设备验证`。**
 > - 其内置的 `privapp-permissions-org.lineageos.recorder.dev.xml` 由 `LineageOS/android_frameworks_base`（`lineage-23.2` 分支，commit `f4ed08a03b518772ba77c3c0a1b4185fa1712c9b`）的 `core/res/AndroidManifest.xml` 静态推导生成，**尚未经目标设备 `pm list permissions -f` 实测校验**。
 > - 若目标 ROM 对特权权限的 `protectionLevel` 定义与上游源码不一致，Android `PackageManager` 可能会在启动时拒绝开机（本模块内置 `post-fs-data.sh` / `service.sh` 启动标记自救，若卡开机强制重启一次会自动禁用模块恢复）。
-> - 收集到测试设备发回的 `GKUI-diag.txt`（内含完整 `pm list permissions -f`）并放入仓库 `device/framework-permissions.txt` 后，后续版本将切回设备实测严格门禁并移除 `-TEST` 标记。
+> - 从 AndVM 虚拟机环境取得 `GKUI-diag.txt`（内含 `pm list permissions -f`）并生成仓库 `device/framework-permissions.txt` 后，后续版本可切换到快照输入的严格门禁并移除 `-TEST` 标记；这不代表真实设备行为已经验证。
 
 ---
 
@@ -15,7 +15,7 @@
 | 安装包文件名 | 录音机安装位置 | `privapp` 权限白名单 | 通话录音 | 适用对象 |
 |---|---|---|---|---|
 | **`GKUI-Pack-v0.0.4.zip`（普通版，默认推荐）** | `/system/app/GKUIRecorder` | 不含任何白名单 XML | 不生效 | 日常稳定使用日历、图库、计算器、时钟、普通录音的用户 |
-| **`GKUI-Pack-v0.0.4-recorderpriv-TEST.zip`（TEST 特权版）** | `/system/priv-app/GKUIRecorder` | 含 `CAPTURE_AUDIO_OUTPUT` 白名单（源码推导，未经设备验证） | 待真机验证 | 愿意协助测试录音机特权挂载与通话录音、并把 `GKUI-diag.txt` 发回的测试者 |
+| **`GKUI-Pack-v0.0.4-recorderpriv-TEST.zip`（TEST 特权版）** | `/system/priv-app/GKUIRecorder` | 含 `CAPTURE_AUDIO_OUTPUT` 白名单（源码推导，未经设备验证） | 真实设备上未验证 | 愿意协助测试录音机特权挂载与通话录音、并把 `GKUI-diag.txt` 发回的测试者 |
 
 > **提示（关于管理器内“更新”）**：两个包的模块 `id` 均为 `gkui-pack`，且 `update.json` 的更新地址指向普通版。**刷了 TEST 版的测试者如果之后在 Magisk / KernelSU / APatch 管理器里点“更新”，会被切回普通版**（如需继续使用特权版，请手动下载对应特权包刷入）。
 

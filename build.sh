@@ -38,14 +38,15 @@
 #
 # 设计要点(勿改,改了会破坏硬约束):
 #   C1/C7  未知值必须是 TODO,并且在构建时**失败**,绝不降级为 warning。
-#   C2     mode 只允许 coexist;绝不写 stock 应用目录或替换 stock APK;模块服务阶段仅通过
-#          pm disable-user / pm enable 可逆管理 stock 包的用户 0 启用状态。
-#   C3     只装 system/app(绝不进 priv-app、绝不生成任何白名单 XML)。
-#          检出 privileged 权限申请的条目默认**被排除出模块**(fail-safe);
+#   C2     mode 只允许 coexist;绝不写 stock 应用目录或替换 stock APK;原始包名映射导致
+#          PackageManager 合并的 stock 名称必须跳过停用;其余只通过 pm disable-user / pm enable 可逆切换。
+#   C3     普通版只装 system/app;普通 APK 不进入特权目录或生成白名单 XML。
+#          检出 privileged 权限申请的条目默认**被排除出普通版**(fail-safe);
 #          只有条目**显式写明** privileged_ack: true 时,才允许以 install_as: system_app
 #          纳入 /system/app —— 这些权限在 /system/app 下**不会被授予**,依赖它们的
 #          功能不会生效,因此报告 / 清单 / 构建摘要必须逐条标注申请了哪些特权权限
 #          (可选字段 privileged_note 用来写明具体后果,如"通话录音不会生效")。
+#          唯一例外是构建后单独生成的 Recorder 特权变体。
 #   C5     构建产物只进 dist/(已被 .gitignore 忽略),仓库内不落任何 APK。
 #   C8     与 /data 同包名的冲突检查由 module/customize.sh 在安装期执行。
 # =============================================================================
@@ -109,9 +110,13 @@ FIELDS = [
 #                    (system/app)纳入模块;缺省 / false 一律保持原有排除行为(fail-safe)。
 #   privileged_note  仅与 privileged_ack: true 搭配:写明这些权限拿不到的具体后果
 #                    (如"通话录音不会生效,需 priv 变体"),原样进入报告 / 清单 / 摘要。
+#   runtime_permissions_only / runtime_permissions_exclude 可选的、互斥的运行时权限过滤器。
+#     最终列表始终以 APK aapt badging 的 uses-permission 与设备权限表为准。
 OPTIONAL_FIELDS = [
     "privileged_ack",
     "privileged_note",
+    "runtime_permissions_only",
+    "runtime_permissions_exclude",
     "previous_release_tag",
     "previous_asset_name",
     "previous_sha256",
@@ -390,7 +395,7 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
         mode = entry.get("mode")
         if mode not in ALLOWED_MODE:
             errors.append(
-                "%s: mode=%r 非法;只允许 coexist(C2:GKUI 包名带后缀,与 stock 不构成替换关系)" % (eid, mode)
+                "%s: mode=%r 非法;只允许 coexist(C2:模块不覆盖 stock APK,PackageManager rename/merge 由运行期映射保护)" % (eid, mode)
             )
         install_as = entry.get("install_as")
         if install_as not in ALLOWED_INSTALL_AS:
@@ -413,7 +418,33 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
             elif is_todo(val):
                 problems.append("%s 为 TODO(需实测/实算后填入)" % key)
 
+        runtime_filter_fields = (
+            "runtime_permissions_only",
+            "runtime_permissions_exclude",
+        )
+        if all(key in entry["_present_fields"] for key in runtime_filter_fields):
+            errors.append(
+                "%s: runtime_permissions_only 与 runtime_permissions_exclude 互斥,不可同时设置" % eid
+            )
         for key in OPTIONAL_FIELDS:
+            if key in runtime_filter_fields:
+                runtime_permissions = entry.get(key)
+                if key in entry["_present_fields"] and not isinstance(runtime_permissions, list):
+                    errors.append("%s: %s 必须是权限名字符串列表" % (eid, key))
+                elif isinstance(runtime_permissions, list):
+                    seen_runtime_permissions = set()
+                    for permission in runtime_permissions:
+                        if not isinstance(permission, str) or not RE_PKG.fullmatch(permission):
+                            errors.append(
+                                "%s: %s 含非法权限名 %r" % (eid, key, permission)
+                            )
+                        elif permission in seen_runtime_permissions:
+                            errors.append(
+                                "%s: %s 重复声明 %s" % (eid, key, permission)
+                            )
+                        else:
+                            seen_runtime_permissions.add(permission)
+                continue
             if is_todo(entry.get(key)):
                 problems.append("%s 为 TODO(需实测/实算后填入)" % key)
 
@@ -491,27 +522,42 @@ def validate(schema_version, entries, strict=False, allow_todo=False):
 
         notes and warnings.extend(notes)
     # --- 重复检查 ---
-    seen_ids, seen_names, seen_stock = {}, {}, {}
+    seen_ids, seen_names, seen_stock, seen_application_ids = {}, {}, {}, {}
+    all_stock_packages, all_application_ids = {}, {}
     for entry in entries:
         eid = entry.get("id")
         if isinstance(eid, str) and not is_todo(eid):
             if eid in seen_ids:
                 errors.append("id 重复: %s" % eid)
             seen_ids[eid] = True
+        application_id = entry.get("application_id")
+        stock = entry.get("stock_package")
+        if isinstance(application_id, str) and not is_todo(application_id):
+            all_application_ids[application_id] = True
+        if isinstance(stock, str) and stock not in ("", "-") and not is_todo(stock):
+            all_stock_packages[stock] = True
         if not entry["_enabled"]:
             continue
+        if isinstance(application_id, str) and not is_todo(application_id):
+            if application_id in seen_application_ids:
+                errors.append("两个 enabled 条目共享同一个 application_id(%s)" % application_id)
+            seen_application_ids[application_id] = True
         name = entry.get("name")
         if isinstance(name, str) and not is_todo(name):
             if name.lower() in seen_names:
                 errors.append("enabled 条目的 name 重复: %s(模块内目录会冲突)" % name)
             seen_names[name.lower()] = True
-        stock = entry.get("stock_package")
         if isinstance(stock, str) and stock not in ("", "-") and not is_todo(stock):
             if stock in seen_stock:
                 errors.append(
                     "两个 enabled 条目共享同一个 stock_package(%s):同类应用重复入包" % stock
                 )
             seen_stock[stock] = True
+    for stock in all_stock_packages:
+        if stock in all_application_ids:
+            errors.append(
+                "stock_package %s 与任意 application_id 冲突;拒绝生成可能误停 GKUI 应用的包清单" % stock
+            )
     if not any(e["_enabled"] for e in entries):
         errors.append("没有任何 enabled: true 的条目,模块无内容")
     return errors, warnings, skipped
@@ -687,6 +733,29 @@ if isinstance(val, list):
 ' "$1" "$2" "$3"
 }
 
+set_preflight_metadata() { # $1=preflight JSON
+  PREFLIGHT_MERGED="$(json_get "$1" merge_with_stock)"
+  [ -n "$PREFLIGHT_MERGED" ] || PREFLIGHT_MERGED=false
+  PREFLIGHT_ORIGINALS="$(json_join "$1" original_packages ',')"
+  PREFLIGHT_SHARED_UID="$(json_get "$1" shared_user_id)"
+  PREFLIGHT_AUTHORITIES="$(json_join "$1" authorities ',')"
+  PREFLIGHT_REQUESTED="$(json_join "$1" requested_permissions ',')"
+  PREFLIGHT_DECLARED="$(json_join "$1" declared_permissions ',')"
+  PREFLIGHT_DECLARED_LEVELS="$(json_join "$1" declared_permission_protection_levels ',')"
+  [ -n "$PREFLIGHT_ORIGINALS" ] || PREFLIGHT_ORIGINALS='-'
+  [ -n "$PREFLIGHT_SHARED_UID" ] || PREFLIGHT_SHARED_UID='-'
+  [ -n "$PREFLIGHT_AUTHORITIES" ] || PREFLIGHT_AUTHORITIES='-'
+  [ -n "$PREFLIGHT_REQUESTED" ] || PREFLIGHT_REQUESTED='-'
+  [ -n "$PREFLIGHT_DECLARED" ] || PREFLIGHT_DECLARED='-'
+  [ -n "$PREFLIGHT_DECLARED_LEVELS" ] || PREFLIGHT_DECLARED_LEVELS='-'
+}
+
+record_merged_stock() { # $1=stock package
+  [ "$PREFLIGHT_MERGED" = true ] || return 0
+  [ -n "$1" ] && [ "$1" != "-" ] || return 0
+  grep -Fqx "$1" "$WORK/stock-merged.list" 2>/dev/null || printf '%s\n' "$1" >> "$WORK/stock-merged.list"
+}
+
 # C3 显式确认制的标注文案(报告 / 清单 / 构建摘要三处共用,保证措辞一致)
 privileged_annotation() { # $1=以 / 连接的特权权限列表 $2=privileged_note(可空)
   local text="该 APK 申请特权权限 $1;以普通系统应用(/system/app)纳入,这些权限不会被授予"
@@ -713,6 +782,50 @@ with open(path, "w", encoding="utf-8") as fh:
 PYEOF
 }
 
+render_module_scripts() { # $1=stage directory $2=Recorder system subdirectory $3=privapp XML enabled
+  render_placeholder "$1/customize.sh" '__RECORDER_SUBDIR__' "$2"
+  render_placeholder "$1/customize.sh" '__PRIVAPP_XML_ENABLED__' "$3"
+  render_placeholder "$1/service.sh" '__RECORDER_SUBDIR__' "$2"
+}
+
+assert_recorder_variant_diff() { # $1=base script $2=generated variant script
+  _variant_diff="$(diff -u "$1" "$2" || true)"
+  _variant_changed=0
+  while IFS= read -r _variant_line; do
+    case "$_variant_line" in
+      +++*|---*|@@*) continue ;;
+      +*|-*)
+        _variant_changed=$((_variant_changed + 1))
+        case "$_variant_line" in
+          *priv-app*|*privapp-permissions*) : ;;
+          *) die "生成的 Recorder 变体含非落点/XML 差异($1): $_variant_line" ;;
+        esac
+        ;;
+    esac
+  done <<EOF
+$_variant_diff
+EOF
+  [ "$_variant_changed" -gt 0 ] || die "Recorder 变体脚本没有预期的落点/XML 差异: $1"
+}
+
+verify_stage_lists() { # $1=staging directory
+  for _list in gkui-packages.list stock-packages.list stock-gkui-map.list runtime-grants.list stock-merged.list; do
+    [ -f "$1/$_list" ] || die "模块暂存目录缺少必需清单 $_list: $1"
+  done
+  [ -f "$1/appop-map.txt" ] || die "模块暂存目录缺少运行时 AppOps 映射 appop-map.txt: $1"
+}
+
+verify_zip_lists() { # $1=zip path; require package maps, grants and merged marker list
+  [ -f "$1" ] || die "模块 zip 不存在: $1"
+  _zip_entries="$(unzip -Z1 "$1" 2>/dev/null)" || die "无法读取模块 zip 清单: $1"
+  for _list in gkui-packages.list stock-packages.list stock-gkui-map.list runtime-grants.list stock-merged.list; do
+    printf '%s\n' "$_zip_entries" | grep -Fqx "$_list" \
+      || die "模块 zip 缺少必需清单 $_list: $1"
+  done
+  printf '%s\n' "$_zip_entries" | grep -Fqx 'appop-map.txt' \
+    || die "模块 zip 缺少 runtime AppOps 映射 appop-map.txt: $1"
+}
+
 # 从 apps.yaml 条目中取单个字段(dump JSON → 取值)
 entry_field() { # $1=app-id $2=字段名
   apps_python --dump-apps-json | python3 -c '
@@ -726,30 +839,131 @@ for app in data["apps"]:
 ' "$1" "$2"
 }
 
-# 从规范化 apps.yaml JSON 生成模块根目录的 stock 包清单(只收 enabled 条目)。
-# 包名为空或 '-' 表示该 GKUI 应用没有对应 stock 包;保序去重,不将其写入产物。
-build_stock_packages_list() { # $1=输出文件
+# 从 apps.yaml 规范化 JSON 生成包映射清单。运行时权限清单在所有 APK
+# preflight 完成后,依据实际 uses-permission 与 device/framework-permissions.txt 生成。
+build_module_package_lists() { # $1=输出目录
   apps_python --dump-apps-json | python3 -c '
-import json, sys
-out_path = sys.argv[1]
+import json, os, sys
+out_dir = sys.argv[1]
+os.makedirs(out_dir, exist_ok=True)
 data = json.load(sys.stdin)
-packages = []
-seen = set()
+gkui, stock, pairs = [], [], []
+seen_gkui, seen_stock, seen_pairs = set(), set(), set()
 for app in data["apps"]:
     if app.get("enabled") is not True:
         continue
-    package = app.get("stock_package")
-    if package in (None, "", "-"):
-        continue
-    if not isinstance(package, str):
-        raise SystemExit("enabled 条目的 stock_package 必须是包名、空值或 '-' ")
-    if package not in seen:
-        seen.add(package)
-        packages.append(package)
-with open(out_path, "w", encoding="utf-8") as fh:
-    if packages:
-        fh.write("\n".join(packages) + "\n")
+    package = app.get("application_id")
+    if not isinstance(package, str) or not package:
+        raise SystemExit("enabled 条目的 application_id 必须是包名")
+    if package not in seen_gkui:
+        seen_gkui.add(package)
+        gkui.append(package)
+    stock_package = app.get("stock_package")
+    if stock_package not in (None, "", "-"):
+        if not isinstance(stock_package, str):
+            raise SystemExit("enabled 条目的 stock_package 必须是包名、空值或 '-' ")
+        if stock_package not in seen_stock:
+            seen_stock.add(stock_package)
+            stock.append(stock_package)
+        pair = stock_package + "|" + package
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            pairs.append(pair)
+for name, rows in (("gkui-packages.list", gkui),
+                   ("stock-packages.list", stock),
+                   ("stock-gkui-map.list", pairs),
+                   ("runtime-grants.list", [])):
+    with open(os.path.join(out_dir, name), "w", encoding="utf-8") as fh:
+        if rows:
+            fh.write("\n".join(rows) + "\n")
 ' "$1"
+}
+
+# Build-time second check for every emitted runtime grant. Anything not provably
+# dangerous or explicitly mapped as appop fails closed before a zip is written.
+validate_runtime_grants() { # $1=runtime-grants.list $2=device permission dump $3=appop map
+  python3 - "$1" "$2" "$3" <<'PYRUNTIME'
+import re, sys
+from pathlib import Path
+list_path, dump_path, map_path = map(Path, sys.argv[1:4])
+re_pkg = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
+re_appop = re.compile(r"^[A-Z][A-Z0-9_]*$")
+levels, current = {}, None
+if dump_path.is_file():
+    for line in dump_path.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^\s*[+*]?\s*permission\s*:\s*([A-Za-z][A-Za-z0-9_.]+)\s*$", line, re.I)
+        if match:
+            current = match.group(1)
+            continue
+        if current is not None:
+            match = re.match(r"^\s*protectionLevel\s*:\s*(.*?)\s*$", line, re.I)
+            if match:
+                level = match.group(1).strip("\"'").lower().replace(" ", "")
+                if current in levels and levels[current] != level:
+                    raise SystemExit("framework permission level 冲突: %s" % current)
+                levels[current] = level
+                current = None
+appops = {}
+if map_path.is_file():
+    for number, raw in enumerate(map_path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("|")
+        if len(fields) != 2 or not all(fields):
+            raise SystemExit("%s:%d: appop-map 格式必须为 permission|appop" % (map_path, number))
+        permission, op = fields
+        if not re_pkg.fullmatch(permission) or not re_appop.fullmatch(op):
+            raise SystemExit("%s:%d: 非法 permission/appop 名称" % (map_path, number))
+        if permission in appops:
+            raise SystemExit("%s:%d: 重复 appop 映射 %s" % (map_path, number, permission))
+        appops[permission] = op
+errors, seen = [], set()
+if not list_path.is_file():
+    raise SystemExit("缺少 runtime-grants.list")
+for number, raw in enumerate(list_path.read_text(encoding="utf-8").splitlines(), 1):
+    if not raw or raw.startswith("#"):
+        continue
+    fields = raw.split("|")
+    if len(fields) != 3 or not all(fields):
+        errors.append("%s:%d: 格式必须为 package|permission|method" % (list_path, number))
+        continue
+    package, permission, method = fields
+    if not re_pkg.fullmatch(package) or not re_pkg.fullmatch(permission):
+        errors.append("%s:%d: 非法 package/permission" % (list_path, number))
+    key = (package, permission)
+    if key in seen:
+        errors.append("%s:%d: 重复 grant %s|%s" % (list_path, number, package, permission))
+    seen.add(key)
+    level = levels.get(permission)
+    if level is None:
+        errors.append("%s:%d: %s 不在 device/framework-permissions.txt,无法证明 protectionLevel" % (list_path, number, permission))
+        continue
+    tokens = set(level.split("|"))
+    if method == "grant":
+        if "dangerous" not in tokens:
+            errors.append("%s:%d: method=grant 但 %s 的 protectionLevel=%s,仅 dangerous 可 pm grant" % (list_path, number, permission, level))
+    elif method == "appops":
+        if "dangerous" in tokens or "appop" not in tokens or permission not in appops:
+            errors.append("%s:%d: method=appops 对 %s 不受支持(protectionLevel=%s, mapping=%s)" % (list_path, number, permission, level, appops.get(permission, "missing")))
+    else:
+        errors.append("%s:%d: 不支持的 runtime grant method=%r" % (list_path, number, method))
+if errors:
+    raise SystemExit("runtime grant 校验失败(fail closed):\n  - " + "\n  - ".join(errors))
+PYRUNTIME
+}
+
+generate_runtime_grants() { # write runtime-grants.list after preflight has generated included.txt
+  apps_python --dump-apps-json > "$WORK/apps.json"
+  python3 "$ROOT/scripts/generate-runtime-grants.py" \
+    --apps-json "$WORK/apps.json" \
+    --included "$WORK/included.txt" \
+    --preflight-dir "$WORK" \
+    --framework-permissions "$ROOT/device/framework-permissions.txt" \
+    --appop-map "$ROOT/scripts/appop-map.txt" \
+    --dependencies "$ROOT/scripts/runtime-permission-dependencies.txt" \
+    --out "$WORK/runtime-grants.list" \
+    --report "$WORK/runtime-grants-report.txt"
 }
 
 # ---------------------------------------------------------------------------
@@ -838,11 +1052,11 @@ mkdir -p "$DIST_DIR" "$APK_DIR"
     # shellcheck disable=SC2016  # Markdown backticks are literal report content.
     printf '> - 风险说明: 仓库当前缺少目标设备实测 `device/framework-permissions.txt`（`pm list permissions -f`），特权包标记为 `GKUI-Pack-%s-recorderpriv-TEST.zip`。若目标 ROM 对特权权限的定义与源码不一致，启动阶段可能触发 `PackageManager` 异常（模块内置二次重启自动禁用自救）。\n\n' "$VERSION"
   elif [ -n "$PERM_DUMP" ]; then
-    printf '> **特权变体白名单来源：设备权限表（Pixel 5 / Android 16 实测严格门禁）**\n'
+    printf '> **特权变体白名单来源：AndVM 虚拟机权限快照；真机行为未验证。**\n'
     # shellcheck disable=SC2016  # Markdown backticks are literal report content.
-    printf '> - 来源文件: `device/framework-permissions.txt`（Pixel 5 / LineageOS / Android 16 / SDK 36 / build `BP4A.251205.006`，epoch 1793032493 由 v0.0.4 priv-TEST 模块 service.sh 诊断采集，原样保存）\n'
-    printf '> - 验证状态: 已在 Pixel 5 / Android 16 验证开机与 CAPTURE_AUDIO_OUTPUT 授予；通话录音功能本身尚未验证；白名单 enforce 校验状态待 v0.0.5 诊断确认（ro.control_privapp_permissions 未采集）。\n'
-    printf '> - 换设备或换 Android 大版本时必须重新采集权限表，不得跨设备复用。\n\n'
+    printf '> - 来源文件: `device/framework-permissions.txt`（ro.lineage.version=`23.2-20261005-NIGHTLY-redfin`; incremental=`45397edbf2`; ro.build.date.utc=`1791158517`; ro.control_privapp_permissions=`enforce`; permission records preserved unchanged）\n'
+    printf '> - 验证范围：已在虚拟机环境（AndVM，Pixel 5 / OnePlus7TPro 配置）验证；真机、KernelSU/APatch、A/B 与 OTA 尚未验证。\n'
+    printf '> - 换设备或换 Android 大版本时必须重新采集权限表，不得跨环境复用。\n\n'
   fi
   printf -- '- 生成者: scripts/preflight-apk.sh(由 build.sh 调用)\n'
   printf -- '- 生成时间(UTC): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -878,7 +1092,8 @@ for line in sys.stdin:
     cells = [cell if cell else "-" for cell in cells]
     sys.stdout.write("\t".join(cells) + "\n")
 ' > "$WORK/enabled.tsv"
-build_stock_packages_list "$WORK/stock-packages.list"
+build_module_package_lists "$WORK"
+: > "$WORK/stock-merged.list"
 : > "$WORK/included.txt"
 : > "$WORK/excluded.txt"
 
@@ -987,7 +1202,7 @@ PYC
       #   * 缺省(未写 privileged_ack 或为 false)→ 排除出模块,仅提示走 adb install(fail-safe);
       #   * 条目显式写明 privileged_ack: true → 以普通系统应用(system/app)纳入,
       #     但这些权限不会被授予:报告 / 清单 / 摘要必须逐条标注申请了哪些特权权限。
-      #   两种情况都**绝不**进 priv-app、**绝不**生成白名单 XML(根本没有这条代码路径)。
+      #   此处只处理普通版纳入/排除决策;Recorder 特权变体在稍后的独立路径生成。
       APP_ACK="$(entry_field "$APP_ID" privileged_ack)"
       priv_perms="$(json_join "$pf_json" privileged_permissions /)"
       [ -n "$priv_perms" ] || priv_perms="(门禁未列出具体权限)"
@@ -998,7 +1213,13 @@ PYC
       else
         warn "$APP_ID 检出 signature|privileged 权限申请($priv_perms),不适合模块化;已排除出本模块,仅可走 adb install"
         warn "    (若明知这些权限不会生效仍要以普通系统应用纳入,请在 apps.yaml 该条目显式写 privileged_ack: true)"
-        printf '%s|%s|%s|%s\n' "$APP_ID" "$APP_NAME" "$APP_PKG" "申请特权权限 $priv_perms" >> "$WORK/excluded.txt"
+        set_preflight_metadata "$pf_json"
+        record_merged_stock "$STOCK_PKG"
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+          "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "申请特权权限 $priv_perms" \
+          "$PREFLIGHT_MERGED" "$PREFLIGHT_ORIGINALS" "$PREFLIGHT_SHARED_UID" \
+          "$PREFLIGHT_AUTHORITIES" "$PREFLIGHT_REQUESTED" "$PREFLIGHT_DECLARED" \
+          "$PREFLIGHT_DECLARED_LEVELS" >> "$WORK/excluded.txt"
         rm -f "$staged"
         continue
       fi
@@ -1008,21 +1229,24 @@ PYC
   esac
 
   [ -f "$pf_json" ] || die "APK 门禁未产出结果文件: $pf_json(门禁脚本异常)"
+  set_preflight_metadata "$pf_json"
+  record_merged_stock "$STOCK_PKG"
   vc="$(json_get "$pf_json" version_code)"
   signer="$(json_get "$pf_json" signer_sha256)"
   if [ -z "$vc" ]; then
-    # 未声明 versionCode 的 APK(LineageOS 部分仓库如此):平台按 0 处理,且设备上
-    # 那一份的实测值也是 0(2026-10-08 真机证实)。到这里说明 preflight 的 G7 已经
-    # 用"有效 versionCode = 0"比较并通过(要么设备上无副本,要么两侧同为 0),
-    # 因此这里只做记录,不再拦截。
+    # 未声明 versionCode 的 APK:平台按 0 处理。G7 已用有效 versionCode=0 与
+    # apps.yaml 的 installed_version_code 完成比较(该记录仅代表 AndVM 虚拟机配置,
+    # 不推断真机行为),因此这里只做记录,不再拦截。
     vc="0(未声明)"
     warn "$APP_ID 的 APK 未声明 versionCode → 按平台语义记为 0(未声明)"
   fi
   [ -n "$signer" ] || die "APK 门禁结果缺少签名摘要: $pf_json"
-  # 第 9/10 列:特权权限列表("-" = 未申请)与 privileged_note(记录分隔符 | 不允许出现在文案里)
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  # 第 9/10 列为 C3 标注;后续列保存 preflight 的所有 manifest 元数据。
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$APP_ID" "$APP_NAME" "$APP_PKG" "$STOCK_PKG" "$vc" "$signer" "$staged_sha" "$APP_ASSET" \
     "$(printf '%s' "$priv_perms" | tr '|' '/')" "$(printf '%s' "$priv_note" | tr '|' '/')" \
+    "$PREFLIGHT_MERGED" "$PREFLIGHT_ORIGINALS" "$PREFLIGHT_SHARED_UID" \
+    "$PREFLIGHT_AUTHORITIES" "$PREFLIGHT_REQUESTED" "$PREFLIGHT_DECLARED" "$PREFLIGHT_DECLARED_LEVELS" \
     >> "$WORK/included.txt"
 done < "$WORK/enabled.tsv"
 
@@ -1053,7 +1277,7 @@ PYEOF
   printf '%s重要:%s本模式**不产出任何模块 zip**,且退出码为 1(C7:apps.yaml 仍有 TODO 时不许假装构建成功)。\n' "$C_YEL" "$C_RST"
   printf '请把上面的值填入 apps.yaml(并删除对应的 TODO 注释),然后执行:\n'
   printf '    bash build.sh --check\n'
-  if [ -f "$WORK/preflight-recorder.json" ] && [ -n "$PERM_DUMP" ] && [ -d "$ROOT/module-priv" ]; then
+  if [ -f "$WORK/preflight-recorder.json" ] && [ -n "$PERM_DUMP" ] && [ -f "$ROOT/module-priv/module.prop" ]; then
     PRIV_XML_PREVIEW="$WORK/privapp-permissions-org.lineageos.recorder.dev.xml"
     if priv_preview_out="$(python3 "$ROOT/scripts/generate-privapp-permissions.py" \
       --dump "$PERM_DUMP" \
@@ -1070,9 +1294,13 @@ PYEOF
       mkdir -p "$P_STAGE/apks" "$P_STAGE_PRIV/apks" "$P_STAGE_PRIV/system/etc/permissions" "$P_ZIPS"
       cp -a "$ROOT/module/." "$P_STAGE/"
       cp -a "$ROOT/module/." "$P_STAGE_PRIV/"
-      cp -a "$ROOT/module-priv/." "$P_STAGE_PRIV/"
-      cp "$WORK/stock-packages.list" "$P_STAGE/stock-packages.list"
-      cp "$WORK/stock-packages.list" "$P_STAGE_PRIV/stock-packages.list"
+      cp "$ROOT/module-priv/module.prop" "$P_STAGE_PRIV/module.prop"
+      cp "$WORK/stock-packages.list" "$WORK/gkui-packages.list" \
+        "$WORK/stock-gkui-map.list" "$WORK/stock-merged.list" "$WORK/runtime-grants.list" "$P_STAGE/"
+      cp "$ROOT/scripts/appop-map.txt" "$P_STAGE/appop-map.txt"
+      cp "$WORK/stock-packages.list" "$WORK/gkui-packages.list" \
+        "$WORK/stock-gkui-map.list" "$WORK/stock-merged.list" "$WORK/runtime-grants.list" "$P_STAGE_PRIV/"
+      cp "$ROOT/scripts/appop-map.txt" "$P_STAGE_PRIV/appop-map.txt"
       cp "$PRIV_XML_PREVIEW" "$P_STAGE_PRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
       P_ENTRIES=""
       P_PREDS=""
@@ -1096,22 +1324,27 @@ PYEOF
       render_placeholder "$P_STAGE/customize.sh" '__APP_ENTRIES__' "$P_ENTRIES"
       render_placeholder "$P_STAGE/customize.sh" '__PREDECESSOR_ENTRIES__' "$P_PREDS"
       render_placeholder "$P_STAGE/service.sh"   '__VERSION__' "$VERSION"
-      render_placeholder "$P_STAGE/service.sh"   '__VARIANT__' "normal"
+      render_module_scripts "$P_STAGE" "app" "false"
       render_placeholder "$P_STAGE_PRIV/module.prop"  '__VERSION__' "$VERSION"
       render_placeholder "$P_STAGE_PRIV/module.prop"  '__VERSION_CODE__' "$VERSION_CODE"
       render_placeholder "$P_STAGE_PRIV/module.prop"  '__PRIV_NAME_SUFFIX__' "recorderpriv-TEST"
-      render_placeholder "$P_STAGE_PRIV/module.prop"  '__PRIV_SOURCE_NOTE__' "[TEST] 白名单来源：源码推导，未经设备验证"
+      render_placeholder "$P_STAGE_PRIV/module.prop"  '__PRIV_SOURCE_NOTE__' "[TEST] 白名单来源：源码推导；AndVM 与真机行为未验证"
       render_placeholder "$P_STAGE_PRIV/customize.sh" '__APP_ENTRIES__' "$P_ENTRIES"
       render_placeholder "$P_STAGE_PRIV/customize.sh" '__PREDECESSOR_ENTRIES__' "$P_PREDS"
-      render_placeholder "$P_STAGE_PRIV/customize.sh" '__PRIVAPP_PERMISSIONS_XML__' "$(cat "$PRIV_XML_PREVIEW")"
       render_placeholder "$P_STAGE_PRIV/service.sh"   '__VERSION__' "$VERSION"
-      render_placeholder "$P_STAGE_PRIV/service.sh"   '__VARIANT__' "priv-TEST"
+      render_module_scripts "$P_STAGE_PRIV" "priv-app" "true"
+      assert_recorder_variant_diff "$P_STAGE/customize.sh" "$P_STAGE_PRIV/customize.sh"
+      assert_recorder_variant_diff "$P_STAGE/service.sh" "$P_STAGE_PRIV/service.sh"
+      verify_stage_lists "$P_STAGE"
+      verify_stage_lists "$P_STAGE_PRIV"
       chmod 0755 "$P_STAGE"/*.sh "$P_STAGE/META-INF/com/google/android/update-binary"
       chmod 0755 "$P_STAGE_PRIV"/*.sh "$P_STAGE_PRIV/META-INF/com/google/android/update-binary"
       P_ZIP_NORM="$P_ZIPS/GKUI-Pack-$VERSION.zip"
       P_ZIP_TEST="$P_ZIPS/GKUI-Pack-$VERSION-recorderpriv-TEST.zip"
       ( cd "$P_STAGE" && zip -q -r9 "$P_ZIP_NORM" . )
       ( cd "$P_STAGE_PRIV" && zip -q -r9 "$P_ZIP_TEST" . )
+      verify_zip_lists "$P_ZIP_NORM"
+      verify_zip_lists "$P_ZIP_TEST"
       printf '\n=== [采集预览] 普通版 zip (unzip -l %s) ===\n' "$(basename "$P_ZIP_NORM")"
       unzip -l "$P_ZIP_NORM"
       printf '\n=== [采集预览] TEST 版 zip (unzip -l %s) ===\n' "$(basename "$P_ZIP_TEST")"
@@ -1147,6 +1380,18 @@ PYEOF
   exit 1
 fi
 
+generate_runtime_grants || die "runtime-grants.list 生成失败(fail closed)"
+validate_runtime_grants "$WORK/runtime-grants.list" "$ROOT/device/framework-permissions.txt" "$ROOT/scripts/appop-map.txt" \
+  || die "runtime-grants.list 中存在无法由设备权限表与 appop-map 证明的条目(fail closed)"
+{
+  printf '\n## Runtime grants (default-on; opt-out via $MODDIR/no-auto-grant)\n\n'
+  printf '从每个通过 preflight 的 APK `aapt dump badging` uses-permission 清单派生;只列入设备权限表标为 dangerous 的 pm grant,或已映射的非-dangerous appop。撤销后不会重复授予;更换 versionCode 会产生一个新 marker。\n\n'
+  printf '```text\n'
+  if [ -s "$WORK/runtime-grants.list" ]; then cat "$WORK/runtime-grants.list"; else printf '(empty)\n'; fi
+  printf '```\n\n'
+  cat "$WORK/runtime-grants-report.txt"
+} >> "$REPORT"
+
 included_count="$(grep -c . "$WORK/included.txt" || true)"
 excluded_count="$(grep -c . "$WORK/excluded.txt" || true)"
 [ "$included_count" -gt 0 ] || die "没有任何条目通过门禁,模块为空,已中止"
@@ -1155,11 +1400,14 @@ excluded_count="$(grep -c . "$WORK/excluded.txt" || true)"
 STAGE="$WORK/stage"
 mkdir -p "$STAGE/apks"
 cp -a "$ROOT/module/." "$STAGE/"
-cp "$WORK/stock-packages.list" "$STAGE/stock-packages.list"
+cp "$WORK/stock-packages.list" "$WORK/gkui-packages.list" \
+  "$WORK/stock-gkui-map.list" "$WORK/stock-merged.list" "$WORK/runtime-grants.list" "$STAGE/"
+cp "$ROOT/scripts/appop-map.txt" "$STAGE/appop-map.txt"
+verify_stage_lists "$STAGE"
 
 ENTRY_LINES=""
 PREDECESSOR_LINES=""
-while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET _PRIV _NOTE; do
+while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG _VC _SIGNER APK_SHA _ASSET _PRIV _NOTE _MERGED _ORIGINALS _SHARED_UID _AUTHORITIES _REQUESTED _DECLARED _DECLARED_LEVELS; do
   [ -n "$APP_ID" ] || continue
   cp "$WORK/apks/$APP_NAME.apk" "$STAGE/apks/$APP_NAME.apk"
   ENTRY_LINES="${ENTRY_LINES}${APP_PKG}|${APP_NAME}|${APK_SHA}"$'\n'
@@ -1179,7 +1427,7 @@ render_placeholder "$STAGE/module.prop"   '__VERSION_CODE__' "$VERSION_CODE"
 render_placeholder "$STAGE/customize.sh"  '__APP_ENTRIES__'  "$ENTRY_LINES"
 render_placeholder "$STAGE/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
 render_placeholder "$STAGE/service.sh"    '__VERSION__'      "$VERSION"
-render_placeholder "$STAGE/service.sh"    '__VARIANT__'      "normal"
+render_module_scripts "$STAGE" "app" "false"
 
 leftover="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$STAGE" || true)"
 if [ -n "$leftover" ]; then
@@ -1200,7 +1448,7 @@ if grep -q '^recorder|' "$WORK/included.txt" 2>/dev/null && [ -d "$ROOT/module-p
     --out "$PRIV_XML" 2>&1)" || die "recorder-priv 白名单生成失败:
 $priv_gen_out"
   if [ "$PERM_MODE" = device ]; then
-    info "recorder-priv 白名单来源：设备权限表（Pixel 5 / Android 16 实测，严格门禁）"
+    info "recorder-priv 白名单来源：AndVM 虚拟机权限快照；真机行为未验证"
   else
     info "recorder-priv 白名单来源：源码推导（未经设备验证，产物带 TEST 标记）"
   fi
@@ -1236,20 +1484,21 @@ $diff_out"
   STAGE_PRIV="$WORK/stage-priv"
   mkdir -p "$STAGE_PRIV/apks" "$STAGE_PRIV/system/etc/permissions"
   cp -a "$ROOT/module/." "$STAGE_PRIV/"
-  cp -a "$ROOT/module-priv/." "$STAGE_PRIV/"
-  cp "$WORK/stock-packages.list" "$STAGE_PRIV/stock-packages.list"
+  cp "$ROOT/module-priv/module.prop" "$STAGE_PRIV/module.prop"
+  cp "$WORK/stock-packages.list" "$WORK/gkui-packages.list" \
+    "$WORK/stock-gkui-map.list" "$WORK/stock-merged.list" "$WORK/runtime-grants.list" "$STAGE_PRIV/"
+  cp "$ROOT/scripts/appop-map.txt" "$STAGE_PRIV/appop-map.txt"
+  verify_stage_lists "$STAGE_PRIV"
   cp -a "$STAGE/apks/." "$STAGE_PRIV/apks/"
   cp "$PRIV_XML" "$STAGE_PRIV/system/etc/permissions/privapp-permissions-org.lineageos.recorder.dev.xml"
 
   if [ "$PRIV_IS_TEST" = 1 ]; then
     PRIV_NAME_SUFFIX="recorderpriv-TEST"
-    PRIV_VARIANT_ID="priv-TEST"
-    PRIV_SOURCE_NOTE="[TEST] 白名单来源：源码推导，未经设备验证"
+    PRIV_SOURCE_NOTE="[TEST] 白名单来源：源码推导；AndVM 与真机行为未验证"
     PRIV_ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION-recorderpriv-TEST.zip"
   else
     PRIV_NAME_SUFFIX="recorderpriv"
-    PRIV_VARIANT_ID="priv"
-    PRIV_SOURCE_NOTE="白名单来源：Pixel 5 / Android 16 设备权限表"
+    PRIV_SOURCE_NOTE="白名单来源：device/framework-permissions.txt（AndVM 虚拟机快照；真机未验证）"
     PRIV_ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION-recorderpriv.zip"
   fi
 
@@ -1259,9 +1508,10 @@ $diff_out"
   render_placeholder "$STAGE_PRIV/module.prop"   '__PRIV_SOURCE_NOTE__' "$PRIV_SOURCE_NOTE"
   render_placeholder "$STAGE_PRIV/customize.sh"  '__APP_ENTRIES__'      "$ENTRY_LINES"
   render_placeholder "$STAGE_PRIV/customize.sh"  '__PREDECESSOR_ENTRIES__' "$PREDECESSOR_LINES"
-  render_placeholder "$STAGE_PRIV/customize.sh"  '__PRIVAPP_PERMISSIONS_XML__' "$(cat "$PRIV_XML")"
   render_placeholder "$STAGE_PRIV/service.sh"    '__VERSION__'          "$VERSION"
-  render_placeholder "$STAGE_PRIV/service.sh"    '__VARIANT__'          "$PRIV_VARIANT_ID"
+  render_module_scripts "$STAGE_PRIV" "priv-app" "true"
+  assert_recorder_variant_diff "$STAGE/customize.sh" "$STAGE_PRIV/customize.sh"
+  assert_recorder_variant_diff "$STAGE/service.sh" "$STAGE_PRIV/service.sh"
 
   leftover_priv="$(grep -rn -I -E '__[A-Z][A-Z0-9_]+__' "$STAGE_PRIV" || true)"
   if [ -n "$leftover_priv" ]; then
@@ -1275,15 +1525,19 @@ fi
 ZIP_OUT="$DIST_DIR/GKUI-Pack-$VERSION.zip"
 UPDATE_JSON="$DIST_DIR/update.json"
 if [ "$NO_ZIP" = 1 ]; then
+  verify_stage_lists "$STAGE"
+  [ -z "$PRIV_ZIP_OUT" ] || verify_stage_lists "$STAGE_PRIV"
   info "--no-zip:已跳过打包,渲染结果在 $STAGE"
 else
   rm -f "$ZIP_OUT"
   ( cd "$STAGE" && zip -q -r9 "$ZIP_OUT" . )
+  verify_zip_lists "$ZIP_OUT"
   info "模块包(普通版): $ZIP_OUT ($(wc -c < "$ZIP_OUT" | tr -d ' ') 字节)"
   unzip -l "$ZIP_OUT"
   if [ -n "$PRIV_ZIP_OUT" ]; then
     rm -f "$PRIV_ZIP_OUT"
     ( cd "$STAGE_PRIV" && zip -q -r9 "$PRIV_ZIP_OUT" . )
+    verify_zip_lists "$PRIV_ZIP_OUT"
     info "模块包(特权版): $PRIV_ZIP_OUT ($(wc -c < "$PRIV_ZIP_OUT" | tr -d ' ') 字节)"
     unzip -l "$PRIV_ZIP_OUT"
   fi
@@ -1312,21 +1566,23 @@ MANIFEST="$DIST_DIR/build-manifest.txt"
   printf '# 产物: %s\n' "$ZIP_OUT"
   printf '#\n# 说明:asset_sha256 是 Release 资产文件的 sha256(即 apps.yaml 的 sha256);\n'
   printf '#       apk_sha256 是解包后实际写入 /system/app 的 APK 的 sha256。\n'
-  printf '#       note 列:"-" 表示未申请特权权限;否则为 C3 显式确认制(privileged_ack: true)的逐条标注 ——\n'
-  printf '#       该 APK 申请了哪些特权权限、以普通系统应用纳入后这些权限不会被授予、具体后果(privileged_note)。\n'
-  printf '#       本模块绝不进 priv-app、绝不生成白名单 XML;excluded 行的 note 列为排除原因。\n'
-  printf 'state\tapp_id\tapplication_id\tname\tasset_sha256\tapk_sha256\tversion_code\tsigner_sha256\tnote\n'
-  while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET PRIV NOTE; do
+  printf '#       merge_with_stock=true 表示 <original-package> 命中 stock_package;PackageManager 以改名/替换形式共享 PackageSetting。\n'
+  printf '#       requested_permissions 为 APK 全部 uses-permission;declared_permissions/protection_levels 是 APK 自声明的 <permission>。\n'
+  printf '#       录音机普通版在 system/app;recorderpriv 变体将其放入特权目录并附对应白名单 XML。\n'
+  printf 'state\tapp_id\tapplication_id\tstock_package\tname\tasset_sha256\tapk_sha256\tversion_code\tsigner_sha256\tmerge_with_stock\toriginal_packages\tshared_user_id\tprovider_authorities\trequested_permissions\tdeclared_permissions\tdeclared_permission_protection_levels\tnote\n'
+  while IFS='|' read -r APP_ID APP_NAME APP_PKG STOCK_PKG VC SIGNER APK_SHA _ASSET PRIV NOTE MERGED ORIGINALS SHARED_UID AUTHORITIES REQUESTED DECLARED DECLARED_LEVELS; do
     [ -n "$APP_ID" ] || continue
     note="-"
     [ "$PRIV" = "-" ] || note="$(privileged_annotation "$PRIV" "$NOTE")"
-    printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$APP_ID" "$APP_PKG" "$APP_NAME" "$(entry_field "$APP_ID" sha256)" "$APK_SHA" "$VC" "$SIGNER" "$note"
+    printf 'included\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$APP_ID" "$APP_PKG" "$STOCK_PKG" "$APP_NAME" "$(entry_field "$APP_ID" sha256)" "$APK_SHA" "$VC" "$SIGNER" \
+      "$MERGED" "$ORIGINALS" "$SHARED_UID" "$AUTHORITIES" "$REQUESTED" "$DECLARED" "$DECLARED_LEVELS" "$note"
   done < "$WORK/included.txt"
-  while IFS='|' read -r APP_ID APP_NAME APP_PKG REASON; do
+  while IFS='|' read -r APP_ID APP_NAME APP_PKG STOCK_PKG REASON MERGED ORIGINALS SHARED_UID AUTHORITIES REQUESTED DECLARED DECLARED_LEVELS; do
     [ -n "$APP_ID" ] || continue
-    printf 'excluded\t%s\t%s\t%s\t-\t-\t-\t-\t%s\n' "$APP_ID" "$APP_PKG" "$APP_NAME" \
-      "$REASON;不适合模块化 → 仅走 adb install(未写 privileged_ack: true)"
+    printf 'excluded\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$APP_ID" "$APP_PKG" "$STOCK_PKG" "$APP_NAME" "$MERGED" "$ORIGINALS" "$SHARED_UID" \
+      "$AUTHORITIES" "$REQUESTED" "$DECLARED" "$DECLARED_LEVELS" "$REASON;不适合模块化 → 仅走 adb install(未写 privileged_ack: true)"
   done < "$WORK/excluded.txt"
 } > "$MANIFEST"
 
@@ -1335,10 +1591,13 @@ log ""
 printf '%s=== 构建摘要 ===%s\n' "$C_BLD" "$C_RST"
 printf '纳入模块(%s 项):\n' "$included_count"
 ack_count=0
-while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET PRIV NOTE; do
+while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG VC SIGNER APK_SHA _ASSET PRIV NOTE MERGED ORIGINALS SHARED_UID AUTHORITIES _REQUESTED DECLARED DECLARED_LEVELS; do
   [ -n "$APP_ID" ] || continue
   printf '  ✔ %-12s %-28s → system/app/%s/%s.apk  versionCode=%s  签名=%s…\n' \
     "$APP_ID" "$APP_PKG" "$APP_NAME" "$APP_NAME" "$VC" "$(printf '%s' "$SIGNER" | cut -c1-16)"
+  if [ "$MERGED" = true ]; then
+    printf '    ⚠ [MERGED/替换] <original-package> 命中 stock_package(%s);共享 PackageSetting,旧数据预期继承;不执行 stock disable。\n' "$_STOCK_PKG"
+  fi
   if [ "$PRIV" != "-" ]; then
     ack_count=$((ack_count + 1))
     printf '    %s⚠ [privileged_ack] %s%s\n' "$C_YEL" "$(privileged_annotation "$PRIV" "$NOTE")" "$C_RST"
@@ -1351,7 +1610,7 @@ if [ "$ack_count" -gt 0 ]; then
 fi
 if [ "$excluded_count" -gt 0 ]; then
   printf '%s因检出 privileged 权限申请被排除(未写 privileged_ack: true;仅走 adb install,见 README):%s\n' "$C_YEL" "$C_RST"
-  while IFS='|' read -r APP_ID APP_NAME APP_PKG REASON; do
+  while IFS='|' read -r APP_ID APP_NAME APP_PKG _STOCK_PKG REASON _MERGED _ORIGINALS _SHARED_UID _AUTHORITIES _REQUESTED _DECLARED _DECLARED_LEVELS; do
     [ -n "$APP_ID" ] || continue
     printf '  ✘ %-12s %-28s (%s)\n' "$APP_ID" "$APP_PKG" "$REASON"
   done < "$WORK/excluded.txt"
