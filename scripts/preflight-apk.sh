@@ -17,8 +17,8 @@
 #   2  APK 申请了 signature|privileged 权限(事实判定,见 G3)。策略由 build.sh 决定:
 #        * 条目未写 privileged_ack: true → 不适合模块化,排除出模块,仅走 adb install;
 #        * 条目显式写明 privileged_ack: true → 以普通系统应用(system/app)纳入并逐条标注
-#          "这些权限不会被授予"(结论 privileged_acknowledged)。
-#      两种情况都绝不进 priv-app、绝不生成白名单 XML。
+#          "这些权限不会被授予"(结论 privileged_acknowledged)。本脚本只负责 preflight，
+#          不生成安装包或白名单；build.sh 另有且仅有 Recorder 专用变体生成路径。
 #   3  环境不完整(aapt / apksigner / java 缺失,无法完成校验)
 #
 # 环境变量:
@@ -332,6 +332,33 @@ fi
 say ""
 say "### G2 sharedUserId"
 XMLTREE="$("$AAPT" dump xmltree "$APK" AndroidManifest.xml 2>/dev/null || true)"
+ORIGINAL_PACKAGES="$(printf '%s\n' "$XMLTREE" | awk '
+  /^[[:space:]]*E:[[:space:]]*original-package([[:space:]]|$)/ {
+    in_original = 1
+    next
+  }
+  in_original && /^[[:space:]]*E:[[:space:]]/ {
+    in_original = 0
+  }
+  in_original && /android:name/ {
+    if (match($0, /"[^"]+"/)) {
+      name = substr($0, RSTART + 1, RLENGTH - 2)
+      if (name != "" && !seen[name]++) print name
+    }
+    in_original = 0
+  }
+' || true)"
+SHARED_USER_ID="$(printf '%s\n' "$XMLTREE" | awk '
+  /android:sharedUserId/ {
+    if (match($0, /"[^"]+"/)) print substr($0, RSTART + 1, RLENGTH - 2)
+    exit
+  }
+' || true)"
+MERGE_WITH_STOCK=false
+if [ -n "$E_STOCK" ] && [ "$E_STOCK" != "-" ] \
+   && printf '%s\n' "$ORIGINAL_PACKAGES" | grep -Fqx "$E_STOCK"; then
+  MERGE_WITH_STOCK=true
+fi
 if [ -z "$XMLTREE" ]; then
   say_bad "无法读取 AndroidManifest.xml(aapt dump xmltree 失败)"
   GATE_FAIL=1
@@ -341,6 +368,23 @@ elif printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId'; then
   GATE_FAIL=1
 else
   say_ok "未检出 sharedUserId"
+fi
+if [ -n "$SHARED_USER_ID" ]; then
+  say "  sharedUserId 值: $SHARED_USER_ID"
+else
+  say "  sharedUserId 值: <none>"
+fi
+if [ -n "$ORIGINAL_PACKAGES" ]; then
+  say "  <original-package> declarations:"
+  while IFS= read -r original_package; do
+    [ -n "$original_package" ] || continue
+    say "      - $original_package"
+  done <<< "$ORIGINAL_PACKAGES"
+else
+  say "  未发现 <original-package> declaration"
+fi
+if [ "$MERGE_WITH_STOCK" = true ]; then
+  say_warn "merge_with_stock=true:APK 的 <original-package> 等于 stock_package($E_STOCK);PackageManager 将其视作改名/替换并共享 PackageSetting,不应停用 stock 名称"
 fi
 
 # ---------------------------------------------------------------------------
@@ -523,15 +567,17 @@ fi
 # G5:applicationId != stock_package(C2)
 # ---------------------------------------------------------------------------
 say ""
-say "### G5 coexist 断言(applicationId != stock_package)"
+say "### G5 applicationId / stock_package / <original-package>"
 if [ -z "$APP_ID_FROM_APK" ]; then
   say_bad "无法取得 applicationId,跳过该断言(已计 G1 失败)"
 else
   if [ "$APP_ID_FROM_APK" = "$E_STOCK" ]; then
-    say_bad "applicationId 与 stock 包名相同($E_STOCK):这构成替换关系,违反 C2(coexist)"
+    say_bad "applicationId 与 stock 包名相同($E_STOCK):这构成直接替换,不允许由普通 coexist 路径打包"
     GATE_FAIL=1
+  elif [ "$MERGE_WITH_STOCK" = true ]; then
+    say_warn "applicationId($APP_ID_FROM_APK) 虽与 stock_package($E_STOCK)不同,但 <original-package>=$E_STOCK → merge_with_stock=true;PackageManager 共享包设置,服务必须跳过 stock disable"
   else
-    say_ok "$APP_ID_FROM_APK != $E_STOCK"
+    say_ok "$APP_ID_FROM_APK != $E_STOCK 且未声明与 stock 相同的 <original-package>"
   fi
 fi
 
@@ -554,7 +600,7 @@ else
         say_ok "authority '$auth' 以 applicationId 为前缀" ;;
       *)
         say_warn "authority '$auth' 不以 applicationId($APP_ID_FROM_APK)为前缀 → 可能与其它应用冲突"
-        say_warn "  设备实测已确认本应用与 stock 共存无 provider 冲突;此项仅供参考,不影响构建" ;;
+        say_warn "  AndVM 虚拟机配置中观察到本应用与 stock 共存无 provider 冲突;此项仅供参考,真实设备仍未验证" ;;
     esac
   done <<< "$AUTHORITIES"
 fi
@@ -585,15 +631,15 @@ case "$E_IVC" in
     #   * 真正的"压制"风险由 C8 在刷入时强制拦截(检出 /data 副本 → 整包中止,
     #     要求先 pm uninstall);卸载之后不存在压制,所以两侧值相等不算危险,只提示;
     #   * 必须硬拦的只有一种:模块内**比设备上更旧**(回退)。
-    # 2026-10-08 真机实测(构建永远失败的教训):
-    #   * calendar/gallery/calculator 模块内 51/1/1,设备上也是 51/1/1(恰好相等);
-    #   * clock 的 APK **未声明 versionCode**,而设备上那一份的实测值正是
-    #     versionCode=0 —— 与平台语义"未声明按 0 处理"完全吻合。
+    # 2026-10-08 AndVM 虚拟机配置记录(构建门禁设计依据):
+    #   * calendar/gallery/calculator 模块内 51/1/1,AndVM 配置记录也是 51/1/1(恰好相等);
+    #   * clock 的 APK **未声明 versionCode**,AndVM 配置记录为 versionCode=0 ——
+    #     与平台语义"未声明按 0 处理"吻合；真实设备上的版本状态仍未验证。
     #   因此"未声明"不再是"未知",而是已知的 0:照常参与比较即可。
     vc_eff="$VER_CODE"
     if [ -z "$vc_eff" ]; then
       vc_eff=0
-      say_warn "该 APK 未在 manifest 里声明 versionCode/versionName:平台按 0 处理(设备上那一份的实测值也是 0)"
+      say_warn "该 APK 未在 manifest 里声明 versionCode/versionName:平台按 0 处理(AndVM 配置记录也是 0;真实设备未验证)"
     fi
     if [ "$vc_eff" -lt "$E_IVC" ] 2>/dev/null; then
       say_bad "模块内 versionCode(${VER_CODE:-未声明→0}) < 设备已安装版本($E_IVC):模块内是更旧的构建"
@@ -644,6 +690,18 @@ if [ -n "$JSON_OUT" ]; then
   [ -n "$APP_ID_FROM_APK" ] && [ "$APP_ID_FROM_APK" != "$E_APPID" ] && GATE1=fail
   printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && GATE2=fail
   [ -n "$ADVISORY_HITS" ] && GATE3=privileged_requested
+  ORIGINAL_PACKAGES_JSON="$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].splitlines() if x], ensure_ascii=False))' "$ORIGINAL_PACKAGES")"
+  SHARED_USER_ID_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$SHARED_USER_ID")"
+  REQUESTED_JSON="$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].splitlines() if x], ensure_ascii=False))' "$REQUESTED")"
+  DECLARED_PERMISSIONS_JSON="$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].splitlines() if x], ensure_ascii=False))' "$DECLARED_PERM_NAMES")"
+  DECLARED_PROTECTION_JSON="$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].splitlines() if x], ensure_ascii=False))' "$DECLARED_PERMS")"
+  PRIVILEGED_JSON="$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].splitlines() if x], ensure_ascii=False))' "$ADVISORY_HITS")"
+  AUTHORITIES_JSON="$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].splitlines() if x], ensure_ascii=False))' "$AUTHORITIES")"
+  if [ "$MERGE_WITH_STOCK" = true ]; then
+    MERGE_WITH_STOCK_JSON=True
+  else
+    MERGE_WITH_STOCK_JSON=False
+  fi
   python3 - "$JSON_OUT" <<PYEOF
 # -*- coding: utf-8 -*-
 import json, sys
@@ -662,14 +720,18 @@ data = {
     "signer_sha256_expected": "$E_SIGNER",
     "signer_count": "$SIGNER_COUNT",
     "shared_user_id_detected": $(printf '%s\n' "$XMLTREE" | grep -q 'sharedUserId' && echo True || echo False),
+    "shared_user_id": $SHARED_USER_ID_JSON,
+    "original_packages": $ORIGINAL_PACKAGES_JSON,
+    "merge_with_stock": $MERGE_WITH_STOCK_JSON,
     "privileged_request_detected": $([ -n "$ADVISORY_HITS" ] && echo True || echo False),
-    "requested_permissions": [$(printf '%s\n' "$REQUESTED" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
-    "declared_permissions": [$(printf '%s\n' "$DECLARED_PERM_NAMES" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
-    "privileged_permissions": [$(printf '%s\n' "$ADVISORY_HITS" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
+    "requested_permissions": $REQUESTED_JSON,
+    "declared_permissions": $DECLARED_PERMISSIONS_JSON,
+    "declared_permission_protection_levels": $DECLARED_PROTECTION_JSON,
+    "privileged_permissions": $PRIVILEGED_JSON,
     "privileged_ack": $([ "$E_ACK" = "true" ] && echo True || echo False),
     "privileged_note": $(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$E_ACK_NOTE"),
     "requested_permission_count": $REQ_COUNT,
-    "authorities": [$(printf '%s\n' "$AUTHORITIES" | sed '/^$/d;s/.*/"&"/' | paste -sd, - 2>/dev/null || true)],
+    "authorities": $AUTHORITIES_JSON,
     "gate1_application_id": "$GATE1",
     "gate2_shared_user_id": "$GATE2",
     "gate3_permissions": "$GATE3",

@@ -1,0 +1,4 @@
+# dependent permission|prerequisite permission
+# Grant foreground location before background location when both are requested.
+android.permission.ACCESS_BACKGROUND_LOCATION|android.permission.ACCESS_COARSE_LOCATION
+android.permission.ACCESS_BACKGROUND_LOCATION|android.permission.ACCESS_FINE_LOCATION

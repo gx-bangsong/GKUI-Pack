@@ -1,0 +1,6 @@
+# Permission|AppOps shell operation name
+# Names are AppOpsManager public operation aliases; only permissions tagged appop are eligible.
+android.permission.SCHEDULE_EXACT_ALARM|SCHEDULE_EXACT_ALARM
+android.permission.USE_FULL_SCREEN_INTENT|USE_FULL_SCREEN_INTENT
+android.permission.SYSTEM_ALERT_WINDOW|SYSTEM_ALERT_WINDOW
+android.permission.REQUEST_INSTALL_PACKAGES|REQUEST_INSTALL_PACKAGES

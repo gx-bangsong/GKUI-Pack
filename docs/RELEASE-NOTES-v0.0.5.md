@@ -1,9 +1,9 @@
 # GKUI-Pack v0.0.5 发布说明（Release Notes）
 
-> ## ℹ️ 关于 `GKUI-Pack-v0.0.5-recorderpriv.zip`（特权版，已去掉 TEST 标记）
-> - **白名单来源：Pixel 5 / Android 16 设备权限表**（真机 `pm list permissions -f` 实测，见仓库 `device/framework-permissions.txt`），不再是 v0.0.4 的源码推导。
-> - 本包生成的 `privapp-permissions-org.lineageos.recorder.dev.xml` 与 v0.0.4 的 `-recorderpriv-TEST.zip` 内 XML **逐字节相同**（仅 `CAPTURE_AUDIO_OUTPUT` 一项），构建时会自动逐字节比对，不一致即中止构建。
-> - **验证口径（如实标注）**：已在 Pixel 5 / Android 16 验证开机与 `CAPTURE_AUDIO_OUTPUT` 授予；**通话录音功能本身尚未验证**；白名单 enforce 校验状态待 v0.0.5 诊断确认（v0.0.4 诊断漏采 `ro.control_privapp_permissions`）。
+> ## ℹ️ 关于 `GKUI-Pack-v0.0.5-recorderpriv.zip`（历史特权版）
+> - **权限表来源：AndVM 虚拟机快照**（Pixel 5 / redfin、Android 16 / SDK 36 配置；见 `device/framework-permissions.txt`），不是本文件所称的真实设备验证。
+> - 该版本生成的 `privapp-permissions-org.lineageos.recorder.dev.xml` 与 v0.0.4 的 `-recorderpriv-TEST.zip` 内 XML 逐字节相同（仅 `CAPTURE_AUDIO_OUTPUT` 一项）；构建流程执行比较。
+> - **验证范围**：已在虚拟机环境（AndVM，Pixel 5 / OnePlus7TPro 配置）验证；真实设备行为、KernelSU/APatch、A/B、OTA、权限实际授予及通话录音均未验证。历史文本中将快照称作“真机实测”的表述已更正。
 
 ---
 
@@ -14,7 +14,7 @@
 | 安装包文件名 | 录音机安装位置 | `privapp` 权限白名单 | 通话录音 | 适用对象 |
 |---|---|---|---|---|
 | **`GKUI-Pack-v0.0.5.zip`（普通版，默认推荐）** | `/system/app/GKUIRecorder` | 不含任何白名单 XML | 不生效 | 日常稳定使用日历、图库、计算器、时钟、普通录音的用户 |
-| **`GKUI-Pack-v0.0.5-recorderpriv.zip`（特权版）** | `/system/priv-app/GKUIRecorder` | 含 `CAPTURE_AUDIO_OUTPUT` 白名单（Pixel 5 / Android 16 设备权限表） | 待真机验证 | 需要通话录音、愿意继续协助验证并回传 `GKUI-diag.txt` 的测试者 |
+| **`GKUI-Pack-v0.0.5-recorderpriv.zip`（特权版）** | `/system/priv-app/GKUIRecorder` | 含 `CAPTURE_AUDIO_OUTPUT` 白名单（AndVM 虚拟机快照） | 未验证 | 需要通话录音、愿意继续协助验证并回传 `GKUI-diag.txt` 的测试者 |
 
 ### 升级与互刷说明
 
@@ -25,21 +25,23 @@
 
 ### 本次主要更新（v0.0.5）
 
-- **recorder-priv 转为正式版**：白名单改用 Pixel 5 / Android 16 真机权限表严格门禁，文件名与 `module.prop` 去掉 `TEST` 标记；普通版照常生成，两个 zip 的模块 id 保持一致。
+- **recorder-priv 转为正式版**：白名单改用 AndVM 虚拟机快照作为严格门禁输入，文件名与 `module.prop` 去掉 `TEST` 标记；普通版照常生成，两个 zip 的模块 id 保持一致。此变更不等同于真实设备验证。
 - **诊断脚本修正（`service.sh`）**：只读属性改为规格要求的 7 个键（`ro.lineage.version`、`ro.build.version.incremental`、`ro.build.date.utc`、`ro.build.fingerprint`、`ro.control_privapp_permissions`、`ro.build.version.sdk`、`ro.product.device`），删除拼写错误的 `ro.Boot.verifiedbootstate`；新增对 5 个 GKUI 包 + 5 个 stock 包共 10 个包的 `pm path` 采集，以及各包 `dumpsys package` 的 `declared permissions` 段、`signatures` / `versionCode` 行采集。boot 等待、`$MODDIR` 先写、`/sdcard` 轮询最多 600 秒、后台子进程、首行 `rm -f .boot_flag` 等原有行为保持不变。
-- v0.0.4 真机诊断确认：5 个 GKUI 应用落点正确（Recorder 在 `priv-app`，其余在 `app`）；`CAPTURE_AUDIO_OUTPUT` 已授予；5 个 stock 包仍在设备上，coexist 模式真机确认；开机诊断在 `boot_completed` 后 59 秒跑完，`/sdcard` 复制 `waited=0s`。
+- 当时新增了 5 个 GKUI 与 5 个 stock 包的只读诊断采集逻辑；脚本测试/虚拟机快照不证明真实设备的安装落点、权限授予、coexist 状态或启动计时。
 
-### 已知异常（本轮只采集更多信息，不修复）
+### 历史问题说明（v0.0.8 补充诊断）
 
-设备权限表中 `com.android.deskclock.dev.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 的归属包显示为 stock 时钟 `com.android.deskclock`（其余四个 GKUI 应用的同名权限均归属自身），且表中不存在 `com.android.deskclock.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`。原因未知，暂无功能影响证据；v0.0.5 诊断已增加 10 包采集以便继续排查。
+#### 时钟诊断事实
 
-### 尚未经真机验证的项
+用户提供的诊断事实为：GKUI Clock APK 声明 `<original-package android:name="com.android.deskclock"/>`；stock 与 GKUI 时钟名称的首个 `pm path` 相同，均为 `/system/app/GKUIClock/GKUIClock.apk`，并共享 PackageSetting；`/product/app/DeskClock` 因重复 APK 被跳过。不要将原因归结为子串匹配或 GKUI Clock 未安装。共享 PackageSetting 下闹钟数据由 GKUI Clock 继承是预期，不是已验证事实；闹钟实际响铃未验证。扩展 `<original-package>` 替换到其他四个应用不属于本次实现。v0.0.6 与 v0.0.7 对应同一提交 `1d34861b50436c29415628a06f1b7769ece2bb8a`，PR #6 未包含这项 clock 修复；无法访问的 `transfer/diag-v0.0.7` 分支未被读取或合并。
 
-- 白名单 enforce 校验状态（`ro.control_privapp_permissions`，待 v0.0.5 诊断回传）；
-- 通话录音的实际效果；
-- KernelSU / APatch 环境（目前仅 Magisk 流程有真机依据）；
-- 时钟权限归属异常的原因；
-- v0.0.5 正式特权包在真机上的刷入行为（本轮只在 CI 用真实 APK 构建过）。
+### 尚未验证的项
+
+- 真实设备上的安装、开机、`ro.control_privapp_permissions` enforce 实际效果与权限授予；
+- KernelSU / APatch、A/B、OTA；
+- 通话录音、真实设备 `pm grant` / AppOps；
+- 卸载后 `/product/app/DeskClock` 恢复、闹钟数据继承与实际响铃；
+- Recorder 特权变体在真实设备上的完整行为。
 
 ---
 

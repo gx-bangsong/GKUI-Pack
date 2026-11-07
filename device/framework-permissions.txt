@@ -1,27 +1,22 @@
 # =============================================================================
-# 真机框架权限表(目标设备实测,recorder-priv 正式版白名单的严格门禁输入)
+# Android framework permission table (metadata added; permission records preserved)
 #
-# Device: Pixel 5 (LineageOS; Android 16; SDK 36)
-# Build: BP4A.251205.006 (userdebug; release-keys)
-# SDK: 36
+# Device: AndVM virtual machine (suspected), with Pixel 5 / redfin and OnePlus7TPro configurations
+# SDK: 36 (Android 16)
+# Verification scope: AndVM virtual-machine environment; real-device behavior is not
+# established by this file.
+# Framework snapshot label: Pixel 5 / redfin (LineageOS 23.2; Android 16; SDK 36)
+# Build label: BP4A.251205.006 (userdebug; release-keys; existing capture label)
+# ro.lineage.version: 23.2-20261005-NIGHTLY-redfin
+# ro.build.version.incremental: 45397edbf2
+# ro.build.date.utc: 1791158517
+# ro.control_privapp_permissions: enforce
 # Captured: 2026-10-27, epoch 1793032493
-# 采集方式: v0.0.4 priv-TEST 模块 service.sh 诊断(设备端 GKUI-diag.txt 第 [5] 节)
+# Collection source: GKUI-Pack diagnostic section [5], v0.0.4 privileged TEST package.
 #
-# 本文件在首行注释之后,原样保存 GKUI-diag.txt 的
-# "--- [5] pm list permissions -f ---" 至 "sdcard_copy:" 之前的全部内容,
-# 未做任何修改、补全、去重或重排(共 1195 条 permission 记录,权限名全部唯一)。
-# 读取脚本(scripts/generate-privapp-permissions.py)跳过本注释头,只解析数据行。
-#
-# 以下 4 个属性因 v0.0.4 诊断脚本缺陷(属性键名偏离规格)未采集到,
-# v0.0.5 的 service.sh 已按规格修正为 7 个允许键,待下一次真机诊断补采:
-#   ro.lineage.version
-#   ro.build.version.incremental
-#   ro.build.date.utc
-#   ro.control_privapp_permissions
-# (v0.0.4 实际采集的是 ro.product.model / ro.build.version.release /
-#  ro.build.display.id / ro.build.type / ro.build.tags,以及拼写错误的
-#  ro.Boot.verifiedbootstate —— 后者取值为空;7 个键中仅 ro.build.version.sdk
-#  符合规格。)
+# From the marker below onward, the captured pm list permissions -f output is preserved
+# byte-for-byte (1195 permission records); no permission data was added, removed,
+# deduplicated, or reordered. The header properties above describe the supplied snapshot.
 # =============================================================================
 --- [5] pm list permissions -f ---
 All Permissions:
