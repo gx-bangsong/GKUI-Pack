@@ -216,7 +216,7 @@ build_assets() { # $1=APK_DIR $2=是否让 clock 申请 privileged 权限 $3=cal
   ( cd "$tmp" && zip -q "$d/ExactCalculator-debug.apk.zip" "ExactCalculator-debug.apk" )
   make_fake_apk "$d/DeskClock-debug.apk" "com.android.deskclock.dev" "80000" "$SIGNER_CLOCK" "" "$priv"
   # 录音机:模块内 versionCode 90000 > 夹具安装值 89999 → G7 放行;
-  # 模拟真实 GKUIRecorder-beta3 的权限结构(含 CAPTURE_AUDIO_OUTPUT、REQUEST_INSTALL_PACKAGES 与包内自声明权限)
+  # 模拟GKUIRecorder 的权限结构(含 CAPTURE_AUDIO_OUTPUT、REQUEST_INSTALL_PACKAGES 与包内自声明权限)
   make_fake_apk "$d/$ASSET_REC" "org.lineageos.recorder.dev" "90000" "$SIGNER_REC" \
 "uses-permission: name='android.permission.CAPTURE_AUDIO_OUTPUT'
 uses-permission: name='android.permission.REQUEST_INSTALL_PACKAGES'
@@ -272,7 +272,7 @@ run_build() { # $1=工作区repo $2=APK_DIR $3=dist $4...=额外参数与环境(
 }
 
 # -----------------------------------------------------------------------------
-head1 "1) 真实仓库状态:五个应用(recorder 已切至 beta3)"
+head1 "1) 真实仓库状态:五个应用(recorder 已切至 beta3.1)"
 # -----------------------------------------------------------------------------
 pending_todos="$(python3 - "$REPO_ROOT" <<'PYP'
 import json, subprocess, sys
@@ -285,7 +285,7 @@ PYP
 out="$(cd "$REPO_ROOT" && bash build.sh --check 2>&1)"; rc=$?
 if [ "$pending_todos" -gt 0 ]; then
   if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'signer_sha256 为 TODO'; then
-    ok "真实清单处于 beta3 signer 待采集态(C7 按预期拦截 TODO,rc=$rc)"
+    ok "真实清单处于 beta3.1 signer 待采集态(C7 按预期拦截 TODO,rc=$rc)"
   else
     bad "真实清单含 TODO 却未按 C7 拦截(rc=$rc)"; printf '%s\n' "$out" | tail -20
   fi
@@ -849,17 +849,17 @@ if [ -f "$ZIP" ]; then
     bad "C8:接管后缺少 GKUIRecorder.apk"
   fi
 
-  # 8.8 C8:检测到 beta2 → beta3 签名变更时整包中止并给出三步指引(备份 → 手动卸载或删旧模块 → 重启)
+  # 8.8 C8:检测到 beta2 → beta3.1 签名变更时整包中止并给出三步指引(备份 → 手动卸载或删旧模块 → 重启)
   MODSIG="$WORK/modsig"
   stage_module "$MODSIG"
   out="$( env PATH="$WORK/bin:$PATH" MODPATH="$MODSIG" \
           FAKE_PM_PKG="org.lineageos.recorder.dev" FAKE_PM_MODE="data" \
           FAKE_PM_SHA256="f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f" \
           sh "$MODSIG/customize.sh" 2>&1 )"; rc=$?
-  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'beta2 → beta3'; then
-    ok "C8:检测到 beta2 → beta3 签名变更时整包中止(rc=$rc)"
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'beta2 → beta3.1'; then
+    ok "C8:检测到 beta2 → beta3.1 签名变更时整包中止(rc=$rc)"
   else
-    bad "C8:beta2 → beta3 签名变更未中止或缺少版本标记(rc=$rc)"; printf '%s\n' "$out" | tail -15
+    bad "C8:beta2 → beta3.1 签名变更未中止或缺少版本标记(rc=$rc)"; printf '%s\n' "$out" | tail -15
   fi
   if printf '%s' "$out" | grep -q '备份' && printf '%s' "$out" | grep -q '手动卸载或删旧模块' && printf '%s' "$out" | grep -q '重启'; then
     ok "C8:签名断裂提示含完整三步指引(备份 → 手动卸载或删旧模块 → 重启)"
@@ -1127,15 +1127,15 @@ for app in data["apps"]:
         # 仍留 TODO),而不是"application_id 必须以 TODO 开头"。后者每回填一个实测字段
         # 就要连 CI 工作流一起改,而工作流只能由用户经网页编辑器落地 —— 徒增耦合。
         signer_ok = (
-            app["signer_sha256"] == "10fd149d021f5fc263f6e6dcb580a3e7e60822d48b1c0f63751e8945b5a60c25"
+            app["signer_sha256"] == "e86cb9cb5499ef2e04d4b178488c31d7a46a9365aea5a34efde0cbf2ccf4d050"
             and app["confidence"] == "confirmed"
         )
         ok = (app["application_id"] == "org.lineageos.recorder.dev"
               and app["application_id"] != app["stock_package"]
               and str(app["installed_version_code"]) == "1"
-              and app["release_tag"] == "beta3"
-              and app["asset_name"] == "GKUIRecorder-beta3.apk"
-              and app["sha256"] == "fe261923f73d07c7e0b3e238231d89553a772b64571df9db1d61e7bb8c72ec4f"
+              and app["release_tag"] == "beta3.1"
+              and app["asset_name"] == "beta_3.1.apk"
+              and app["sha256"] == "183a2249388984439c26ce6e2e4448afde8d1f5fb711c700dc05c75318bd8eee"
               and app["previous_release_tag"] == "beta2"
               and app["previous_sha256"] == "f4c00ddb06145ab26fb4a4ba85f91bf866a22a33ad079044ed45da3d7f778f6f"
               and app["previous_signer_sha256"] == "7cd26af2112c234f9bbfe2b21e3651c4e51a5d4c4de34b462c86bacd881e0985"
@@ -1144,7 +1144,7 @@ for app in data["apps"]:
         sys.exit(0 if ok else 1)
 sys.exit(1)
 PYEOF
-then ok "recorder:已切到 beta3 并保留 beta2 前驱(包名/versionCode/哈希/signer 已核实)"; else bad "recorder 条目不符合要求"; fi
+then ok "recorder:已切到 beta3.1 并保留 beta2 前驱(包名/versionCode/哈希/signer 已核实)"; else bad "recorder 条目不符合要求"; fi
 if grep -q '^\*.apk$' "$REPO_ROOT/.gitignore" && grep -q '^dist/$' "$REPO_ROOT/.gitignore" \
    && grep -q '^build/$' "$REPO_ROOT/.gitignore" && grep -q '^\*.keystore$' "$REPO_ROOT/.gitignore"; then
   ok ".gitignore 含 *.apk / dist/ / build/ / *.keystore"
